@@ -26,19 +26,15 @@ pub const DEFAULT_MEMORY_MAX: u64 = 2 << 30;
 
 /// The smallest memory ceiling that is a cap rather than a wall.
 ///
-/// `--job-memory-max 0` was refused and `--job-memory-max 1kB` was accepted,
-/// and the two do the same thing: refuse every job. Under the fallback
-/// (`RLIMIT_AS`, D23) the figure bounds the address space of each process, and
-/// on this host `/bin/sh -c 'echo ok'` needs 16 MiB of it: 8 MiB fails in the
-/// dynamic loader, 4 MiB fails to allocate at all, 1 MiB segfaults. So 16 MiB
-/// is where a ceiling stops being a cap on a job and becomes a guarantee that
-/// nothing runs — and a runner that cannot run `/bin/sh` is not a runner.
-///
-/// Measured rather than guessed, and deliberately generous in the refusal's
-/// direction: refusing a ceiling that would work is a startup an operator can
-/// argue with, while accepting one that cannot is a runner whose every job
-/// fails for a reason nobody looks for.
-pub const MINIMUM_MEMORY_MAX: u64 = 16 << 20;
+/// **It lives on the contract now**, as
+/// [`herd_proto::MINIMUM_MEMORY_MAX`], and is re-exported here because this
+/// is where every caller already looks for it. It moved for the reason
+/// [`herd_proto::CEILING_MARGIN_PERCENT`] is there: [`job_ceiling`] floors a
+/// grant at this figure, so a job declaring one mebibyte is *granted*
+/// sixteen, and a hub that charged what it clamped rather than what the
+/// runner granted would under-charge every such job. One figure, in one
+/// place, and neither crate carries a second copy (invariant 4).
+pub use herd_proto::MINIMUM_MEMORY_MAX;
 
 /// An hour. Long enough for a cold build of the first consumer (over thirty
 /// minutes), short enough that a wedged job is noticed the same morning.
@@ -189,6 +185,174 @@ impl Confinement {
     }
 }
 
+/// The kernel memory ceiling **one job** is held to, with where the figure
+/// came from and what this host can actually do about it.
+///
+/// Until now there was no such thing: `--job-memory-max` was resolved once at
+/// startup and the same `JobLimits` was handed to every job, so a job the hub
+/// admitted against 8 GiB of declared need ran under the 2 GiB its runner's
+/// owner had lent — the runner being the only thing in the product that
+/// writes `memory.max` at all. D180 named that and declined to close it by
+/// guessing; the frame now carries the figure
+/// ([`herd_proto::JobNeed`]), and this is where it becomes a ceiling.
+#[derive(Debug, Clone)]
+pub struct JobCeiling {
+    memory_max: u64,
+    need: Option<herd_proto::JobNeed>,
+    /// What `--job-memory-max` says, kept so the line can name whose figure
+    /// won when the two disagreed.
+    lent: u64,
+    clamped: bool,
+    floored: bool,
+}
+
+/// What one job's ceiling is, given this runner's own figure and what the hub
+/// costed the job at.
+///
+/// **Two cases, and the second one is why the flag survives.** A job the hub
+/// costed carries both of its figures and is held to their sum plus
+/// [`herd_proto::CEILING_MARGIN_PERCENT`] — the ceiling admission weighed it
+/// against, and the tmpfs is in it because tmpfs pages are charged to the
+/// cgroup that writes them. A job costed at nothing gets `--job-memory-max`
+/// exactly as it always has: `herd_hub::JobRecord::memory_need_mib` answers
+/// `Ok(None)` for a real class of job — `herdctl submit -- true` — which is
+/// admitted on its capabilities alone, so the global figure is the only one
+/// anybody has stated about it and it is not going away.
+///
+/// **Bounded above by `--job-memory-max`, and this is the whole of invariant 2
+/// in one `min`.** A declared figure can only ever make a job's ceiling
+/// *tighter*, never looser. Without the bound a requester's declaration could
+/// raise the most a job may hold on somebody else's machine: a runner lending
+/// 25 GiB at `--job-memory-max 2GiB` keeps twelve seats
+/// ([`jobs_at_once`]), and twelve ceilings of 4.5 GiB is 52 GiB permitted on
+/// a host that lent 25. **The hub cannot stop that either** — it does not know
+/// `--job-memory-max`, which no frame carries, so it will place a job
+/// declaring 4 GiB on a 2 GiB-cap runner and did so before this field existed.
+/// With the bound, `seats × --job-memory-max` still bounds the permitted
+/// total, exactly as it did; `--job-memory-max` goes on meaning what its name
+/// says — the most any job on this machine may hold — and an owner's
+/// configured bound is not raised by a figure a requester sent. Weakening
+/// invariant 2 is Alexa's to decide, not a side effect of carrying a figure.
+///
+/// **Floored at [`MINIMUM_MEMORY_MAX`], which is a measurement.** 16 MiB is
+/// where a ceiling stops being a cap on a job and becomes a guarantee that
+/// nothing runs: `/bin/sh -c 'echo ok'` needs that much address space on the
+/// host that figure was measured on. [`Confined::prepare`] already refuses a
+/// *global* ceiling below it, because invariant 2 asks for a cap and not for
+/// a wall; a per-job figure below it is the same wall arriving from the hub
+/// instead of from a command line, and it gets the same answer. The job is
+/// **not** refused for it — a declaration too small to start a shell is the
+/// requester's mistake, not work this machine should hand back — and the line
+/// below says the floor was what got written.
+pub fn job_ceiling(global: u64, need: Option<herd_proto::JobNeed>) -> JobCeiling {
+    let declared = need.map(|need| need.ceiling_bytes());
+    let asked = declared.unwrap_or(global).min(global);
+    JobCeiling {
+        memory_max: asked.max(MINIMUM_MEMORY_MAX),
+        need,
+        lent: global,
+        clamped: declared.is_some_and(|declared| declared > global),
+        floored: asked < MINIMUM_MEMORY_MAX,
+    }
+}
+
+/// The whole mebibytes of `--job-memory-max`, which is the unit **both**
+/// bounds on this machine divide in.
+///
+/// [`jobs_at_once`] has always divided in it, so the sum that replaces that
+/// count has to as well, or the two statements of one bound would differ by
+/// a rounding. Truncated down and floored at one, exactly as the seat count
+/// truncates it.
+fn per_job_mib(memory_max: u64) -> u64 {
+    (memory_max / (1 << 20)).max(1)
+}
+
+impl JobCeiling {
+    /// The figure to write, in bytes.
+    pub fn memory_max(&self) -> u64 {
+        self.memory_max
+    }
+
+    /// What this grant is **charged** against the memory this host lends,
+    /// in MiB — the figure the runner's own running sum adds up and the hub
+    /// charges the same job (`herd_proto::charged_ceiling_mib`).
+    ///
+    /// **The same function on both sides, so that one bound has one
+    /// statement.** `herd-hub/src/matcher.rs` is explicit that a hub counting
+    /// a different set from the runner is the defect; a hub charging a
+    /// different *figure* over the same set is that defect with the set made
+    /// right, and it is the one this closes.
+    ///
+    /// Mebibytes and not bytes, because [`per_job_mib`] truncates
+    /// `--job-memory-max` down to whole mebibytes and [`jobs_at_once`] always
+    /// has: `seats × --job-memory-max` carried exactly the same sub-mebibyte
+    /// residue, so the finer bound is no looser than the count it replaces
+    /// (`herd-hub/tests/packed_by_declaration.rs` asserts that, not this
+    /// paragraph).
+    pub fn charged_mib(&self) -> u64 {
+        herd_proto::charged_ceiling_mib(self.need, Some(per_job_mib(self.lent)))
+    }
+
+    /// What this runner says about this job's ceiling, or nothing when there
+    /// is nothing new to say.
+    ///
+    /// **Silence for a job the hub costed at nothing**, and that silence is
+    /// deliberate: its ceiling is the one the startup report already named,
+    /// and a line per job repeating a figure that has not moved is noise an
+    /// operator learns to skip past — which is how the line that matters gets
+    /// missed.
+    ///
+    /// **A clamped job says so, and says whose figure won.** A reader who
+    /// finds a job killed at its runner's figure rather than at the one it
+    /// declared has to learn that from the line and not from arithmetic: the
+    /// two figures and the word are all there.
+    ///
+    /// **A host with no cgroup of its own to put the job in says so, per
+    /// job.** The fallback is `RLIMIT_AS` on the job's first process: it
+    /// bounds one process's *address space*, not the resident memory of the
+    /// job's process tree, so a job of several processes holds more than the
+    /// figure and an allocation past it fails instead of killing. That is a
+    /// weaker thing than a kernel ceiling on the job, and the honest word for
+    /// it is **not enforced** — a runner that printed the figure and left it
+    /// there would be reporting a ceiling it does not hold.
+    pub fn line(&self, in_a_cgroup_of_its_own: bool, fallback: Option<&str>) -> Option<String> {
+        let need = self.need?;
+        let floor = if self.floored {
+            format!(
+                ", floored at {} because a ceiling under that refuses every job",
+                show_bytes(MINIMUM_MEMORY_MAX)
+            )
+        } else {
+            String::new()
+        };
+        let whose = if self.clamped {
+            format!(
+                "declares {} — more than the {} this machine's owner lends any one job, so \
+                 it is CLAMPED to the owner's figure: {} is this job's ceiling{floor}",
+                need.line(),
+                show_bytes(self.lent),
+                show_bytes(self.memory_max)
+            )
+        } else {
+            format!("declares {}{floor}", need.line())
+        };
+        Some(if in_a_cgroup_of_its_own {
+            format!("{whose}, and that is the memory.max of its own cgroup on this host")
+        } else {
+            format!(
+                "{whose}, and this host CANNOT enforce a per-job ceiling: {} What it gets \
+                 instead is an address-space limit of {} on its first process, which bounds \
+                 neither the job's process tree nor its resident memory — so the ceiling \
+                 named above is NOT ENFORCED here",
+                fallback.unwrap_or(
+                    "this runner has no delegated cgroup v2 subtree to make a job cgroup in."
+                ),
+                show_bytes(self.memory_max),
+            )
+        })
+    }
+}
+
 /// How many jobs this runner holds at once, and the sentence that says why.
 ///
 /// **Derived from what this machine itself declared, and from nothing the hub
@@ -199,13 +363,33 @@ impl Confinement {
 /// got 250 jobs (`herd-hub/tests/fake_hub_flood.rs`). A machine's own bound
 /// has to be held on the machine.
 ///
-/// The arithmetic is the one invariant 2 is actually about: every job here
-/// runs under the same kernel memory ceiling ([`Confinement::memory_max`], one
-/// figure for every job and not a per-job negotiation), so N jobs permit N
-/// times that much, and the bound is how many of them fit in the memory this
-/// host says it lends after the floor it says it keeps. At 2 GiB a job, a
-/// 31 GiB server keeping 6 GiB for itself holds 12; the owner's 17 GiB PC
-/// keeping 3 GiB holds 6.
+/// The arithmetic is the one invariant 2 is actually about: no job here is
+/// permitted more than `memory_max`, so N jobs permit at most N times that
+/// much, and the bound is how many of them fit in the memory this host says
+/// it lends after the floor it says it keeps. At 2 GiB a job, a 31 GiB server
+/// keeping 6 GiB for itself holds 12; the owner's 17 GiB PC keeping 3 GiB
+/// holds 6.
+///
+/// **It is no longer the whole of the bound, and this is why.** A job is now
+/// held to its *own* ceiling ([`job_ceiling`]) and not to one figure for
+/// every job, so a job granted less than the cap costs this machine less than
+/// a whole one of these places. What `Session::take_job` admits against is
+/// therefore the running sum of the ceilings this runner granted:
+/// `Σ granted ≤ lent − floor` where this count stood for
+/// `seats × memory_max ≤ lent − floor`. **The same bound, finer
+/// granularity** — invariant 2's exposure does not move, because every grant
+/// is at most the cap and so the sum admits every set this count admitted.
+/// The count is kept beside it and is the bound a host that will not say how
+/// much memory it lends has; it is also the figure the hub is told
+/// ([`JobsAtOnce::most`]), because no frame carries `memory_max` and the hub
+/// derives its own charge from this count (D180, D181, ORCH-312).
+///
+/// **Read once, at startup.** The lend is a snapshot of a slice other things
+/// move (`crate::room`, D186 measured the same binaries announcing 1 seat and
+/// then 2 an hour later on one host). Nothing here reads it as current:
+/// erring low is the only direction invariant 2 allows, so a stale snapshot
+/// is stale downwards, and both the count and the sum are quoted in the
+/// sentences a reader gets.
 ///
 /// It is a **worst case**, deliberately: the cap is what a job is permitted,
 /// not what it takes, and a bound set on what jobs usually take is a bound
@@ -214,6 +398,17 @@ impl Confinement {
 pub struct JobsAtOnce {
     most: usize,
     why: String,
+    /// The memory this host lends after its own floor, in MiB, or `None`
+    /// from a host that will not say how big it is.
+    ///
+    /// **The same two figures [`JobsAtOnce::most`] was divided out of**, kept
+    /// rather than re-read, so that the sum the runner admits against and the
+    /// count it announced are two statements of one arithmetic and cannot
+    /// drift. Read once, at startup, off a slice other things move
+    /// (`crate::room`, D186): erring low is the only direction invariant 2
+    /// allows, so a snapshot that is stale is stale downwards, and nothing
+    /// here reads it as current.
+    admissible_mib: Option<u64>,
 }
 
 impl JobsAtOnce {
@@ -226,6 +421,16 @@ impl JobsAtOnce {
     /// and the refusal the hub is sent quote.
     pub fn why(&self) -> &str {
         &self.why
+    }
+
+    /// The memory this host lends after its floor, in MiB — what the running
+    /// sum of granted ceilings is admitted against.
+    ///
+    /// `None` from a host that will not say how much it lends. There is then
+    /// nothing to sum against, and [`JobsAtOnce::most`] is the whole of this
+    /// machine's bound, as it was before there was a sum.
+    pub fn admissible_mib(&self) -> Option<u64> {
+        self.admissible_mib
     }
 }
 
@@ -265,6 +470,26 @@ pub const JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY: usize = 1;
 /// its ceiling exactly as much as one that did the arithmetic.
 pub const A_RUNNERS_OWN_CEILING: &str = "this runner holds at most";
 
+/// The clause that marks a sentence as **this runner's own running sum**:
+/// the jobs it is already holding, charged at the ceilings it granted them,
+/// against the memory its host lends after its floor.
+///
+/// A third clause and not a reworded second one, for the reason there are
+/// two: attribution has to be decidable from the words alone. There are now
+/// three sentences about room on a machine that reach the same record —
+/// this one and [`A_RUNNERS_OWN_CEILING`] inside an `attempt_ended` line,
+/// and `herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED` on a `waiting`
+/// line — and a reader has to be able to say which bound bit. **No one of
+/// the three clauses is a substring of another**, which
+/// `herd-hub/tests/announced_job_ceiling.rs` asserts against the sentences
+/// as they are really built.
+///
+/// The sum sentence quotes [`JobsAtOnce::why`] whole, so a refusal for the
+/// sum still carries the arithmetic — what the machine lends, what it keeps
+/// as its own floor, and what it caps a job at — which is the only thing
+/// that tells a full machine from a broken one.
+pub const A_RUNNERS_OWN_MEMORY_SUM: &str = "the jobs it is holding already add up to";
+
 /// How many jobs a runner of this size, capping every job at `memory_max`,
 /// holds at once.
 ///
@@ -282,10 +507,11 @@ pub const A_RUNNERS_OWN_CEILING: &str = "this runner holds at most";
 /// machine too small to hold one job at its own ceiling holds one anyway, and
 /// the sentence says what the arithmetic was.
 pub fn jobs_at_once(host: &herd_proto::HostSize, memory_max: u64) -> JobsAtOnce {
-    let per_job_mib = (memory_max / (1 << 20)).max(1);
+    let per_job_mib = per_job_mib(memory_max);
     let Some(lent) = host.memory_mib else {
         return JobsAtOnce {
             most: JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
+            admissible_mib: None,
             why: format!(
                 "this machine does not say how much memory it lends, so how many jobs of {} \
                  fit on it cannot be derived: {A_RUNNERS_OWN_CEILING} \
@@ -302,6 +528,7 @@ pub fn jobs_at_once(host: &herd_proto::HostSize, memory_max: u64) -> JobsAtOnce 
     let most = usize::try_from((admissible / per_job_mib).max(1)).unwrap_or(usize::MAX);
     JobsAtOnce {
         most,
+        admissible_mib: Some(admissible),
         why: format!(
             "this machine lends {} and keeps {} as its own floor, and caps every job at {}, \
              so {A_RUNNERS_OWN_CEILING} {most} job(s) at once",
@@ -1560,5 +1787,233 @@ mod tests {
                 "{writable} points outside the data root: {value}"
             );
         }
+    }
+
+    // ------------------- one job's own kernel memory ceiling --------------
+
+    /// A job the hub costed is held to **its** figure, and a job costed at
+    /// nothing is held to the machine's.
+    ///
+    /// Both halves in one test because the second is the one a careless fix
+    /// would lose: `herd_hub::JobRecord::memory_need_mib` answers `Ok(None)`
+    /// for a real class of job — `herdctl submit -- true` — so
+    /// `--job-memory-max` is not a legacy figure to be replaced, it is the
+    /// answer for every job nobody costed.
+    #[test]
+    fn a_costed_job_gets_its_own_ceiling_and_an_uncosted_one_gets_the_machine_s() {
+        // Lent generously, so that the declaration below is the tighter of
+        // the two figures and is the one that bites. The other direction —
+        // a declaration **over** what the owner lends — is the next test.
+        let lent = 16 << 30;
+        let costed = job_ceiling(
+            lent,
+            Some(herd_proto::JobNeed {
+                memory_mib: 4096,
+                tmpfs_mib: 4096,
+            }),
+        );
+        assert_eq!(
+            costed.memory_max(),
+            9011 * (1 << 20),
+            "8192 MiB declared plus the margin, and not the machine's 16 GiB"
+        );
+        assert_ne!(
+            costed.memory_max(),
+            lent,
+            "the whole defect was a declared job running under the machine's one figure"
+        );
+
+        let uncosted = job_ceiling(lent, None);
+        assert_eq!(
+            uncosted.memory_max(),
+            lent,
+            "a job the hub costed at nothing keeps --job-memory-max exactly"
+        );
+        assert_eq!(
+            uncosted.line(true, None),
+            None,
+            "and there is nothing new to say about it: the startup report named that figure"
+        );
+    }
+
+    /// **A declaration can only ever tighten a ceiling, never loosen one**,
+    /// and the proof is the figure read back out of `memory.max`.
+    ///
+    /// This is invariant 2 and not an optimisation. The hub does not know
+    /// `--job-memory-max` — no frame carries it, which is what
+    /// `herd-hub/src/server.rs`'s own comment says — so it will place a job
+    /// declaring 12 GiB on a runner whose owner lends 2 GiB a job, and before
+    /// this field existed the runner held it to 2 GiB. Honouring the
+    /// declaration upwards would let a figure a *requester* sent raise the
+    /// most any job may hold on somebody else's machine: twelve seats of
+    /// 2 GiB ([`jobs_at_once`]) would permit twelve ceilings of 13 GiB on a
+    /// host that lent 25. So `--job-memory-max` is an absolute bound, the
+    /// margin never lifts it, and `seats × --job-memory-max` still bounds the
+    /// permitted total exactly as it did before.
+    ///
+    /// The base here is a directory and not a cgroup, which is what lets the
+    /// read-back be asserted on a host with no delegation; `memory.max` is
+    /// written with `fs::write` either way and what is asserted is **which
+    /// number Herd writes**.
+    #[test]
+    fn a_declaration_over_what_the_owner_lends_is_clamped_to_it_in_the_cgroup() {
+        let lent = 2 << 30;
+        let need = herd_proto::JobNeed {
+            memory_mib: 8192,
+            tmpfs_mib: 4096,
+        };
+        assert!(
+            need.ceiling_bytes() > lent,
+            "the premise: this declaration asks for more than the owner lends"
+        );
+        let ceiling = job_ceiling(lent, Some(need));
+        assert_eq!(
+            ceiling.memory_max(),
+            lent,
+            "the owner's configured cap wins over a figure a requester sent"
+        );
+
+        let temp = TempDir::new("clamped-ceiling");
+        let base = temp.path().join("base");
+        std::fs::create_dir_all(&base).expect("a base");
+        let cgroups = Ceiling::Cgroups {
+            base: base.clone(),
+            limits: JobLimits::with_memory_max(lent),
+            unenforced: Vec::new(),
+        };
+        let tag = JobTag::mint(&herd_proto::JobId::new("j-declares-too-much"));
+        let _held = cgroups
+            .open_for_job(&tag, ceiling.memory_max())
+            .expect("a writable base makes a cgroup");
+        let written = std::fs::read_to_string(base.join(tag.as_str()).join("memory.max"))
+            .expect("memory.max is written before anything is in the cgroup");
+        assert_eq!(
+            written.trim(),
+            lent.to_string(),
+            "the cgroup must carry the owner's figure, not the declaration's"
+        );
+        assert_ne!(
+            written.trim(),
+            need.ceiling_bytes().to_string(),
+            "a build that honoured the declaration upwards would have written {} here",
+            need.ceiling_bytes()
+        );
+
+        // And the line says it clamped, and whose figure won: a reader who
+        // finds this job killed at 2 GiB rather than at the 13516 MiB it
+        // declared must not have to do the arithmetic to find out why.
+        let said = ceiling
+            .line(true, None)
+            .expect("a costed job has a ceiling worth a line");
+        assert!(said.contains("CLAMPED"), "{said}");
+        assert!(
+            said.contains("8192 MiB of memory and 4096 MiB of tmpfs"),
+            "the figure that did not win is still named: {said}"
+        );
+        assert!(
+            said.contains(&show_bytes(lent)),
+            "and so is the one that did: {said}"
+        );
+
+        // A declaration inside what the owner lends is not clamped and says
+        // nothing about clamping — the pair is what makes the word above a
+        // measurement rather than a constant.
+        let inside = job_ceiling(
+            lent,
+            Some(herd_proto::JobNeed {
+                memory_mib: 512,
+                tmpfs_mib: 0,
+            }),
+        );
+        assert_eq!(inside.memory_max(), 563 * (1 << 20));
+        assert!(!inside.line(true, None).expect("a line").contains("CLAMPED"));
+    }
+
+    /// A declaration too small to start a shell is **floored**, not obeyed.
+    ///
+    /// [`MINIMUM_MEMORY_MAX`] is a measurement — 16 MiB is what
+    /// `/bin/sh -c 'echo ok'` needs of address space — and
+    /// [`Confined::prepare`] already refuses a *global* figure under it
+    /// because invariant 2 asks for a cap and not for a wall. A per-job
+    /// figure under it is that same wall arriving from the hub, and it gets
+    /// the same answer; the job still runs, and the line says the floor is
+    /// what was written.
+    #[test]
+    fn a_declaration_under_the_floor_is_floored_and_says_so() {
+        let tiny = job_ceiling(
+            2 << 30,
+            Some(herd_proto::JobNeed {
+                memory_mib: 1,
+                tmpfs_mib: 0,
+            }),
+        );
+        assert_eq!(tiny.memory_max(), MINIMUM_MEMORY_MAX);
+        let said = tiny
+            .line(true, None)
+            .expect("a costed job has a ceiling worth a line");
+        assert!(
+            said.contains("floored at"),
+            "a figure the runner raised must say it raised it: {said}"
+        );
+
+        // And the floor is a floor and not a replacement: a figure above it
+        // and under what the owner lends is left exactly alone.
+        let above = job_ceiling(
+            2 << 30,
+            Some(herd_proto::JobNeed {
+                memory_mib: 1024,
+                tmpfs_mib: 0,
+            }),
+        );
+        assert_eq!(above.memory_max(), 1126 * (1 << 20));
+        assert!(!above
+            .line(true, None)
+            .expect("a line")
+            .contains("floored at"));
+    }
+
+    /// A host that cannot make a cgroup says the ceiling is **NOT ENFORCED**,
+    /// per job, rather than printing the figure and leaving it there.
+    ///
+    /// The fallback is `RLIMIT_AS` on the job's first process: one process's
+    /// address space, not the resident memory of a process tree. That is a
+    /// weaker thing than a kernel ceiling on the job, and a runner that named
+    /// the figure without naming the weakness would be reporting a ceiling it
+    /// does not hold.
+    #[test]
+    fn a_host_that_cannot_enforce_a_per_job_ceiling_says_so_per_job() {
+        // Lent generously, so that this test is about the host's sentence and
+        // not about the clamp: the two are asserted apart.
+        let ceiling = job_ceiling(
+            16 << 30,
+            Some(herd_proto::JobNeed {
+                memory_mib: 4096,
+                tmpfs_mib: 0,
+            }),
+        );
+        let fallen_back = ceiling
+            .line(false, Some("there is no cgroup v2 here."))
+            .expect("a costed job on a fallback host has something to say");
+        assert!(
+            fallen_back.contains("NOT ENFORCED"),
+            "the honest word has to be in it: {fallen_back}"
+        );
+        assert!(
+            fallen_back.contains("there is no cgroup v2 here."),
+            "and the host's own reason, so an operator knows what to grant: {fallen_back}"
+        );
+        assert!(
+            fallen_back.contains("4096 MiB of memory"),
+            "with the figure that is not being enforced: {fallen_back}"
+        );
+
+        // The same ceiling on a host that *can* enforce it says the opposite,
+        // and that pair is what makes the sentence above a measurement of the
+        // host rather than a constant.
+        let enforced = ceiling
+            .line(true, None)
+            .expect("a costed job has a ceiling worth a line");
+        assert!(!enforced.contains("NOT ENFORCED"), "{enforced}");
+        assert!(enforced.contains("memory.max"), "{enforced}");
     }
 }

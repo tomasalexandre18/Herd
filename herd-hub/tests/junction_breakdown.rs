@@ -828,7 +828,14 @@ fn each_post_alone() {
             (0..5)
                 .map(|_| {
                     let at = Instant::now();
-                    std::hint::black_box(herd_hub::matcher::reserved(&records));
+                    // Nothing is known about any runner in this fixture, so
+                    // a costed job is charged its declared ceiling whole:
+                    // the cost this bench measures is the walk over the
+                    // records, not the clamp.
+                    std::hint::black_box(herd_hub::matcher::reserved(
+                        &records,
+                        &std::collections::BTreeMap::new(),
+                    ));
                     at.elapsed()
                 })
                 .collect(),

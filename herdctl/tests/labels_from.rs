@@ -235,13 +235,27 @@ async fn a_reading_is_an_ordinary_job_and_the_real_job_is_placed_on_its_answer()
         why.contains(&READ_LABELS.join(", ")),
         "the placement must be on the labels the reading answered: {why:?}"
     );
+    // The *ceiling* each figure earns, not the figure itself: what a job costs
+    // a machine is what its runner will grant it, which is the declared sum
+    // plus `CEILING_MARGIN_PERCENT` (ORCH-312). Derived here rather than
+    // written out, so that this assertion is about which figure won and not
+    // about the margin.
+    let ceiling_of = |memory_mib| {
+        herd_proto::size_mib(
+            herd_proto::JobNeed {
+                memory_mib,
+                tmpfs_mib: 0,
+            }
+            .ceiling_mib(),
+        )
+    };
     assert!(
-        why.contains(&herd_proto::size_mib(READ_MEMORY_MIB))
-            && !why.contains(&herd_proto::size_mib(PROBE_DECLARES_MEMORY_MIB)),
+        why.contains(&ceiling_of(READ_MEMORY_MIB))
+            && !why.contains(&ceiling_of(PROBE_DECLARES_MEMORY_MIB)),
         "the job must be admitted against the figure the reading gave ({}), not the one its \
          command declares ({}): {why:?}",
-        herd_proto::size_mib(READ_MEMORY_MIB),
-        herd_proto::size_mib(PROBE_DECLARES_MEMORY_MIB)
+        ceiling_of(READ_MEMORY_MIB),
+        ceiling_of(PROBE_DECLARES_MEMORY_MIB)
     );
 
     // The reading's own output is kept, as any job's is (E-15): the answer it

@@ -89,6 +89,7 @@ use crate::metrics::{host_load_milli, process_rss_bytes};
 use crate::reclaim::{kill_by_marker, JobTag};
 use crate::root::{DataRoot, Unmeasurable, Workspace};
 use crate::step::{self, Stage};
+use crate::Room;
 use crate::{CancelToken, Ending, NotTaken, Session};
 
 /// Output is read in chunks this size; a chunk is sent as soon as the process
@@ -186,11 +187,11 @@ impl Packs {
 /// Run one job: announce it, stream every step's output, cap each step,
 /// report how it ended and what it cost.
 ///
-/// Nine arguments, and they are the job: what to run, how it was declared,
-/// which packs it consumes and leaves, what it is allowed to cost, who to
-/// tell and how full this machine already is. Collapsing them into a struct
-/// would name the struct after this function and move the same list one line
-/// up.
+/// Ten arguments, and they are the job: what to run, how it was declared,
+/// which packs it consumes and leaves, what it is allowed to cost, what the
+/// hub costed it at, who to tell and how full this machine already is.
+/// Collapsing them into a struct would name the struct after this function
+/// and move the same list one line up.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     job_id: JobId,
@@ -202,6 +203,7 @@ pub async fn execute(
     session: Session,
     confined: Arc<Confined>,
     ceiling: Arc<JobsAtOnce>,
+    need: Option<herd_proto::JobNeed>,
 ) {
     // Taken in hand first, before a byte is written anywhere: that is what
     // numbers this job's output, holds its result against an acknowledgement,
@@ -215,7 +217,24 @@ pub async fn execute(
     // will actually run it rather than failing. The reason names which of the
     // three it was, because "the PC said no", "she is gaming on the PC" and
     // "that machine is full" are different facts about different machines.
-    let cancel = match session.take_job(&job_id, attempt, ceiling.most()) {
+    // **This job's own ceiling, before the machine is asked whether it has
+    // room for it** — because what it has room for is now this figure and no
+    // longer a seat (invariant 2). The caps are cloned and the memory one
+    // replaced, rather than read per site, so that every sentence downstream
+    // names the figure this job was actually held to: the `memory.max`
+    // written into its cgroup, the address-space limit a host with no cgroup
+    // falls back to, the figure reported with `stopped_by_cap { memory }`,
+    // and the mebibytes the next assignment is weighed against are then one
+    // number by construction and cannot drift apart. The other four caps are
+    // the machine's and are untouched.
+    let memory_ceiling = crate::confine::job_ceiling(confined.caps().memory_max, need);
+    let room = Room {
+        most_at_once: ceiling.most(),
+        admissible_mib: ceiling.admissible_mib(),
+        grant_mib: memory_ceiling.charged_mib(),
+    };
+
+    let cancel = match session.take_job(&job_id, attempt, &room) {
         Ok(cancel) => cancel,
         // A refusal for this machine's own ceiling says so in a field as well
         // as in the sentence (D182): the hub charges a job a go for an
@@ -224,9 +243,14 @@ pub async fn execute(
         // that. The other two refusals are about this runner going away —
         // draining, or withdrawn by its owner — and are counted as they
         // always were.
-        Err(not_taken @ (NotTaken::AtItsCeiling { .. } | NotTaken::StillRunningThisJob { .. })) => {
+        Err(
+            not_taken @ (NotTaken::AtItsCeiling { .. }
+            | NotTaken::PastItsMemorySum { .. }
+            | NotTaken::StillRunningThisJob { .. }),
+        ) => {
             let running = match not_taken {
                 NotTaken::AtItsCeiling { running, .. }
+                | NotTaken::PastItsMemorySum { running, .. }
                 | NotTaken::StillRunningThisJob { running, .. } => running,
                 _ => unreachable!("the pattern above admits nothing else"),
             };
@@ -281,7 +305,9 @@ pub async fn execute(
         }
     };
 
-    let caps = confined.caps();
+    let mut per_job_caps = confined.caps().clone();
+    per_job_caps.memory_max = memory_ceiling.memory_max();
+    let caps = &per_job_caps;
     let stages = match &declaration {
         // Exactly the job Herd has run since M4: one command line, one
         // process, the runner's own cap, and no step on the record at all.
@@ -365,7 +391,22 @@ pub async fn execute(
     // lines about it. Unique per runner process, so one job's kill can never
     // reach another job's processes.
     let tag = JobTag::mint(&job_id);
-    let cgroup = confined.ceiling().open_for_job(&tag);
+    let cgroup = confined
+        .ceiling()
+        .open_for_job(&tag, memory_ceiling.memory_max());
+
+    // **What this job is held to, said per job, because the figure is now per
+    // job.** Silence for a job the hub costed at nothing: its ceiling is the
+    // one the startup report already named. Loud for a job that declares a
+    // figure on a host that cannot enforce one — the fallback bounds one
+    // process's address space and not the job's tree, so what the hub
+    // admitted this job against is not enforced there, and a runner that
+    // printed the figure without that word would be reporting a ceiling it
+    // does not hold.
+    if let Some(said) = memory_ceiling.line(cgroup.is_some(), confined.ceiling().fallback_reason())
+    {
+        eprintln!("herd-runner: job {job_id} {said}");
+    }
 
     // Counted across every step and both streams: the log the hub keeps and
     // the requester reads is one log, whatever produced it.
@@ -2150,7 +2191,7 @@ mod tests {
 
         let session = Session::new();
         let _cancel = session
-            .take_job(&job_id, 1, 4)
+            .take_job(&job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
         reclaim_or_say(&root, &workspace, &job_id, 1, &session);
 
@@ -2197,7 +2238,7 @@ mod tests {
 
         let session = Session::new();
         let _cancel = session
-            .take_job(&job_id, 1, 4)
+            .take_job(&job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
         reclaim_or_say(&root, &workspace, &job_id, 1, &session);
 

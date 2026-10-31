@@ -588,7 +588,7 @@ make sense read as a chain from outside in:
 | Herd's whole subtree | `MemoryMax=` on the unit | the runner plus every job it runs (Q6, ~12 GiB) |
 | what Herd says it lends | `--host-memory` | what the hub is allowed to admit here |
 | what stays hers regardless | `--host-memory-floor` | subtracted before anything is admitted (E-29) |
-| one job | `--job-memory-max` | the kernel ceiling on a single job |
+| one job nobody costed | `--job-memory-max` | the kernel ceiling on a job that declares no memory need; a job that declares one is held to its own figure |
 
 **The number to look up is the PC's RAM**, because every figure below it
 is a fraction of it and the 12 GiB of Q6 assumes a 32 GiB machine. From

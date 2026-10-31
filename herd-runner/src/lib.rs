@@ -83,7 +83,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub use confine::{
-    jobs_at_once, Confined, Confinement, JobsAtOnce, A_RUNNERS_OWN_CEILING, DEFAULT_MEMORY_MAX,
+    job_ceiling, jobs_at_once, Confined, Confinement, JobCeiling, JobsAtOnce,
+    A_RUNNERS_OWN_CEILING, A_RUNNERS_OWN_MEMORY_SUM, DEFAULT_MEMORY_MAX,
     JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
 };
 use spool::Spooled;
@@ -489,7 +490,35 @@ pub(crate) enum NotTaken {
     /// the hub**: a hub whose arithmetic is right never reaches this, and a
     /// runner that reached it says so rather than finding out what N times
     /// its memory ceiling does to its host.
+    ///
+    /// **The count, which is the bound a host that will not say how much
+    /// memory it lends has.** A host that says its size is bounded by
+    /// [`NotTaken::PastItsMemorySum`] instead — the same bound at finer
+    /// granularity, and the finer one admits every set this one admitted.
     AtItsCeiling { running: usize, most: usize },
+    /// The ceilings it has already granted, plus the one this job would be
+    /// granted, come to more than the memory its host lends after the floor
+    /// it keeps (invariant 2).
+    ///
+    /// **The same bound [`NotTaken::AtItsCeiling`] is, stated over the
+    /// figures instead of over a count.** Today the permitted total is
+    /// `seats × --job-memory-max ≤ lent − floor`; here it is
+    /// `Σ granted ≤ lent − floor`. The bound does not move and invariant 2's
+    /// exposure does not move with it: what changes is that a job granted
+    /// less than the cap costs this machine less than a whole seat.
+    ///
+    /// Not a statement about the hub either, and it spends none of the job's
+    /// goes (D182): the machine is here, healthy, and holding exactly what it
+    /// said it would hold.
+    PastItsMemorySum {
+        running: usize,
+        /// What the jobs already running here were granted, in MiB.
+        held_mib: u64,
+        /// What this one would be granted, in MiB.
+        grant_mib: u64,
+        /// What this host lends after its own floor, in MiB.
+        admissible_mib: u64,
+    },
     /// It is **already running another attempt of this very job**, and one
     /// machine runs one job once (D182).
     ///
@@ -505,6 +534,47 @@ pub(crate) enum NotTaken {
     },
 }
 
+/// What one assignment is weighed against: this machine's own two bounds, and
+/// what this job's ceiling was granted at.
+///
+/// A struct rather than three more arguments to
+/// [`Session::take_job`], so that the dozen unit tests of the refusals say
+/// which bound they are about. Every field is a figure somebody else already
+/// derived — the caller holds the one [`confine::JobsAtOnce`] the runner
+/// announced and the one [`JobCeiling`] this job's cgroup will be written
+/// from, and a second derivation here would be a second answer to one
+/// question.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Room {
+    /// The count this runner announced ([`confine::JobsAtOnce::most`]).
+    pub(crate) most_at_once: usize,
+    /// The memory this host lends after its floor, in MiB, or `None` from a
+    /// host that will not say how big it is
+    /// ([`confine::JobsAtOnce::admissible_mib`]).
+    pub(crate) admissible_mib: Option<u64>,
+    /// What this job's granted ceiling is charged at, in MiB
+    /// ([`JobCeiling::charged_mib`]).
+    pub(crate) grant_mib: u64,
+}
+
+impl Room {
+    /// A machine bounded by its announced count alone, for the tests of the
+    /// refusals that are not about memory.
+    ///
+    /// `admissible_mib: None` is a host that will not say how much memory it
+    /// lends, which is the one state in which the count is still the whole of
+    /// the bound — so these tests go on asserting exactly what they asserted,
+    /// against the branch that still answers them.
+    #[cfg(test)]
+    pub(crate) fn seats_only(most: usize) -> Self {
+        Self {
+            most_at_once: most,
+            admissible_mib: None,
+            grant_mib: 0,
+        }
+    }
+}
+
 impl NotTaken {
     /// The sentence the hub is given, which is the whole of what a reader of
     /// the record learns about why this machine said no.
@@ -517,6 +587,21 @@ impl NotTaken {
             ),
             NotTaken::AtItsCeiling { running, .. } => format!(
                 "the runner is already running {running} job(s) and never started this job: {}",
+                ceiling.why()
+            ),
+            NotTaken::PastItsMemorySum {
+                running,
+                held_mib,
+                grant_mib,
+                admissible_mib,
+            } => format!(
+                "the runner is already running {running} job(s) and never started this job: {} \
+                 {} of the {} it admits, and this job would be held to {} more, which does \
+                 not fit in what is left. {}",
+                confine::A_RUNNERS_OWN_MEMORY_SUM,
+                herd_proto::size_mib(*held_mib),
+                herd_proto::size_mib(*admissible_mib),
+                herd_proto::size_mib(*grant_mib),
                 ceiling.why()
             ),
             NotTaken::StillRunningThisJob { held, running, .. } => format!(
@@ -676,6 +761,18 @@ struct JobInHand {
     /// different path (D151). The first drop says what the cap is; the total
     /// is said once, when the job is let go.
     trimmed: u64,
+    /// What this job's granted ceiling is charged at, in MiB
+    /// (`JobCeiling::charged_mib`), for as long as it is running.
+    ///
+    /// **Written down when the job is taken in hand and never recomputed**:
+    /// the sum the next assignment is weighed against has to be a sum of the
+    /// figures really granted, and a figure re-derived later from a
+    /// `--job-memory-max` that moved, or from a need read a second time,
+    /// would be a bound on a set of jobs that do not exist. There is nothing
+    /// to release: a job leaves this map by every one of the ways it can end,
+    /// and leaving it is what gives the mebibytes back (D79's rule, one
+    /// level down).
+    granted_mib: u64,
 }
 
 impl JobInHand {
@@ -2136,6 +2233,10 @@ impl Session {
                     end: None,
                     cancel: cancel.clone(),
                     trimmed: 0,
+                    // Nought: this door exists to reach states `take_job`
+                    // refuses, and a figure here would be a grant nothing
+                    // granted.
+                    granted_mib: 0,
                 },
             );
             cancel
@@ -2168,7 +2269,7 @@ impl Session {
         &self,
         job_id: &JobId,
         attempt: u32,
-        most_at_once: usize,
+        room: &Room,
     ) -> Result<CancelToken, NotTaken> {
         self.with(|inner| {
             if inner.draining {
@@ -2184,10 +2285,10 @@ impl Session {
             if !inner.switch.claims() {
                 return Err(NotTaken::Switched(inner.switch.clone()));
             }
-            // And this machine's own ceiling, in the same place and under the
-            // same lock, for the same reason: the count has to be read and the
-            // entry written without an instant in between, or two assignments
-            // arriving together would both find room for the last one.
+            // And this machine's own room, in the same place and under the
+            // same lock, for the same reason: it has to be read and the entry
+            // written without an instant in between, or two assignments
+            // arriving together would both find room for the last place.
             //
             // **Jobs that are still running, not jobs still on the books.** A
             // finished job whose verdict the hub has not acknowledged holds a
@@ -2195,11 +2296,61 @@ impl Session {
             // ceiling, and counting it would let a slow hub shut a working
             // machine down.
             let running = inner.jobs.values().filter(|job| job.end.is_none()).count();
-            if running >= most_at_once {
-                return Err(NotTaken::AtItsCeiling {
-                    running,
-                    most: most_at_once,
-                });
+            // **The two bounds, and which one this host has.**
+            //
+            // Today's permitted total on a machine that says how big it is
+            // was `seats × --job-memory-max ≤ lent − floor`, with `seats` the
+            // count it announced. Here it is `Σ granted ≤ lent − floor`:
+            // **the same bound, finer granularity.** Invariant 2's exposure
+            // does not move — a job is still held to an explicit ceiling and
+            // the ceilings still have to fit in the memory this host says it
+            // lends after the floor it says it keeps — and what changes is
+            // that a job granted less than the cap costs less than a whole
+            // seat. Every grant is at most the cap, so `Σ granted ≤
+            // seats × cap`: the sum admits every set the count admitted and
+            // refuses nothing the count would have taken.
+            //
+            // The count is **kept beside it** and is the bound a host that
+            // will not say how much memory it lends has: there is nothing to
+            // sum against there, and
+            // `JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY` is the whole of that
+            // machine's arithmetic exactly as it was. Keeping it as a second
+            // hard bound on a host that *did* say its size would make the sum
+            // unreachable rather than safer — `seats × cap ≤ lent − floor`,
+            // so the count always bites first — and a bound nothing can reach
+            // is not a bound, it is a line of code that passes a test.
+            match room.admissible_mib {
+                Some(admissible) => {
+                    let held: u64 = inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.end.is_none())
+                        .map(|job| job.granted_mib)
+                        .sum();
+                    // **A machine too small to hold one job at its own
+                    // ceiling holds one anyway**, which is `jobs_at_once`'s
+                    // own `.max(1)` said over the sum instead of over the
+                    // count. Without this clause a host lending less after
+                    // its floor than it caps a job at would take no job at
+                    // all, and a runner that runs nothing is not the thing
+                    // invariant 2 asks for.
+                    if running > 0 && held.saturating_add(room.grant_mib) > admissible {
+                        return Err(NotTaken::PastItsMemorySum {
+                            running,
+                            held_mib: held,
+                            grant_mib: room.grant_mib,
+                            admissible_mib: admissible,
+                        });
+                    }
+                }
+                None => {
+                    if running >= room.most_at_once {
+                        return Err(NotTaken::AtItsCeiling {
+                            running,
+                            most: room.most_at_once,
+                        });
+                    }
+                }
             }
             // **One machine runs one job once.** The map holds both attempts
             // honestly since the entries were keyed by job *and* attempt
@@ -2230,7 +2381,7 @@ impl Session {
                 return Err(NotTaken::StillRunningThisJob {
                     held,
                     running,
-                    most: most_at_once,
+                    most: room.most_at_once,
                 });
             }
             let cancel = CancelToken::new();
@@ -2243,6 +2394,7 @@ impl Session {
                     end: None,
                     cancel: cancel.clone(),
                     trimmed: 0,
+                    granted_mib: room.grant_mib,
                 },
             );
             Ok(cancel)
@@ -4672,6 +4824,13 @@ async fn serve_hub(
                 // exists to prevent.
                 packs_in,
                 packs_out,
+                // What the hub costed this job at, which until now it kept
+                // to itself: the runner is the only thing that writes a
+                // kernel memory ceiling, and it had never been told the
+                // figure the job was admitted against (D180's open half).
+                // `None` is a job costed at nothing, and keeps this
+                // runner's own `--job-memory-max`.
+                need,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
@@ -4705,6 +4864,7 @@ async fn serve_hub(
                         session,
                         confined,
                         ceiling,
+                        need,
                     )
                     .await
                 });
@@ -5110,6 +5270,9 @@ mod tests {
             end: None,
             cancel: CancelToken::new(),
             trimmed: 0,
+            // These two tests are about the held-bytes cap and not about
+            // room on the machine, so this job cost it nothing.
+            granted_mib: 0,
         };
         let chunk = vec![b'x'; 1024 * 1024];
         for seq in 0..8 {
@@ -5135,6 +5298,9 @@ mod tests {
             end: None,
             cancel: CancelToken::new(),
             trimmed: 0,
+            // These two tests are about the held-bytes cap and not about
+            // room on the machine, so this job cost it nothing.
+            granted_mib: 0,
         };
         for seq in 0..5 {
             job.remember(seq, LogStream::Stdout, b"hello");
@@ -5176,7 +5342,7 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000057");
         let _cancel = session
-            .take_job(&job_id, 1, 4)
+            .take_job(&job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
 
         // The buffered output, as the runner holds it with no link up. These
@@ -5253,7 +5419,9 @@ mod tests {
         session.start_draining("the owner asked");
         assert!(session.draining());
         assert_eq!(
-            session.take_job(&JobId::new("j1"), 1, 4).err(),
+            session
+                .take_job(&JobId::new("j1"), 1, &Room::seats_only(4))
+                .err(),
             Some(NotTaken::Draining),
             "a draining runner must refuse a job the hub had already sent, and say which \
              refusal it was"
@@ -5276,17 +5444,201 @@ mod tests {
         let most = 3;
         for n in 1..=most {
             session
-                .take_job(&JobId::new(format!("j{n:010}")), 1, most)
+                .take_job(&JobId::new(format!("j{n:010}")), 1, &Room::seats_only(most))
                 .expect("a runner under its ceiling takes the job");
         }
         assert_eq!(
-            session.take_job(&JobId::new("j0000000004"), 1, most).err(),
+            session
+                .take_job(&JobId::new("j0000000004"), 1, &Room::seats_only(most))
+                .err(),
             Some(NotTaken::AtItsCeiling {
                 running: most,
                 most
             }),
             "a runner holding all it can hold must refuse the next one, whatever the hub \
              believes about it"
+        );
+    }
+
+    /// **Two jobs where one seat held one.** The thing ORCH-312 is for, at the
+    /// lock that decides it.
+    ///
+    /// A host lending 8 GiB and keeping 1 GiB as its floor, capping every job
+    /// at 7 GiB: `jobs_at_once` is `floor(7168 / 7168) = 1`, so this machine
+    /// held **one** job however small it was. Two jobs each declaring 1700 MiB
+    /// are granted 1870 MiB apiece — 3740 MiB of the 7168 this host admits —
+    /// and the machine takes both.
+    ///
+    /// **The permitted total did not move**: it was `1 × 7168` and it is
+    /// `Σ granted ≤ 7168`. Finer granularity, the same bound.
+    #[tokio::test]
+    async fn two_declared_jobs_fit_where_one_seat_held_one() {
+        let host = herd_proto::HostSize::new(Some(8192), Some(8)).with_floor(Some(1024));
+        let cap = 7168 << 20;
+        let ceiling = crate::confine::jobs_at_once(&host, cap);
+        assert_eq!(
+            ceiling.most(),
+            1,
+            "the premise of this test is a one-seat machine"
+        );
+        assert_eq!(ceiling.admissible_mib(), Some(7168));
+
+        let need = herd_proto::JobNeed {
+            memory_mib: 1700,
+            tmpfs_mib: 0,
+        };
+        let grant = crate::confine::job_ceiling(cap, Some(need));
+        assert_eq!(grant.charged_mib(), 1870, "1700 MiB plus the 10% margin");
+        let room = Room {
+            most_at_once: ceiling.most(),
+            admissible_mib: ceiling.admissible_mib(),
+            grant_mib: grant.charged_mib(),
+        };
+
+        let session = Session::new();
+        session
+            .take_job(&JobId::new("j0000000001"), 1, &room)
+            .expect("the first of two 1.7 GiB jobs");
+        session
+            .take_job(&JobId::new("j0000000002"), 1, &room)
+            .expect(
+                "and the second, which the seat count refused and the sum has room for: this \
+                 assertion is the whole of ORCH-312 on the runner's side",
+            );
+    }
+
+    /// And the sum refuses the job that would cross it, with every figure in
+    /// the sentence and the arithmetic quoted whole.
+    ///
+    /// The same machine, and a job declaring 6000 MiB: 6600 MiB of granted
+    /// ceiling on top of 1870 MiB already held is 8470 of the 7168 this host
+    /// admits, so it does not fit and is handed straight back.
+    #[tokio::test]
+    async fn the_sum_refuses_the_job_that_would_cross_it_and_says_the_figures() {
+        let host = herd_proto::HostSize::new(Some(8192), Some(8)).with_floor(Some(1024));
+        let cap = 7168 << 20;
+        let ceiling = crate::confine::jobs_at_once(&host, cap);
+        let small = crate::confine::job_ceiling(
+            cap,
+            Some(herd_proto::JobNeed {
+                memory_mib: 1700,
+                tmpfs_mib: 0,
+            }),
+        );
+        let large = crate::confine::job_ceiling(
+            cap,
+            Some(herd_proto::JobNeed {
+                memory_mib: 6000,
+                tmpfs_mib: 0,
+            }),
+        );
+        let room_for = |grant_mib| Room {
+            most_at_once: ceiling.most(),
+            admissible_mib: ceiling.admissible_mib(),
+            grant_mib,
+        };
+
+        let session = Session::new();
+        session
+            .take_job(
+                &JobId::new("j0000000001"),
+                1,
+                &room_for(small.charged_mib()),
+            )
+            .expect("the first job fits");
+        let refused = session
+            .take_job(
+                &JobId::new("j0000000002"),
+                1,
+                &room_for(large.charged_mib()),
+            )
+            .expect_err("the second does not");
+        assert_eq!(
+            refused,
+            NotTaken::PastItsMemorySum {
+                running: 1,
+                held_mib: 1870,
+                grant_mib: 6600,
+                admissible_mib: 7168,
+            }
+        );
+        let said = refused.sentence(&ceiling);
+        assert!(
+            said.contains(crate::confine::A_RUNNERS_OWN_MEMORY_SUM),
+            "a refusal for the sum has to be attributable to the sum: {said}"
+        );
+        assert!(
+            said.contains(A_RUNNERS_OWN_CEILING) && said.contains("floor"),
+            "and it has to carry the arithmetic, or nobody can tell a full machine from a \
+             broken one: {said}"
+        );
+    }
+
+    /// **A machine too small to hold one job at its own ceiling holds one
+    /// anyway** — `jobs_at_once`'s own `.max(1)`, said over the sum.
+    ///
+    /// A runner that took no job at all would not be the thing invariant 2
+    /// asks for, and this is the one place the sum is allowed to be crossed:
+    /// by the first job, on a machine that cannot fit it, exactly as the seat
+    /// count allowed before there was a sum.
+    #[tokio::test]
+    async fn a_host_smaller_than_one_ceiling_still_takes_one_job_and_no_more() {
+        let host = herd_proto::HostSize::new(Some(2048), Some(8)).with_floor(Some(1024));
+        let cap = 7168 << 20;
+        let ceiling = crate::confine::jobs_at_once(&host, cap);
+        assert_eq!(ceiling.most(), 1, "the `.max(1)` branch");
+        assert_eq!(ceiling.admissible_mib(), Some(1024));
+        let uncosted = crate::confine::job_ceiling(cap, None);
+        let room = Room {
+            most_at_once: ceiling.most(),
+            admissible_mib: ceiling.admissible_mib(),
+            grant_mib: uncosted.charged_mib(),
+        };
+        let session = Session::new();
+        session
+            .take_job(&JobId::new("j0000000001"), 1, &room)
+            .expect("one job, on a machine that cannot fit one: today's answer, unchanged");
+        assert!(
+            matches!(
+                session.take_job(&JobId::new("j0000000002"), 1, &room),
+                Err(NotTaken::PastItsMemorySum { .. })
+            ),
+            "and no more than one"
+        );
+    }
+
+    /// The flood's own arithmetic, at the lock: 4 GiB lent, 2 GiB kept, a
+    /// 256 MiB cap, uncosted jobs — **eight**, and the ninth refused.
+    ///
+    /// `herd-hub/tests/fake_hub_flood.rs` asserts the same figure against the
+    /// real binaries and a hub that is not one. This is the unit the figure
+    /// comes out of, so a change to the sum that moved it fails here in a
+    /// second rather than there in a minute.
+    #[tokio::test]
+    async fn the_floods_eight_is_the_sums_eight() {
+        let host = herd_proto::HostSize::new(Some(4096), Some(4)).with_floor(Some(2048));
+        let cap = 256 << 20;
+        let ceiling = crate::confine::jobs_at_once(&host, cap);
+        assert_eq!(ceiling.most(), 8);
+        let uncosted = crate::confine::job_ceiling(cap, None);
+        assert_eq!(uncosted.charged_mib(), 256);
+        let room = Room {
+            most_at_once: ceiling.most(),
+            admissible_mib: ceiling.admissible_mib(),
+            grant_mib: uncosted.charged_mib(),
+        };
+        let session = Session::new();
+        for n in 1..=8 {
+            session
+                .take_job(&JobId::new(format!("j{n:010}")), 1, &room)
+                .expect("the first eight fit exactly");
+        }
+        assert!(
+            matches!(
+                session.take_job(&JobId::new("j0000000009"), 1, &room),
+                Err(NotTaken::PastItsMemorySum { .. })
+            ),
+            "and the ninth does not: 8 × 256 MiB is the whole 2048 this host admits"
         );
     }
 
@@ -5299,7 +5651,7 @@ mod tests {
         let session = Session::new();
         let finished = JobId::new("j0000000001");
         session
-            .take_job(&finished, 1, 1)
+            .take_job(&finished, 1, &Room::seats_only(1))
             .expect("the first job is taken");
         session.finish(
             &finished,
@@ -5312,7 +5664,9 @@ mod tests {
         );
         assert_eq!(session.results_held(), 1, "the verdict is still held");
         assert!(
-            session.take_job(&JobId::new("j0000000002"), 1, 1).is_ok(),
+            session
+                .take_job(&JobId::new("j0000000002"), 1, &Room::seats_only(1))
+                .is_ok(),
             "a machine whose one job has ended has its place back, acknowledged or not"
         );
     }
@@ -5433,7 +5787,7 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000403");
         let _first = session
-            .take_job(&job_id, 1, 8)
+            .take_job(&job_id, 1, &Room::seats_only(8))
             .expect("a fresh session is not draining");
         session.finish(
             &job_id,
@@ -5457,7 +5811,7 @@ mod tests {
         // Through `take_job`, which is reachable: its refusal is about a
         // job this runner is **running**, and attempt 1 has ended here.
         let second = session
-            .take_job(&job_id, 2, 8)
+            .take_job(&job_id, 2, &Room::seats_only(8))
             .expect("attempt 1 has ended, so nothing of this job is running here");
         assert_eq!(
             session.results_held(),
@@ -5516,7 +5870,7 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000009");
         let _cancel = session
-            .take_job(&job_id, 1, 4)
+            .take_job(&job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
 
         let workspace = confined
@@ -5652,7 +6006,7 @@ mod tests {
         std::fs::create_dir_all(spool).expect("a spool directory");
         std::fs::write(spool.join("results.json"), &bytes).expect("the spooled file");
         let _cancel = session
-            .take_job(job_id, 1, 4)
+            .take_job(job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
         herd_proto::JobOutputs {
             files: vec![herd_proto::OutputFile {
