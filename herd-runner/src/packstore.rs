@@ -540,12 +540,24 @@ pub struct Claims {
     /// families this runner keeps for the fleet, and how many of each. The
     /// newest `keep_per_key` of every named key are **never** evicted.
     ///
-    /// `None` is "the hub has pinned nothing here", which is still every
-    /// runner a hub of this build talks to: reading `Welcome.keeper_for` and
-    /// [`PinPacks`] and keeping the set across a redial is `lib.rs`'s
-    /// ([`crate::Session::keeps_for`], [`crate::Session::pin_packs`]), and
-    /// what makes a hub *name* a keeper is M12's keeper policy, which is the
-    /// hub's and is not written yet.
+    /// `None` is "the hub has pinned nothing here". Reading
+    /// `Welcome.keeper_for` and [`PinPacks`] and keeping the set across a
+    /// redial is `lib.rs`'s ([`crate::Session::keeps_for`],
+    /// [`crate::Session::pin_packs`]), and what makes a hub *name* a keeper
+    /// is M12's keeper policy, which is the hub's and **is written**: it
+    /// landed in batch 25 (D266) as `herd-hub`'s `Keepers`, filled from
+    /// `--keeper RUNNER` and `--keeper-for KEY=RUNNER`, put on every
+    /// welcome's `keeper_for` and sent as [`PinPacks`] to the runners whose
+    /// set moves.
+    ///
+    /// So `None` is no longer every runner a hub of this build talks to; it
+    /// is every runner of a hub nobody configured. The line that decides it
+    /// is that neither option has a default — `Keepers`' own doc in
+    /// `herd-hub/src/server.rs` puts it as "it names no default of its own:
+    /// a hub started with neither setting names nobody, sends `keeper_for`
+    /// on no welcome and sends no `PinPacks` at all" — which is the
+    /// consumer's hub today, and is why this field being `None` is still the
+    /// ordinary case rather than an unbuilt one.
     pub pins: Option<PinPacks>,
     /// How many packs of each key family the retention rule keeps while it
     /// can — [`KEEP_PER_KEY`] unless the caller says otherwise.
