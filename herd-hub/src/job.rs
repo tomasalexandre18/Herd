@@ -1594,6 +1594,31 @@ pub struct CollectionOwed {
     pub held: Vec<herd_proto::FileHeld>,
 }
 
+/// How far a streamed collection got, in the figures that answer *what was
+/// lost* with no sentence parsed (D167).
+///
+/// **Derived once and read twice.** The sentence a requester is given and
+/// the [`JobEventKind::CollectionShort`] line on the record are both built
+/// from one of these, taken at the instant the hub decides the wait is over.
+/// So the prose a person reads and the numbers a parser reads cannot
+/// disagree about one collection, which two separate reads of the disk would
+/// eventually make them do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionShortfall {
+    /// How many of the manifest's files are on this hub, whole and verified.
+    pub files_here: u64,
+    /// How many the manifest names. The difference is what was lost, and
+    /// every one of the missing paths is still on the record — in
+    /// `outputs.files`, with its length and its digest.
+    pub files_owed: u64,
+    /// How many bytes of them this hub holds.
+    pub bytes_here: u64,
+    /// How many the manifest promised.
+    pub bytes_owed: u64,
+    /// The runner that produced them and did not finish sending them.
+    pub runner: String,
+}
+
 /// What one streamed chunk completed, as the store saw it.
 ///
 /// Three outcomes rather than a `bool`, because the hub does three different
@@ -2041,6 +2066,22 @@ impl JobEvent {
         }
     }
 
+    /// The hub stopped waiting for a job's streamed collection, with the
+    /// figures of what never arrived (D167).
+    pub fn collection_short(at: Timestamp, got: &CollectionShortfall, why: &str) -> Self {
+        Self {
+            at,
+            what: JobEventKind::CollectionShort {
+                files_here: got.files_here,
+                files_owed: got.files_owed,
+                bytes_here: got.bytes_here,
+                bytes_owed: got.bytes_owed,
+                runner: got.runner.clone(),
+                why: why.to_owned(),
+            },
+        }
+    }
+
     /// A second identical submission joined this job rather than minting a
     /// new one (E-05).
     pub fn joined(at: Timestamp, submissions: u32, asked_for: Priority) -> Self {
@@ -2072,7 +2113,8 @@ impl JobEvent {
             | JobEventKind::Joined { .. }
             | JobEventKind::PriorityRaised { .. }
             | JobEventKind::Waiting { .. }
-            | JobEventKind::OutputsRemoved { .. } => None,
+            | JobEventKind::OutputsRemoved { .. }
+            | JobEventKind::CollectionShort { .. } => None,
         }
     }
 }
@@ -2171,6 +2213,51 @@ pub enum JobEventKind {
         bytes: u64,
         /// The same sentence [`OutputsRemoved`](crate::job::OutputsRemoved)
         /// carries, with the date and the budget in it.
+        why: String,
+    },
+    /// The hub stopped waiting for this job's streamed collection, and this
+    /// is how much of it never arrived (D167).
+    ///
+    /// **The derivation nobody performed.** The fact was already on the
+    /// record before this line existed: `outputs.files` names every file
+    /// with its length and its digest while `files/` holds fewer of them, so
+    /// a job that produced nothing and a job whose outputs were dropped are
+    /// two *distinguishable* states of a record reading `finished, exited
+    /// 0`. What was missing is that nothing ever **derived** the
+    /// distinction. Both durable witnesses were the hub's own stdout, which
+    /// is not a record, and that is how the first consumer lost 17 files and
+    /// 42 MiB on 2026-10-31 under a verdict a nightly would read as green.
+    ///
+    /// **Written once ever**, by [`JobStore::note_collection_short`], and
+    /// that is not a nicety: the give-up is reached when the verdict is
+    /// first held and found hopeless, from the held-verdict loop after
+    /// [`crate::COLLECTION_SILENCE`], and again from *every* late `herdctl
+    /// wait --outputs-to` on the same job for ever after. A line per caller
+    /// would be a history that grows with its readers.
+    ///
+    /// **Counts and not paths**, which is
+    /// [`JobEventKind::OutputsRemoved`]'s own ruling and for its reason: the
+    /// paths are in the manifest beside this line, in the same job
+    /// directory, and the 657-file collection D167 was measured on would
+    /// otherwise put 657 paths into one event line. What the counts buy is
+    /// the derivation itself — they are what tells a reader whether the
+    /// manifest is worth joining at all, which is the question nothing
+    /// answered.
+    CollectionShort {
+        /// How many of the manifest's files reached this hub.
+        files_here: u64,
+        /// How many it named. The difference is the loss, and every missing
+        /// path is on the record in `outputs.files`.
+        files_owed: u64,
+        /// How many bytes of them reached this hub.
+        bytes_here: u64,
+        /// How many the manifest promised.
+        bytes_owed: u64,
+        /// The runner that did not finish sending them.
+        runner: String,
+        /// The same sentence the requester was given: how far it got, and
+        /// why waiting longer bought nothing — the runner is gone, or
+        /// nothing has landed for the silence bound.
         why: String,
     },
 }
@@ -2529,6 +2616,28 @@ pub trait JobStore: Send + Sync + 'static {
     /// last-read stamp would be a record write per poll. What the sweeper
     /// needs is the boolean, and the boolean only ever changes once.
     fn note_outputs_fetched(&self, id: &JobId) -> Result<()>;
+
+    /// Write down that this job's streamed collection was given up on, if no
+    /// line of its history says so yet (D167).
+    ///
+    /// **A no-op after the first time**, for
+    /// [`JobEventKind::CollectionShort`]'s reason: the hub reaches the
+    /// give-up from three places, and a late `herdctl wait --outputs-to`
+    /// reaches one of them every time it is run. `Ok(true)` when the line
+    /// was written, `Ok(false)` when one was already there.
+    ///
+    /// **Not through `open_for_writing`**, for
+    /// [`Self::note_outputs_fetched`]'s reason: the one gate refuses every
+    /// write to a job that is over, and a collection can only be given up on
+    /// *after* the job is over. The state, the outcome, the metrics and the
+    /// manifest are untouched — this is the hub writing down what became of
+    /// the record's own files.
+    fn note_collection_short(
+        &self,
+        id: &JobId,
+        got: &CollectionShortfall,
+        why: &str,
+    ) -> Result<bool>;
 
     /// Bring the hub inside its output budget, and say what that cost
     /// (D152).

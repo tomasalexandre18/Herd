@@ -217,6 +217,15 @@ impl JobStore for CostlyStore {
         self.charge("note_outputs_fetched", 1);
         self.inner.note_outputs_fetched(id)
     }
+    fn note_collection_short(
+        &self,
+        id: &JobId,
+        got: &herd_hub::CollectionShortfall,
+        why: &str,
+    ) -> StoreResult<bool> {
+        self.charge("note_collection_short", 1);
+        self.inner.note_collection_short(id, got, why)
+    }
     fn sweep_outputs(&self) -> StoreResult<Sweep> {
         self.charge("sweep_outputs", self.directories);
         self.inner.sweep_outputs()

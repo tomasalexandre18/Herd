@@ -947,12 +947,19 @@ impl JobDirStore {
     /// it is the hub writing down what became of the record's own files. The
     /// state, the outcome, the metrics and the manifest are untouched.
     ///
-    /// **No `events.jsonl` line.** `JobEventKind` is `#[serde(tag =
-    /// "event")]` with no `#[serde(other)]` arm, so a new variant would make
-    /// the file undecodable to a hub rolled back — and the `outputs_removed`
-    /// line already on the history stays true: the bytes *were* removed that
-    /// day. What they are now is a question for the record, which is where
-    /// the mark lives.
+    /// **No `events.jsonl` line**, because there is nothing for one to say:
+    /// the `outputs_removed` line already on the history stays true — the
+    /// bytes *were* removed that day — and what they are now is a question
+    /// for the record, which is where the mark lives.
+    ///
+    /// This once also rested on the cost of growing `JobEventKind` at all:
+    /// it is `#[serde(tag = "event")]` with no `#[serde(other)]` arm, so a
+    /// new variant makes a line undecodable to a reader built on an earlier
+    /// hub's type. That fact has not changed, but it is no longer a rule
+    /// freezing the variant list — `CollectionShort` was added for a line
+    /// nothing else derives, and the reasoning is in its own decision. So
+    /// the reason this path writes nothing is the first one and not the
+    /// second.
     ///
     /// Called with no lock held, and takes its own, because the caller goes
     /// on to [`Self::held_more`], which takes it too.
@@ -3149,6 +3156,33 @@ impl JobStore for JobDirStore {
         // the same reason (D148, D152).
         record.outputs.first_fetched_at = Some(Timestamp::now());
         self.write_record(&record)
+    }
+
+    fn note_collection_short(
+        &self,
+        id: &JobId,
+        got: &crate::job::CollectionShortfall,
+        why: &str,
+    ) -> Result<bool> {
+        // **The one-shot test, with no lock held**, because `job_events`
+        // takes the lock itself and this store's is not reentrant. Two
+        // callers racing between the read and the append would write the
+        // line twice, which is a duplicate on a history rather than a wrong
+        // figure; what the test is for is the unbounded case — a line per
+        // late `herdctl wait --outputs-to`, for ever — and that it prevents.
+        if self.job_events(id)?.is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event.what, crate::job::JobEventKind::CollectionShort { .. }))
+        }) {
+            return Ok(false);
+        }
+        let _live = self.lock()?;
+        if self.read_record(id)?.is_none() {
+            return Ok(false);
+        }
+        self.append_event(id, &JobEvent::collection_short(Timestamp::now(), got, why))?;
+        Ok(true)
     }
 
     fn sweep_outputs(&self) -> Result<crate::job::Sweep> {
