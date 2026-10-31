@@ -387,8 +387,8 @@ Five things a reader must not mistake for done:
 4. **E-30's real kernel ceiling is only asserted under a delegated
    cgroup.** Without delegation the runner falls back to `RLIMIT_AS`,
    weaker in three named ways (D23). That is most of why the suite
-   reports **12** loud skips on a host with no delegated subtree on a
-   block device (D27): every one of the twelve is a cgroup-delegation
+   reports **13** loud skips on a host with no delegated subtree on a
+   block device (D27): every one of the thirteen is a cgroup-delegation
    or ZFS `io.max` assertion. E-30's WSL replay stays a manual M17
    check.
 5. **The three format numbers have all moved, and this paragraph gave
