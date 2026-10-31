@@ -6176,21 +6176,30 @@ async fn relay_from_runner(
                 // ordinary verdict, which is almost every verdict, reads no
                 // record for a collection it has not got.
                 //
-                // **What this costs on a healthy link, said plainly.** A
-                // collection whose runner never lost its link is already
-                // being pumped when this frame is handled, and this hub
-                // holds none of it yet, so the `JobFilesHeld` sent here
-                // reports zero and `FilesOut::resume_from` winds that
-                // runner's cursor back to the start of the collection. Every
-                // chunk in flight is then sent a second time and refused by
-                // offset, and the refusal carries this hub's real holdings,
-                // which winds the cursor forward again. Bounded by the
-                // runner's in-flight window — `FILES_IN_FLIGHT` 8 times
-                // `OUTPUT_CHUNK_BYTES` 1 MiB, so at most 8 MiB — paid once
-                // per streamed collection, and self-correcting. That is a
-                // real new cost on a path that had none, it is a transfer
-                // cost and not a correctness one, and it is a row of its own
-                // rather than a second change smuggled in here.
+                // **What this costs on a healthy link, with the measurement
+                // and not without it.** A collection whose runner never lost
+                // its link is already being pumped when this frame is
+                // handled, so this is a second start for it: the frame
+                // reports the nothing this hub holds, `FilesOut::resume_from`
+                // winds that runner's cursor back to the start of the
+                // collection, and a second `pump_files` task joins the
+                // first. The two cannot duplicate a chunk between them —
+                // `FilesOut::next` hands each one out once, under the
+                // session's own lock — so what the rewind can cost is the
+                // chunks already in flight when it lands, re-sent and
+                // refused by offset, with the refusal carrying this hub's
+                // real holdings and winding the cursor forward again.
+                //
+                // Measured on `outputs_whole`, a real runner streaming 33
+                // files of a megabyte over loopback, twice: **zero** refused
+                // chunks. On a link whose round trip is microseconds the
+                // rewind lands before anything has been sent, so there is
+                // nothing to re-send. The window it could cost on a link
+                // with real latency is `FILES_IN_FLIGHT` 8 times
+                // `OUTPUT_CHUNK_BYTES` 1 MiB — 8 MiB, once per collection,
+                // self-correcting — and that figure is reasoned from those
+                // two constants, not measured. Either way it is a transfer
+                // cost and not a correctness one.
                 if outputs.streamed && !outputs.files.is_empty() {
                     match state.store.collection_owed(&job_id) {
                         Ok(Some(collection)) if collection.runner == name => {
