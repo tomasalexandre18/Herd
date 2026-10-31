@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use herdctl::verdict::{JobExists, Verdict};
 use herdctl::{
-    could_not_start_message, impossible_exit_code_reason, job_id_line, no_verdict_message,
-    no_verdict_reason, setup_failed_message, stopped_by_cap_message, Config, DEFAULT_HUB_URL,
-    JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
+    cap_in_words, could_not_start_message, impossible_exit_code_reason, job_id_line,
+    no_verdict_message, no_verdict_reason, peak_memory_line, setup_failed_message,
+    stopped_by_cap_message, Config, DEFAULT_HUB_URL, JOB_UNKNOWN_LINE, NO_JOB_LINE,
+    NO_VERDICT_CODE,
 };
 
 /// What this invocation knows about whether a job of its own exists.
@@ -221,7 +222,12 @@ struct Keeping {
 const EXIT_CODES: &str = "\
 Exit codes:
   the job's own  worn untouched — 0, 1, 75, whatever the process exited with
-  124            a runner stopped the job at a cap: time, memory, log or disk
+  124            a runner stopped the job at a cap: time, memory, log or disk.
+                 One code for all four on purpose; **which** cap it was, its
+                 figure and the job's id are said on stderr, and for the
+                 memory cap that figure is the runner's own ceiling for every
+                 job it accepts (`--job-memory-max`), never this job's
+                 declared `--memory-mib`
   125            Herd has no verdict: it could not run the job, lost it,
                  refused it, could not be reached, or the machine it ran on
                  could not do its own part. Never a failing build
@@ -248,6 +254,11 @@ For a requester that is a program: --verdict-to
                      as a field
     ran_on           the runner the job ran on, and why there
     cap              which cap and its figures, when a cap ended the job
+    metrics          what the runner measured while the job ran, the job's
+                     peak memory among them. A figure nobody could take is
+                     **absent**, never a zero: `peak_memory_bytes` is the
+                     whole job's high-water mark with page cache counted in,
+                     so it reads high, and the stderr line beside it says so
 
   Every key is always present; a field with nothing in it is null. The
   document carries its own `verdict_format_version` as its first field. The
@@ -829,6 +840,19 @@ async fn main() -> ExitCode {
                 JobOutcome::SetupFailed { reason } => said.push(setup_failed_message(reason)),
                 JobOutcome::StoppedByCap { cap, limit, detail } => {
                     said.push(stopped_by_cap_message(*cap, *limit, detail.as_deref()));
+                    // And which of the four it was, in words, with the figure
+                    // and the job's id — because 124 is one code for all four
+                    // caps on purpose and nobody should have to fetch the
+                    // record to learn whether it was time, memory, log or
+                    // disk. For memory it also says the ceiling is the
+                    // runner's own and not the job's `--memory-mib`, which
+                    // the first consumer read the other way (`cap_in_words`).
+                    said.push(cap_in_words(
+                        &finished.job_id,
+                        *cap,
+                        *limit,
+                        detail.as_deref(),
+                    ));
                 }
                 JobOutcome::Exited { .. }
                 | JobOutcome::Signalled { .. }
@@ -852,6 +876,18 @@ async fn main() -> ExitCode {
             // was (D20).
             if let Some(reason) = no_verdict_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
+            }
+            // What the job actually took, which Herd has measured since M4
+            // and showed the requester nowhere. Said for **every** job that
+            // reached a machine, whatever the ending — a job stopped at its
+            // memory cap is the one whose peak a requester most wants — and
+            // for no job that reached none, where "not measured" would be
+            // noise about a job that never ran. Absent prints as absent and
+            // never as a small number (D23, ORCH-268): `peak_memory_line`
+            // carries the whole reading, unit and direction of error
+            // included.
+            if finished.ran_on.is_some() {
+                said.push(peak_memory_line(&finished.metrics));
             }
             // A verdict attributed to a commit the tree was not at (D176).
             // Said, and nothing more: the exit code stays the job's own,

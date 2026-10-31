@@ -128,6 +128,33 @@ pub struct Verdict {
     pub outcome: Option<JobOutcome>,
     /// What the runner measured while the job ran (E-15). `null` when no job
     /// ran to report anything.
+    ///
+    /// **`peak_memory_bytes` is the figure in here a requester reads most,
+    /// and it needs its reading beside it**, which is why that reading is
+    /// written out here rather than left to whoever finds the number. It is
+    /// the job cgroup's `memory.peak`: a high-water mark for the **whole
+    /// job**, every executor step of it, counting page cache and shared
+    /// memory as well as anonymous pages. So it **over-reports** what the job
+    /// needed of its own, and the only conclusions it supports are these — a
+    /// peak above a declared figure is conclusive that the job over-ran it, a
+    /// peak below it is conclusive that it did not, and a peak just above it
+    /// is conclusive of neither.
+    ///
+    /// **Absent is never zero** (D23), and the absence is meant: a job whose
+    /// host delegated no cgroup v2 leaves the runner sampling the job's own
+    /// process, which sees one pid and not its children — about 3.2 MB for a
+    /// job that compiled an entire workspace (ORCH-268). Nothing in this
+    /// document distinguishes a cgroup figure from a sampled one, so
+    /// `herdctl`'s stderr line ([`crate::peak_memory_line`], kept in
+    /// [`Verdict::said`]) names both possibilities rather than claiming the
+    /// one it cannot check.
+    ///
+    /// **The job's declared `memory_mib` is not here and cannot be**, which
+    /// is the one thing missing from the pair that would make this figure
+    /// evidence on its own: [`herd_proto::FromHub::JobFinished`] carries the
+    /// outcome, the metrics, the outputs and the commit, and none of the
+    /// job's requirements, so nothing at the point this document is composed
+    /// knows what the requester asked for.
     pub metrics: Option<JobMetrics>,
 }
 

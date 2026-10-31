@@ -274,6 +274,136 @@ pub fn stopped_by_cap_message(cap: Cap, limit: u64, detail: Option<&str>) -> Str
     )
 }
 
+/// The one stderr line that tells a requester the most memory its job ever
+/// held — and how to read that figure, which is the harder half.
+///
+/// **Measured since M4 and shown to nobody until now.**
+/// [`JobMetrics::peak_memory_bytes`] is read from the job cgroup's
+/// `memory.peak` while that cgroup still exists and kept in the hub's record
+/// for every job that ran; `herdctl` printed it nowhere, so a requester that
+/// wanted to know what its build actually took had to go and read the record.
+/// This is that figure, on stderr, where the person who submitted the job is
+/// already looking, and in the verdict document's `said` beside it.
+///
+/// **Its direction of error is part of the measurement.** `memory.peak` is a
+/// high-water mark for the **whole job** — every executor step of it, not the
+/// `run` step alone — and it counts page cache and shared memory as well as
+/// anonymous pages. So it reads **high**: it over-reports what the job needed
+/// of its own. What follows is the only honest reading of it, and the line
+/// carries it, because a figure quoted without it is a figure somebody
+/// tightens a declaration on. A peak **above** a declared figure is
+/// conclusive that the job over-ran it. A peak **below** it is conclusive
+/// that it did not. A peak **just above** it is conclusive of neither,
+/// because the margin may be page cache entirely.
+///
+/// **A figure nobody could take prints as "not measured", never as a number**
+/// (D23). And the line says one more thing, which is a limitation of the
+/// record and not of this line: on a host that delegates no cgroup v2 the
+/// runner has no `memory.peak` to read and falls back to sampling the job's
+/// own process, which sees one pid and not its children — a job that compiled
+/// an entire workspace reported about 3.2 MB that way (ORCH-268). **Nothing
+/// in the record distinguishes the two provenances**, so this line names both
+/// rather than claiming one it cannot check. Telling them apart is a change
+/// to [`herd_proto::JobMetrics`], which is a protocol surface and not this
+/// function's to make.
+///
+/// **The declaration is not beside it, and could not be from here.** The pair
+/// a requester actually wants is (what I declared, what it took), and
+/// [`herd_proto::FromHub::JobFinished`] carries the outcome, the metrics, the
+/// outputs and the commit — none of the job's requirements. So the figure
+/// goes out alone and says what it is.
+pub fn peak_memory_line(metrics: &JobMetrics) -> String {
+    match metrics.peak_memory_bytes {
+        Some(bytes) => format!(
+            "this job's peak memory was {}: the high-water mark of the whole job, every step \
+             of it, with page cache and shared memory counted in, so it reads high rather \
+             than low — a peak above a declared figure is conclusive that the job over-ran \
+             it, a peak below it is conclusive that it did not, and a peak just above it is \
+             conclusive of neither. Where the runner had no cgroup of its own to read, this \
+             was sampled from the job's first process instead and undercounts its children, \
+             and nothing in the record says which of the two this figure is (ORCH-268)",
+            herd_proto::size::measured_bytes(bytes)
+        ),
+        // Absent, and said as absent. A zero here would read as a job that
+        // held no memory, which is a measurement nobody took (D23).
+        None => "this job's peak memory was not measured: no figure for it came back, which \
+                 is not the same thing as a job that held no memory and must not be read as \
+                 a zero"
+            .to_owned(),
+    }
+}
+
+/// Which cap stopped a job, in words, beside the 124 — naming the cap, its
+/// figure with the unit, and the job it is about.
+///
+/// **124 stays one code for all four caps, and this is what makes that
+/// legible.** Not splitting it per cap is deliberate
+/// ([`STOPPED_BY_CAP_CODE`], D20's reasoning): the four caps are one event —
+/// the machine said no, so the job has no verdict of its own — and a
+/// requester branching on four numbers would be branching on which resource
+/// ran out rather than on whether it has an answer at all. What was missing
+/// was never the code; it was that nobody could learn *which* cap without
+/// fetching the record. This line is that, on stderr, where the requester is.
+///
+/// **And for the memory cap it has to say whose figure it is.** There is
+/// exactly one `memory.max` write in the product, in `herd-runner`'s cgroup
+/// setup, and the number it writes is built once at the runner's start from
+/// `--job-memory-max`. It is the same number for every job that machine
+/// accepts. A requester's own `--memory-mib` is a **placement** requirement
+/// (E-29) — what the hub needs a machine to have free — and it never becomes
+/// a ceiling anywhere. So a requester that declared 1.7 GiB and reads
+/// `8589934592 bytes` here is reading its runner's ceiling and not its own
+/// declaration; the first consumer read exactly that and reported it. The
+/// sentence is worded so that it cannot be read the other way.
+///
+/// The other three caps get the cap, the figure and the id, and no claim
+/// about provenance: a declared command's `run` step may carry a `timeout_s`
+/// of its own (D108), so "the runner's own, for every job" is asserted of the
+/// memory ceiling and of nothing else here.
+///
+/// **`detail` decides which of two sentences this is, and it has to**
+/// (D30). A non-null detail means the job did **not** reach `limit`: the cap
+/// could not be *enforced*, and "stopped at its disk cap of 21474836480
+/// bytes" about a job that wrote four kilobytes is the true figure inside a
+/// false sentence that made [`verdict::CapReport::detail`] exist. So a
+/// detail turns "stopped **at** the cap" into "stopped **by** a cap it could
+/// not be held to", with the reason, and the figure stops being offered as a
+/// measurement.
+pub fn cap_in_words(job_id: &JobId, cap: Cap, limit: u64, detail: Option<&str>) -> String {
+    // The limit is a figure an operator **typed** on a command line, so it
+    // reads back through `show_bytes`, in the family it was typed in — not
+    // through `measured_bytes`, which is for a figure Herd took itself. The
+    // exact count leads either way, because this is a number somebody is
+    // going to compare against another number.
+    let figure = match (cap.unit(), herd_proto::show_bytes(limit)) {
+        ("bytes", readable) if readable != format!("{limit} bytes") => {
+            format!("{limit} bytes ({readable})")
+        }
+        (unit, _) => format!("{limit} {unit}"),
+    };
+    let whose = match cap {
+        Cap::Memory => {
+            " That ceiling is the runner's own, the same one for every job that machine \
+             accepts, set once at its start by `--job-memory-max`; it is not this job's \
+             declared `--memory-mib`, which is what the hub needed a machine to have free \
+             and never a limit the job was held to."
+        }
+        Cap::Time | Cap::Log | Cap::Disk => "",
+    };
+    match detail {
+        None => format!(
+            "cap: job {job_id} was stopped at the {} cap of {figure}, and at no other cap.{whose}",
+            cap.name()
+        ),
+        Some(detail) => format!(
+            "cap: job {job_id} was stopped by the {} cap of {figure}, which the runner could \
+             not hold it to — that figure is the cap and not what the job reached: \
+             {detail}.{whose}",
+            cap.name()
+        ),
+    }
+}
+
 /// The one sentence `herdctl` prints on stderr when Herd could not run the
 /// job. Herd is the subject on purpose: the job did not fail, it never ran.
 /// A function, so the wording lives in one place and a test can rely on it.
@@ -1907,5 +2037,197 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("no-such-tool: not found"), "{message}");
+    }
+
+    /// The figure a requester asked for and never got: the most memory its
+    /// job held, with the three things that make it readable — the exact
+    /// byte count, a unit beside it, and the direction of its error.
+    #[test]
+    fn the_peak_memory_line_carries_the_figure_its_unit_and_its_error_upward() {
+        let line = peak_memory_line(&JobMetrics {
+            peak_memory_bytes: Some(1_073_741_824),
+            ..JobMetrics::default()
+        });
+        // The exact count, because this is a number somebody compares.
+        assert!(line.contains("1073741824 bytes"), "{line}");
+        // And a unit, because 1073741824 is not a figure anybody reads.
+        assert!(line.contains("1.00 GiB"), "{line}");
+        // The direction of the error, which is the whole reason the line is
+        // a sentence and not a number: `memory.peak` counts page cache and
+        // shared memory for the whole job, so it reads high.
+        assert!(line.contains("whole job"), "{line}");
+        assert!(line.contains("page cache"), "{line}");
+        assert!(
+            line.contains("reads high"),
+            "a figure that over-reports must say so where it is read: {line}"
+        );
+        // And what the figure does and does not settle, in so many words.
+        for conclusion in [
+            "above a declared figure is conclusive",
+            "below it is conclusive",
+            "just above it is conclusive of neither",
+        ] {
+            assert!(
+                line.contains(conclusion),
+                "the only honest reading has three parts and {conclusion:?} is missing: {line}"
+            );
+        }
+    }
+
+    /// **Absent, never zero** (D23), and this is the assertion that matters
+    /// most: on a host that delegates no cgroup v2 the runner has nothing to
+    /// read, and a figure that cannot be taken must not arrive looking like a
+    /// job that used almost nothing — which is exactly what ORCH-268 saw,
+    /// about 3.2 MB for a job that compiled a whole workspace.
+    #[test]
+    fn a_peak_nobody_could_measure_says_so_and_is_never_printed_as_a_figure() {
+        let absent = peak_memory_line(&JobMetrics::default());
+        assert!(
+            absent.contains("not measured"),
+            "an unmeasured figure has to say so: {absent}"
+        );
+        assert!(
+            absent.contains("must not be read as a zero"),
+            "and say why a zero would be a lie: {absent}"
+        );
+        // No digits at all, so nothing in this line can be mistaken for a
+        // measurement — a "0 bytes" here is the defect, not the report.
+        assert!(
+            !absent.contains(char::is_numeric),
+            "a line about a figure nobody took must carry no figure: {absent}"
+        );
+
+        // And the other side of the same rule: a real zero is a measurement
+        // and is printed as one. The two cases must not collapse into each
+        // other in either direction.
+        let measured_zero = peak_memory_line(&JobMetrics {
+            peak_memory_bytes: Some(0),
+            ..JobMetrics::default()
+        });
+        assert!(measured_zero.contains("0 bytes"), "{measured_zero}");
+        assert!(
+            !measured_zero.contains("not measured"),
+            "a figure of zero was still measured: {measured_zero}"
+        );
+    }
+
+    /// 124 is one code for all four caps and stays one; what this line adds
+    /// is **which** cap, at what figure, about which job — so that nobody
+    /// has to fetch the record to learn it.
+    #[test]
+    fn the_cap_line_names_the_cap_its_figure_and_the_job() {
+        let job = JobId::new("j1197");
+        for (cap, limit, expected) in [
+            (Cap::Time, 600, "time cap of 600 s"),
+            (Cap::Memory, 8_589_934_592, "memory cap of 8589934592 bytes"),
+            (Cap::Log, 1024, "log cap of 1024 bytes"),
+            (Cap::Disk, 21_474_836_480, "disk cap of 21474836480 bytes"),
+        ] {
+            let line = cap_in_words(&job, cap, limit, None);
+            assert!(
+                line.contains(expected),
+                "the line must name the cap and its figure with the unit: {line}"
+            );
+            assert!(line.contains("j1197"), "and the job it is about: {line}");
+            // One cap stopped the job and the line says which, so it must
+            // not read as though the others were in play.
+            for other in [Cap::Time, Cap::Memory, Cap::Log, Cap::Disk] {
+                if other != cap {
+                    assert!(
+                        !line.contains(&format!("{} cap of", other.name())),
+                        "{} must not appear in the {} cap's line: {line}",
+                        other.name(),
+                        cap.name()
+                    );
+                }
+            }
+        }
+        // The byte figures also read back in the family an operator typed
+        // them in, because the exact count is not what they recognise.
+        let memory = cap_in_words(&job, Cap::Memory, 8_589_934_592, None);
+        assert!(memory.contains("(8 GiB)"), "{memory}");
+        // And a figure that is an exact multiple of nothing stays in bytes
+        // rather than being printed twice.
+        let odd = cap_in_words(&job, Cap::Log, 1_000_001, None);
+        assert!(odd.contains("1000001 bytes"), "{odd}");
+        assert!(!odd.contains("(1000001 bytes)"), "{odd}");
+    }
+
+    /// D30, in this line: a cap the runner could not **hold** the job to is
+    /// not a cap the job reached, and the sentence must not read as though
+    /// it were. The case is the measured one — a job of four kilobytes
+    /// against a disk budget of twenty gigabytes.
+    #[test]
+    fn a_cap_line_whose_figure_would_mislead_says_the_cap_could_not_be_held_to() {
+        let job = JobId::new("j1197");
+        let line = cap_in_words(
+            &job,
+            Cap::Disk,
+            21_474_836_480,
+            Some("this runner could not measure the job's workspace"),
+        );
+        assert!(
+            line.contains("could not hold it to"),
+            "the cap is what could not be enforced, not what was reached: {line}"
+        );
+        assert!(
+            line.contains("not what the job reached"),
+            "and the figure must be disclaimed as a measurement: {line}"
+        );
+        assert!(
+            line.contains("could not measure the job's workspace"),
+            "with the real reason: {line}"
+        );
+        assert!(
+            !line.contains("was stopped at the disk cap"),
+            "the misleading sentence must not be the one printed: {line}"
+        );
+        // And the figure is still there, because it is the budget and
+        // somebody has to be able to see which budget it was.
+        assert!(line.contains("21474836480 bytes"), "{line}");
+    }
+
+    /// The one thing this line exists to prevent, reported by the first
+    /// consumer: reading the runner's own ceiling as the figure the job
+    /// declared.
+    ///
+    /// `herd-runner` writes `memory.max` in exactly one place and the number
+    /// it writes is built once at the runner's start from
+    /// `--job-memory-max`. A requester's `--memory-mib` is a placement
+    /// requirement (E-29) and never a ceiling, so the two are different
+    /// figures and the line has to say so — and say it **only** of the
+    /// memory cap, because a declared command's `run` step may carry its own
+    /// `timeout_s` (D108).
+    #[test]
+    fn the_memory_cap_line_cannot_be_read_as_the_job_s_declared_limit() {
+        let job = JobId::new("j1197");
+        let memory = cap_in_words(&job, Cap::Memory, 8_589_934_592, None);
+        assert!(
+            memory.contains("--job-memory-max"),
+            "the line must name whose figure it is: {memory}"
+        );
+        assert!(
+            memory.contains("it is not this job's declared `--memory-mib`"),
+            "and deny the reading the consumer made, in so many words: {memory}"
+        );
+        assert!(
+            memory.contains("the same one for every job"),
+            "which is what makes it the runner's and not the job's: {memory}"
+        );
+
+        // And nowhere else: a claim true of the memory ceiling is not
+        // asserted of the other three.
+        for cap in [Cap::Time, Cap::Log, Cap::Disk] {
+            let line = cap_in_words(&job, cap, 600, None);
+            assert!(
+                !line.contains("--job-memory-max"),
+                "the {} cap's line must claim nothing about the memory ceiling: {line}",
+                cap.name()
+            );
+            assert!(
+                !line.contains("--memory-mib"),
+                "nor about a declaration it knows nothing about: {line}"
+            );
+        }
     }
 }

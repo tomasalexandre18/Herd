@@ -731,6 +731,14 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
         stderr(&output)
     );
     assert!(stderr(&output).contains("log cap"), "{}", stderr(&output));
+    // And the line that makes one code for four caps legible: which cap, at
+    // what figure, about which job. Read off the real binary, because that
+    // is the only place a requester reads it.
+    assert!(
+        stderr(&output).contains("cap: job ") && stderr(&output).contains("log cap of 1024 bytes"),
+        "the cap line must name the cap, the figure and the job: {}",
+        stderr(&output)
+    );
     // The job's own output, after E-02's framing line: the cap is on the
     // job's bytes, and Herd's framing is not one of them.
     assert_eq!(
@@ -745,6 +753,18 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
     let output = harness.herdctl_shell("sleep 120").await;
     assert_eq!(status_code(&output), 124, "{}", stderr(&output));
     assert!(stderr(&output).contains("time cap"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("time cap of 1 s"),
+        "the cap line carries the figure with its unit: {}",
+        stderr(&output)
+    );
+    // The memory ceiling's caveat belongs to the memory cap alone: this line
+    // must claim nothing about `--job-memory-max`.
+    assert!(
+        !stderr(&output).contains("--job-memory-max"),
+        "a time cap says nothing about the memory ceiling: {}",
+        stderr(&output)
+    );
     drop(harness);
 
     // The disk budget, breached behind a directory the job made unreadable:
@@ -758,6 +778,143 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
         .await;
     assert_eq!(status_code(&output), 124, "{}", stderr(&output));
     assert!(stderr(&output).contains("disk cap"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("disk cap of 8388608 bytes (8 MiB)"),
+        "the cap line carries the exact figure and the family it was typed in: {}",
+        stderr(&output)
+    );
+    // **Which of two sentences this is depends on a race, and the assertion
+    // has to be on the agreement between them rather than on one of them.**
+    // This job writes 40 MiB against an 8 MiB budget and *then* makes the
+    // directory unreadable, so either end can come first: the 200 ms sampler
+    // can see the tree go over the budget while `dd` is still running, which
+    // is a cap the job **reached** and carries no detail; or the final walk
+    // after the job exits finds `h/` unreadable, which is a cap that could
+    // not be **enforced** and carries one. Measured 2026-10-31: the first
+    // path is the one that fires on this host, and an assertion written for
+    // the second alone was red on a product that was right.
+    //
+    // What D30 requires is that the two never read alike, so that is what is
+    // asserted: a detail turns "stopped **at** the cap" into "stopped **by**
+    // a cap it could not be held to", and the figure stops being offered as
+    // a measurement.
+    let said = stderr(&output);
+    if said.contains("could not hold it to") {
+        assert!(
+            said.contains("not what the job reached"),
+            "a cap that could not be enforced must disclaim its figure (D30): {said}"
+        );
+    } else {
+        assert!(
+            said.contains("was stopped at the disk cap of 8388608 bytes"),
+            "a cap the job did reach says so plainly, with the figure: {said}"
+        );
+        assert!(
+            !said.contains("could not hold"),
+            "and must not borrow the sentence for the other case: {said}"
+        );
+    }
+}
+
+/// **What the job took, told to the requester that submitted it** — read off
+/// the real binary, because stderr is where a requester reads it and
+/// `herdctl` printed this figure nowhere until now.
+///
+/// Herd has measured `peak_memory_bytes` since M4 and kept it in every job's
+/// record; a requester that wanted to know what its build actually held had
+/// to go and read that record. This asserts the line is there for a job that
+/// reached a machine, and — the part that matters — that it is **one of two
+/// readings and never a third**: a figure with its unit and the direction of
+/// its error, or the words "not measured". A small number in place of an
+/// absence is the defect ORCH-268 reported, so this test refuses to let the
+/// two collapse into each other.
+///
+/// **Whether this host measures the figure at all is not asserted and must
+/// not be.** `memory.peak` needs a delegated cgroup v2; where there is none
+/// the runner samples the job's own process, and where even that says
+/// nothing the figure is absent. All three are legitimate on some host, so
+/// the assertion is on the line's honesty and not on the host's capability —
+/// which is also why nothing here is skipped (D27): both branches are
+/// asserted as unit tests in `herdctl::peak_memory_line`, with exact text.
+#[tokio::test]
+async fn a_job_that_reached_a_machine_is_told_what_it_took() {
+    let harness = Harness::with_caps(|_| {}).await;
+    let output = harness.herdctl_shell("exit 0").await;
+    assert_eq!(status_code(&output), 0, "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(
+        said.contains("this job's peak memory was"),
+        "a job that ran must be told what it held: {said}"
+    );
+    let absent = said.contains("this job's peak memory was not measured");
+    if absent {
+        // The absence says it is one, and carries no figure that could be
+        // read as a measurement.
+        assert!(
+            said.contains("must not be read as a zero"),
+            "an absence has to say why a zero would be a lie: {said}"
+        );
+    } else {
+        // A figure, with its unit and the direction of its error beside it.
+        assert!(
+            said.contains("bytes"),
+            "a figure is printed exactly, in bytes: {said}"
+        );
+        assert!(
+            said.contains("the high-water mark of the whole job")
+                && said.contains("reads high rather than low"),
+            "a figure that over-reports must say so where it is read: {said}"
+        );
+    }
+    // And the verdict document carries the same words a person read (D166),
+    // which is the whole point of `said` being kept rather than only
+    // printed.
+    let into = TempDir::new().expect("a temporary directory for the verdict");
+    let path = into.path().join("verdict.json");
+    let output = harness
+        .herdctl_args(&[
+            "run",
+            "--verdict-to",
+            &path.display().to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ])
+        .await;
+    assert_eq!(status_code(&output), 0, "{}", stderr(&output));
+    let verdict = verdict_at(&path);
+    let said = verdict["said"]
+        .as_array()
+        .expect("said is an array")
+        .iter()
+        .map(|line| line.as_str().expect("a sentence").to_owned())
+        .collect::<Vec<String>>()
+        .join("\n");
+    assert!(
+        said.contains("this job's peak memory was"),
+        "the document logs the same sentence a person would have read: {said}"
+    );
+    // And the figure itself is in `metrics`, absent rather than zero when
+    // nobody could take it — the protocol's own habit, which the document
+    // keeps (D23).
+    assert!(
+        verdict["metrics"].is_object(),
+        "a job that ran reports metrics: {verdict}"
+    );
+    let peak = &verdict["metrics"]["peak_memory_bytes"];
+    assert!(
+        peak.is_null() || peak.is_u64(),
+        "a peak is a number or it is absent, never anything else: {verdict}"
+    );
+    // The sentence and the field, about **this** job: a document that says
+    // "not measured" over a figure, or prints a figure with no sentence, is
+    // the two halves disagreeing, which is the defect either way.
+    assert_eq!(
+        peak.is_null(),
+        said.contains("this job's peak memory was not measured"),
+        "the sentence and the field have to agree about whether a figure exists: {said}"
+    );
 }
 
 /// Read the document `--verdict-to` wrote, as the agent that submitted the
