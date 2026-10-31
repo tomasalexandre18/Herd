@@ -779,8 +779,29 @@ EOS
   rm -f "$tmp/gate-expected-load"
 }
 # gate_run <extra env...> -- <gate args...>
+#
+# The host's own load must not decide a case here, and until 2026-10-31 it
+# did. gate.sh reads /proc/loadavg unless HERD_GATE_LOADAVG points
+# elsewhere (its `loadavg=` seam, which exists so that "the host was busy"
+# is a case a test can run) and refuses outright above
+# HERD_GATE_LOAD_MAX, default 24. The `env -i` below rebuilds the child's
+# environment from a fixed list that did not carry that variable, so every
+# case which does not supply its own read the real host. Measured on this
+# host: 334 passed / 1 failed at load1 1.66, and 297 passed / 45 failed at
+# load1 24.45 with all 45 reading `gate: REFUSED ... above the ceiling
+# 24` -- a fact about the host, printed as a defect in the tree, on a
+# machine the consumer's production shares. So the default is a quiet
+# file, rewritten on every call because the stub suite above writes to
+# $HERD_GATE_LOADAVG when a case asks it to. The 15 of these 40 call sites
+# that drive the load cases still supply their own value: `env` applies
+# assignments left to right and "$@" comes last, so theirs wins. What is
+# NOT the fix: HERD_GATE_LOAD_MAX in the environment. Raising a gate's own
+# ceiling to get past it is the move workflow.md's *Failure* forbids,
+# wearing a different hat (ORCH-336).
 gate_run() {
+  printf '0.00 0.00 0.00 1/1 1\n' > "$tmp/gate-loadavg-quiet"
   env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+    HERD_GATE_LOADAVG="$tmp/gate-loadavg-quiet" \
     HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
     HERD_GATE_EXPECTED="$tmp/gate-expected" \
     HERD_GATE_EXPECTED_UNDER_LOAD="$tmp/gate-expected-load" \
