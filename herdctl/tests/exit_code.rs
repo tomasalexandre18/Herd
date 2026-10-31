@@ -783,16 +783,37 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
         "the cap line carries the exact figure and the family it was typed in: {}",
         stderr(&output)
     );
-    // This budget could not be *measured*, so the job did not reach it, and
-    // the cap line must say which of the two it is (D30): a figure offered
-    // as a measurement here would be the true number inside a false
-    // sentence.
-    assert!(
-        stderr(&output).contains("could not hold it to")
-            && stderr(&output).contains("not what the job reached"),
-        "a cap that could not be enforced must not read as one the job reached: {}",
-        stderr(&output)
-    );
+    // **Which of two sentences this is depends on a race, and the assertion
+    // has to be on the agreement between them rather than on one of them.**
+    // This job writes 40 MiB against an 8 MiB budget and *then* makes the
+    // directory unreadable, so either end can come first: the 200 ms sampler
+    // can see the tree go over the budget while `dd` is still running, which
+    // is a cap the job **reached** and carries no detail; or the final walk
+    // after the job exits finds `h/` unreadable, which is a cap that could
+    // not be **enforced** and carries one. Measured 2026-10-31: the first
+    // path is the one that fires on this host, and an assertion written for
+    // the second alone was red on a product that was right.
+    //
+    // What D30 requires is that the two never read alike, so that is what is
+    // asserted: a detail turns "stopped **at** the cap" into "stopped **by**
+    // a cap it could not be held to", and the figure stops being offered as
+    // a measurement.
+    let said = stderr(&output);
+    if said.contains("could not hold it to") {
+        assert!(
+            said.contains("not what the job reached"),
+            "a cap that could not be enforced must disclaim its figure (D30): {said}"
+        );
+    } else {
+        assert!(
+            said.contains("was stopped at the disk cap of 8388608 bytes"),
+            "a cap the job did reach says so plainly, with the figure: {said}"
+        );
+        assert!(
+            !said.contains("could not hold"),
+            "and must not borrow the sentence for the other case: {said}"
+        );
+    }
 }
 
 /// **What the job took, told to the requester that submitted it** — read off
