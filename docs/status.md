@@ -11,13 +11,13 @@ one batch, one `--no-ff` landing, a green `./scripts/gate.sh` for the merge's
 **v1.0.0 is landed and tagged by `herd-merger`** (**D212**, **D277**); a
 release's own notes stay **Alexa's** (**D210**). **Stable means v1.0.0**
 (**D204**); the notes carry **no headline figure** — his choice — and a
-sourced table: the 44 `must` cells at `f7f2ea1` read **36 / 5 / 1 / 2**,
-E-14's still `planned` (ORCH-305). **Named as not met, five**: E-49 waived and
-**unmeasured**, E-50 and E-14 **withdrawn** (**D248**, **D275**), record
-retention cut to **v1.1**, **one known-unstable test shipping**, breaking
-blocker **B8**. **All three versions have moved** — `PROTOCOL_VERSION` **3**,
-`RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** — and there is **no migration
-path** (**D243**).
+sourced table: the 44 `must` cells at `f7f2ea1` read **36 / 5 / 1 / 2**, E-14
+`planned` there and `withdrawn` here since 2026-10-31. **Named as not met,
+five**: E-49 waived and **unmeasured**, E-50 and E-14 **withdrawn**
+(**D248**, **D275**), record retention cut to **v1.1**, **one known-unstable
+test shipping**, breaking blocker **B8**. **All three versions have moved** —
+`PROTOCOL_VERSION` **3**, `RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** —
+and there is **no migration path** (**D243**).
 
 ## What is known about the consumer's machines, and when
 
