@@ -48,6 +48,15 @@
 //! look green. So the cap is checked once more after the process has gone,
 //! and whatever it says wins (D24, D25, D31).
 //!
+//! **The memory ceiling is the one of the four the runner does not watch**,
+//! and it is read instead of watched: the kernel kills, and the job cgroup's
+//! own counters are what say so afterwards ([`OomWatermark`]). The three the
+//! watchdog trips outrank an exit status as above; the kernel's kill is
+//! charged to the step whose processes it took, and a step that exited 0 is
+//! not one of them — with `memory.oom.group = 1` a shell the kernel killed
+//! has no code to report at all. That is the one place where this section's
+//! rule is read the other way round, and the reason is in `OomWatermark`.
+//!
 //! ## Ended from outside, and by whom
 //!
 //! A job is also ended by a requester's cancel (E-06), by a drain (invariant
@@ -72,7 +81,7 @@ use herd_proto::{
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
-use crate::cgroup::JobCgroup;
+use crate::cgroup::{JobCgroup, OomKills};
 use crate::confine::{
     job_environment, kill_process_group, ChildSetup, Confined, JobsAtOnce, POLL_INTERVAL,
 };
@@ -376,7 +385,10 @@ pub async fn execute(
     // nobody. The pid on it is whichever step is running.
     let mut live: Option<u64> = None;
     let mut pids: Vec<u32> = Vec::new();
-    let mut oom_kills = 0u64;
+    // One cgroup per job and not per step, so its kill counters are
+    // job-scoped by construction and every step-level reading of them carries
+    // its own baseline. The watermark is that baseline.
+    let mut oom_mark = OomWatermark::default();
 
     for stage in &stages {
         // `down` is the one stage that runs however the others ended, and it
@@ -559,10 +571,13 @@ pub async fn execute(
         .await;
 
         // Read the kernel's own verdict before killing anything ourselves, so
-        // that an out-of-memory kill is told apart from the runner's kill.
-        let since = oom_kills;
-        oom_kills = cgroup.as_ref().map_or(0, JobCgroup::oom_kills);
-        let oomed = oom_kills > since;
+        // that an out-of-memory kill is told apart from the runner's kill —
+        // and charged to the step it happened in and to no other
+        // ([`OomWatermark`]).
+        let now = cgroup
+            .as_ref()
+            .map_or_else(OomKills::default, JobCgroup::oom_kills);
+        let oomed = oom_mark.killed_in_this_step(now, &watched.outcome);
 
         // Both pipes are drained before the step's line is recorded, so the
         // steps' output reaches the log in the order the steps ran —
@@ -827,6 +842,65 @@ pub async fn execute(
 struct StepAt {
     started_unix_ms: i64,
     took: Duration,
+}
+
+/// The baseline one step's out-of-memory verdict is read against, and the one
+/// place it moves.
+///
+/// There is **one cgroup per job, not per step** — created once in
+/// [`execute`], with `memory.max`, `memory.swap.max` and `memory.oom.group`
+/// written once, and only `cgroup.procs` reopened per step — so the kernel's
+/// kill counters are job-scoped by construction and every step-level reading
+/// of them has to carry its own baseline. This is that baseline, and the two
+/// things it has to get right are both facts about *when* a counter settles,
+/// not about the counter's value:
+///
+/// * **A group kill is counted once, before the first death.** Which is why
+///   `oom_group_kill` is what a step is judged on wherever the kernel
+///   publishes it. `oom_kill` counts a task at a time while the group is
+///   being walked, and the runner is woken by the *first* of those deaths, so
+///   the reading it takes can be mid-burst and the rest of the **same** kill
+///   lands in the next step's delta. One job's record showed `run` stopped at
+///   the memory cap and `down` stopped at the memory cap, 5 s later, with one
+///   OOM event in the kernel log and nothing at all during `down`
+///   ([`crate::cgroup::OomKills`] has the mechanism).
+/// * **A step that exited 0 was not stopped by anything.** With
+///   `memory.oom.group = 1` the whole job tree dies together, so a shell that
+///   exited cleanly cannot be a shell the kernel killed, whatever a counter
+///   read after it says. A non-zero code keeps its cap: a job whose own
+///   process was killed while its shell reported 137 *was* stopped by the
+///   ceiling, and that is the case this must not swallow.
+///
+/// The watermark never moves backwards, because an unreadable `memory.events`
+/// reads as zero ([`JobCgroup::oom_kills`]) and a baseline one unreadable
+/// step had lowered would charge the next step with every kill the job ever
+/// had.
+#[derive(Debug, Default, Clone, Copy)]
+struct OomWatermark(OomKills);
+
+impl OomWatermark {
+    /// Did an out-of-memory kill happen **in this step**? Advances the
+    /// baseline either way, because the counters are cumulative.
+    fn killed_in_this_step(&mut self, now: OomKills, outcome: &JobOutcome) -> bool {
+        let before = self.0;
+        self.0 = OomKills {
+            processes: before.processes.max(now.processes),
+            group_kills: match (before.group_kills, now.group_kills) {
+                (Some(was), Some(is)) => Some(was.max(is)),
+                (was, is) => was.or(is),
+            },
+        };
+        if matches!(outcome, JobOutcome::Exited { code: 0 }) {
+            return false;
+        }
+        match (before.group_kills, now.group_kills) {
+            (Some(was), Some(is)) => is > was,
+            // No `oom_group_kill` on this kernel: the per-process counter is
+            // all there is, and the clause above is what keeps a step that
+            // came off from wearing somebody else's kill.
+            _ => now.processes > before.processes,
+        }
+    }
 }
 
 /// A cap that ended the attempt, with everything the record says about it.
@@ -1129,8 +1203,39 @@ impl Attempt {
                 (None, None, other) => (None, Some(format!("ended as {other:?}"))),
             }
         };
-        let how = Self::how_it_went(exit_code, &ended);
+        // What a later line says this step did. A cap says it as the step's
+        // own, never in the job's sentence: "the down step the runner stopped
+        // this job at its memory cap of …" is two claims in one clause.
+        let how = match &capped {
+            Some(capped) => how_a_cap_stopped_this_step(stage, capped),
+            None => Self::how_it_went(exit_code, &ended),
+        };
         self.record(stage, at, exit_code, ended, session, job_id, attempt);
+
+        // The step that decided the verdict says so in the job's **own** log,
+        // naming itself and the figure, because that log is what a reader
+        // reads first and until now the cap never reached it from here.
+        //
+        // **Except the log cap, which is the one of the four that cannot
+        // afford it.** That cap is a promise about how many bytes reach the
+        // requester, and a step it stopped has had its own bytes cut at
+        // exactly that figure — so a line about the cap is the bytes that
+        // break it. Measured on this very change: 1220 bytes against a 1 024
+        // cap and 65733 against 65536, the difference being this line's own
+        // length both times (`herd-runner/tests/confinement.rs:923` and
+        // `:466`). The log cap keeps saying what it is in the record's
+        // `StepRun.ended` and in the attempt's outcome, where it costs the
+        // requester's log nothing.
+        if let Some(capped) = &capped {
+            if capped.cap != Cap::Log {
+                say_in_the_log(
+                    session,
+                    job_id,
+                    attempt,
+                    &the_cap_that_stopped_this_step(stage, capped),
+                );
+            }
+        }
 
         // Ahead of everything else read off this step: a workspace the runner
         // was refused is the machine's problem at `up` exactly as it is at
@@ -1615,6 +1720,62 @@ fn limit_of(cap: Cap, stage: &Stage, caps: &crate::confine::Confinement) -> u64 
     }
 }
 
+/// What a cap did to **this step**, in the step's own grammar.
+///
+/// [`herd_proto::cap_exceeded_reason`] is the job's sentence — *"the runner
+/// stopped this job at its memory cap of N bytes"* — and it is the right one
+/// for the attempt's outcome, which is about the job. Pasted behind a step's
+/// name it reads *"the down step the runner stopped this job at…"*, which
+/// says two different things at once and is what left a reader unable to tell
+/// which step a kill happened in. A step's own line says what happened to the
+/// step and nothing about the job.
+fn how_a_cap_stopped_this_step(stage: &Stage, capped: &Capped) -> String {
+    match capped.cap {
+        // The one of the four whose figure is the step's own rather than the
+        // runner's, so its sentence says whose it is (D108).
+        Cap::Time => format!(
+            "was stopped at the time cap of {} s, {}",
+            capped.limit, stage.whose_timeout
+        ),
+        cap => format!(
+            "was stopped at this runner's own {} cap of {} {}",
+            cap.name(),
+            capped.limit,
+            cap.unit()
+        ),
+    }
+}
+
+/// The line a capped step writes into the **job's own log**, naming itself.
+///
+/// Until this existed the step that decided the verdict put its cap sentence
+/// in the record's `StepRun.ended` and in the attempt's outcome and nowhere
+/// else, so a reader of the log met the memory cap exactly once — attached to
+/// `down`, by way of the takedown line — and could not tell which step the
+/// kill happened in without fetching the record.
+///
+/// The figure is named for what it is. The three attempt-wide caps are this
+/// **runner's** figures, built once at startup: `memory.max` is written from
+/// one runner-wide `--job-memory-max` and never from the job's declaration,
+/// so a job that declared 1792 MiB and was stopped at 8589934592 bytes was
+/// not stopped at anything it asked for. Said plainly here, because it has
+/// already misread twice.
+fn the_cap_that_stopped_this_step(stage: &Stage, capped: &Capped) -> String {
+    let what = match stage.step {
+        Some(step) => format!("the {step} step"),
+        // An ad-hoc job has one process and no executor step at all (D77).
+        None => "this job's command".to_owned(),
+    };
+    let how = how_a_cap_stopped_this_step(stage, capped);
+    match capped.cap {
+        Cap::Time => format!("{what} {how}"),
+        _ => format!(
+            "{what} {how} — this runner's own ceiling, the figure it holds every job it takes \
+             to, and not a figure this job declared"
+        ),
+    }
+}
+
 /// How a finished process ended, in the protocol's terms. A unix status is an
 /// exit code or a signal, never both.
 #[cfg(unix)]
@@ -2050,6 +2211,430 @@ mod tests {
             "and nothing removed or renamed what was in the way"
         );
         let _ = std::fs::remove_file(workspace.base_dir());
+    }
+
+    // ------------------------------------- one kill, one step (D-NEXT) ----
+
+    /// A reading of the job cgroup's two kill counters, as a step takes it.
+    fn read(processes: u64, group_kills: Option<u64>) -> OomKills {
+        OomKills {
+            processes,
+            group_kills,
+        }
+    }
+
+    /// The rule this replaces, written out so the defect is **computed** here
+    /// and not asserted from memory: `oomed = oom_kills > since` over the
+    /// per-process counter, which is what `job.rs` did until D-NEXT.
+    fn the_old_rule(before: OomKills, now: OomKills) -> bool {
+        now.processes > before.processes
+    }
+
+    fn signalled() -> JobOutcome {
+        JobOutcome::Signalled { signal: 9 }
+    }
+
+    fn exited(code: i32) -> JobOutcome {
+        JobOutcome::Exited { code }
+    }
+
+    /// Job j0000000069's own readings, replayed: **one** OOM event, charged
+    /// to **one** step.
+    ///
+    /// The first consumer's record had `up` exit 0, `fetch` exit 0, `run`
+    /// stopped at the memory cap after 218 217 ms and `down` stopped at the
+    /// memory cap after 5 097 ms — the same sentence twice. Their kernel log
+    /// has one `oom-killer` invocation, at the end of `run`, a burst of
+    /// per-process kills over about 4 ms, `down` starting 2 ms after that
+    /// burst and **no** kernel OOM line at all during `down`'s 5.1 s.
+    ///
+    /// So the counter was still climbing when `run` read it: eight tasks were
+    /// in the kill set and `run`'s reading was taken 3.7 ms into the walk.
+    /// The remainder of the **same** kill was what `down` saw.
+    #[test]
+    fn one_oom_kill_is_charged_to_one_step() {
+        let mut mark = OomWatermark::default();
+
+        // `up` and `fetch`: nothing has been killed.
+        assert!(!mark.killed_in_this_step(read(0, Some(0)), &exited(0)));
+        assert!(!mark.killed_in_this_step(read(0, Some(0)), &exited(0)));
+
+        // `run`: the group kill is counted once and already settled; the
+        // per-process counter is three of eight and still going.
+        let at_run = read(3, Some(1));
+        assert!(
+            mark.killed_in_this_step(at_run, &signalled()),
+            "the kill happened in `run` and `run` is what must report it"
+        );
+
+        // `down`: 5.1 s later, the same kill, fully counted. Nothing new.
+        let at_down = read(8, Some(1));
+        assert!(
+            the_old_rule(at_run, at_down),
+            "the detector is proved on the known-bad case first: the old rule \
+             is true here, which is the whole defect"
+        );
+        assert!(
+            !mark.killed_in_this_step(at_down, &exited(0)),
+            "one kill, one step: `down` must not inherit `run`'s verdict"
+        );
+    }
+
+    /// The same replay with a `down` that ended **without** an exit code, so
+    /// that the group counter is what has to carry it.
+    ///
+    /// Both guards fix j0000000069 and the two are tested apart on purpose: a
+    /// test where `down` exits 0 passes with the group counter taken out, and
+    /// one where it is signalled passes with the exit-code clause taken out.
+    /// Together they leave neither clause able to be removed unnoticed.
+    #[test]
+    fn one_oom_kill_is_charged_to_one_step_even_when_down_is_signalled_too() {
+        let mut mark = OomWatermark::default();
+        let at_run = read(3, Some(1));
+        assert!(mark.killed_in_this_step(at_run, &signalled()));
+
+        let at_down = read(8, Some(1));
+        assert!(
+            the_old_rule(at_run, at_down),
+            "the old rule is true here too, which is what has to be refused"
+        );
+        assert!(
+            !mark.killed_in_this_step(at_down, &signalled()),
+            "no second event in `oom_group_kill`, so no second kill — \
+             whatever ended `down`"
+        );
+    }
+
+    /// And the fix does not work by making `down` unable to report a cap.
+    /// Two real kills — two `oom_group_kill` events — are both reported.
+    #[test]
+    fn two_real_kills_are_both_reported() {
+        let mut mark = OomWatermark::default();
+        assert!(mark.killed_in_this_step(read(8, Some(1)), &signalled()));
+        assert!(
+            mark.killed_in_this_step(read(11, Some(2)), &signalled()),
+            "a second event in `down` is a second kill and says so"
+        );
+    }
+
+    /// The same, on a kernel with no `oom_group_kill` to read (before Linux
+    /// 5.17): the per-process counter is all there is, and two kills still
+    /// read as two.
+    #[test]
+    fn two_real_kills_are_both_reported_without_the_group_counter() {
+        let mut mark = OomWatermark::default();
+        assert!(mark.killed_in_this_step(read(8, None), &signalled()));
+        assert!(mark.killed_in_this_step(read(16, None), &signalled()));
+    }
+
+    /// A step that exited 0 was not stopped by anything, whatever a counter
+    /// read after it says. This is the clause that holds on a kernel with no
+    /// `oom_group_kill`, where the mid-burst reading cannot be told apart
+    /// from a new kill by the counter alone.
+    #[test]
+    fn a_step_that_exited_cleanly_is_never_said_to_have_been_capped() {
+        let mut mark = OomWatermark::default();
+        assert!(mark.killed_in_this_step(read(3, None), &signalled()));
+        assert!(
+            !mark.killed_in_this_step(read(8, None), &exited(0)),
+            "a shell that exited 0 is not a shell the kernel killed: \
+             `memory.oom.group = 1` takes the whole tree"
+        );
+    }
+
+    /// And a non-zero code keeps its cap. A job whose own process was killed
+    /// while its shell reported 137 **was** stopped by the ceiling, and that
+    /// is the case the clause above must not swallow.
+    #[test]
+    fn a_step_that_exited_non_zero_keeps_its_memory_verdict() {
+        let mut mark = OomWatermark::default();
+        assert!(mark.killed_in_this_step(read(1, Some(1)), &exited(137)));
+    }
+
+    /// An unreadable `memory.events` reads as zero
+    /// ([`JobCgroup::oom_kills`]), so the baseline never moves backwards: one
+    /// unreadable step must not charge the next one with every kill the job
+    /// ever had.
+    #[test]
+    fn an_unreadable_memory_events_never_charges_the_next_step() {
+        let mut mark = OomWatermark::default();
+        assert!(mark.killed_in_this_step(read(5, Some(1)), &signalled()));
+        // The read failed: zero, which is lower than the baseline.
+        assert!(!mark.killed_in_this_step(read(0, None), &signalled()));
+        // And the one after it sees the same counters it always saw.
+        assert!(
+            !mark.killed_in_this_step(read(5, Some(1)), &signalled()),
+            "the watermark is a high-water mark, so a failed read costs \
+             nothing but that step's own answer"
+        );
+    }
+
+    // --------------------------------- the step names itself (D-NEXT) ----
+
+    fn a_step(step: Step) -> Stage {
+        Stage {
+            step: Some(step),
+            ..a_stage(Duration::from_secs(60))
+        }
+    }
+
+    /// What the watchdog saw of a step that nothing but the kernel ended.
+    fn watched(outcome: JobOutcome) -> Watched {
+        Watched {
+            outcome,
+            cap: None,
+            ending: None,
+            peak_disk: None,
+            unmeasurable: None,
+            peak_rss: None,
+        }
+    }
+
+    fn at() -> StepAt {
+        StepAt {
+            started_unix_ms: 0,
+            took: Duration::from_secs(1),
+        }
+    }
+
+    /// The consumer's own figure: a runner-wide `--job-memory-max` of 8 GiB,
+    /// against a job that declared 1792 MiB.
+    const EIGHT_GIB: u64 = 8_589_934_592;
+
+    /// The line one capped step writes into the job's own log, as a reader
+    /// meets it.
+    fn capped_line(step: &str) -> String {
+        format!("the {step} step was stopped at this runner's own memory cap of {EIGHT_GIB} bytes")
+    }
+
+    fn a_session(job_id: &JobId) -> (Session, CancelToken) {
+        let session = Session::new();
+        let cancel = session
+            .take_job(job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
+        (session, cancel)
+    }
+
+    /// The step that decided the verdict says so in the job's **own** log,
+    /// naming itself and naming whose figure the ceiling is.
+    ///
+    /// Before this, the cap sentence reached the log only through the
+    /// takedown line, so a reader met the memory cap exactly once and it was
+    /// attached to `down`.
+    #[test]
+    fn the_capped_step_names_itself_in_the_job_s_log() {
+        let mut caps = Confinement::with_data_root("/nowhere");
+        caps.memory_max = EIGHT_GIB;
+        let job_id = JobId::new("j0000000069");
+        let (session, _cancel) = a_session(&job_id);
+        let mut ran = Attempt::default();
+
+        ran.step_ended(
+            &a_step(Step::Run),
+            at(),
+            watched(signalled()),
+            true,
+            &caps,
+            &session,
+            &job_id,
+            1,
+        );
+
+        let log = session.held_output_of(&job_id, 1);
+        assert!(
+            log.contains(&capped_line("run")),
+            "the step that was stopped names itself and its figure: {log}"
+        );
+        assert!(
+            log.contains("not a figure this job declared"),
+            "and the figure is named for what it is — their job declared 1792 \
+             MiB and read 8589934592 bytes as its own: {log}"
+        );
+        assert!(
+            !log.contains("stopped this job at its memory cap"),
+            "the job's sentence is the attempt's outcome, not a step's line: {log}"
+        );
+        assert_eq!(
+            ran.cap.as_ref().map(|capped| capped.cap),
+            Some(Cap::Memory),
+            "and the verdict is unchanged: the job was stopped by the memory cap"
+        );
+    }
+
+    /// A `down` that came off is recorded as having come off: its own exit
+    /// code, no cap sentence, and no takedown line claiming a workspace may
+    /// have been left behind.
+    ///
+    /// This is the reader's half of j0000000069. With `oomed` true for
+    /// `down`, `capped` overrode `down`'s exit code — the record showed no
+    /// code at all and `came_off` was false — so the log gained *"the down
+    /// step the runner stopped this job at its memory cap of 8589934592
+    /// bytes, so this job's workspace may be left on this host"* for a
+    /// takedown that had in fact succeeded.
+    #[test]
+    fn a_down_step_that_came_off_is_never_called_capped() {
+        let mut caps = Confinement::with_data_root("/nowhere");
+        caps.memory_max = EIGHT_GIB;
+        let job_id = JobId::new("j0000000069");
+        let (session, _cancel) = a_session(&job_id);
+        let mut ran = Attempt::default();
+        // `run` was stopped by the ceiling, which is the job's verdict.
+        ran.step_ended(
+            &a_step(Step::Run),
+            at(),
+            watched(signalled()),
+            true,
+            &caps,
+            &session,
+            &job_id,
+            1,
+        );
+        // And `down` ran for 5 s and exited 0, with no new kill.
+        ran.step_ended(
+            &a_step(Step::Down),
+            at(),
+            watched(exited(0)),
+            false,
+            &caps,
+            &session,
+            &job_id,
+            1,
+        );
+
+        let down = ran
+            .steps
+            .iter()
+            .find(|step| step.step == Step::Down)
+            .expect("the takedown is on the record");
+        assert_eq!(down.exit_code, Some(0), "its own code, not a cap's silence");
+        assert_eq!(down.ended, None, "and nothing said about how it ended");
+
+        let log = session.held_output_of(&job_id, 1);
+        assert!(
+            !log.contains("the down step was stopped"),
+            "no cap is charged to a takedown that came off: {log}"
+        );
+        assert!(
+            !log.contains("may be left on this host"),
+            "and no workspace is said to be left behind by a takedown that \
+             did its work: {log}"
+        );
+    }
+
+    /// Two real kills read as two lines a reader can tell apart without
+    /// fetching the record.
+    #[test]
+    fn two_capped_steps_read_as_two_lines_in_the_log() {
+        let mut caps = Confinement::with_data_root("/nowhere");
+        caps.memory_max = EIGHT_GIB;
+        let job_id = JobId::new("j0000000460");
+        let (session, _cancel) = a_session(&job_id);
+        let mut ran = Attempt::default();
+        for step in [Step::Run, Step::Down] {
+            ran.step_ended(
+                &a_step(step),
+                at(),
+                watched(signalled()),
+                true,
+                &caps,
+                &session,
+                &job_id,
+                1,
+            );
+        }
+
+        let log = session.held_output_of(&job_id, 1);
+        // The step-naming line, which only a capped step writes: the takedown
+        // line that follows it carries the same clause about the ceiling, and
+        // counting both would count one step twice.
+        let named: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("not a figure this job declared"))
+            .collect();
+        assert_eq!(
+            named.len(),
+            2,
+            "two kills, two lines, each naming its own step: {log}"
+        );
+        assert!(named[0].contains(&capped_line("run")), "{log}");
+        assert!(named[1].contains(&capped_line("down")), "{log}");
+        // And the takedown still says what a failed takedown means, as the
+        // step's own ending and never in the job's sentence (D108).
+        assert!(
+            log.contains(
+                "the down step was stopped at this runner's own memory cap of 8589934592 bytes, \
+                 so this job's workspace may be left on this host"
+            ),
+            "{log}"
+        );
+        assert!(
+            !log.contains("the down step the runner stopped this job"),
+            "the two claims must not be pasted into one clause: {log}"
+        );
+    }
+
+    /// The time cap keeps its own grammar: its figure is the **step's**, not
+    /// the runner's, so its line must not call it the runner's ceiling
+    /// (D108).
+    #[test]
+    fn the_time_cap_s_line_names_whose_figure_it_is() {
+        let caps = Confinement::with_data_root("/nowhere");
+        let stage = a_step(Step::Run);
+        let capped = Capped {
+            cap: Cap::Time,
+            limit: limit_of(Cap::Time, &stage, &caps),
+            detail: None,
+        };
+        let said = the_cap_that_stopped_this_step(&stage, &capped);
+        assert_eq!(
+            said,
+            "the run step was stopped at the time cap of 60 s, this runner's own figure"
+        );
+        assert!(
+            !said.contains("not a figure this job declared"),
+            "a declared figure can be exactly what bounded it: {said}"
+        );
+    }
+
+    /// The log cap is the one of the four whose step does **not** name itself
+    /// in the job's log, and not one byte of it may.
+    ///
+    /// The cap is a promise about how many bytes reach the requester, and a
+    /// step it stopped has had its own bytes cut at exactly that figure. A
+    /// line about the cap would therefore be the bytes that break it, which
+    /// is what two of the suite's own tests measured when this change first
+    /// wrote one: 1220 bytes against a 1 024 cap, 65733 against 65536.
+    #[test]
+    fn a_log_capped_step_adds_no_bytes_to_the_log_it_just_cut() {
+        let mut caps = Confinement::with_data_root("/nowhere");
+        caps.log_cap = 1024;
+        let job_id = JobId::new("j0000000070");
+        let (session, _cancel) = a_session(&job_id);
+        let mut ran = Attempt::default();
+        let mut cut = watched(exited(0));
+        cut.cap = Some(Cap::Log);
+
+        ran.step_ended(
+            &a_step(Step::Run),
+            at(),
+            cut,
+            false,
+            &caps,
+            &session,
+            &job_id,
+            1,
+        );
+
+        assert_eq!(
+            ran.cap.as_ref().map(|capped| capped.cap),
+            Some(Cap::Log),
+            "the verdict is still the cap, said where it costs nothing"
+        );
+        assert_eq!(
+            session.held_output_of(&job_id, 1),
+            String::new(),
+            "and the log the cap is a promise about gains nothing at all"
+        );
     }
 }
 
