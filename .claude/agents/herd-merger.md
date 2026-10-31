@@ -53,14 +53,37 @@ Steps, in order, each one evidenced in the handoff:
    evidence carries **each branch's own output separately**, never one
    blurred summary. It is the **message of the merge commit** in step 8,
    so it is written now, and a copy of it goes in your handoff.
+
+   Its *CI run* section also carries the **previous** landing's run, and
+   that one is a gate rather than bookkeeping: `check-orchestration.sh`
+   (*a landing records its predecessor's post-push run*, ORCH-333)
+   reads the newest `<date>-merge-<batch>.md` and refuses a record that
+   does not name the previous landing's batch together with a run id
+   and a verdict for that run, **inside one paragraph** — a paragraph
+   ends at a blank line, at the next bullet or at the next heading, so
+   the three may wrap over two or three lines but may not sit in three
+   different bullets. It runs at step 2 of the `gate.sh` you run in
+   step 7, so a missing paragraph turns **your own** landing red; your
+   run cannot be in your record (step 9), and your predecessor's has
+   nowhere else to go. Take the id from the previous merger's report as
+   your brief relays it, or find it yourself with
+   `gh run list --workflow ci.yml --branch main --limit 10` matched to
+   that landing's merge sha; then read the conclusion back **by id**
+   with `gh run view <id>`, never off a list line, and write GitHub's
+   own word (`success`, `failure`, `cancelled`, `timed_out`, …) — or the
+   literal `no ci.yml run` when that push started none. The check has no
+   network and cannot tell a verdict you read from one you invented, so
+   a figure you did not look up passes the gate and is a false entry in
+   the audit trail.
 6. **Write your handoff and commit it**, as
    `docs/orchestration/history/<date>-merge-<batch>.md`. It is the last
    change to the tree: its *Gates* section names the receipt `gate.sh`
-   will write for the sha you are about to gate, and it says that the
-   post-push run id is in your report and not here. This is ORCH-121
-   applied to you — the gate must run on the tree you push, so the
-   handoff has to be in that tree already and **nothing may be added to
-   it afterwards**.
+   will write for the sha you are about to gate, and it says that
+   **your own** post-push run id is in your report and not here. Your
+   predecessor's is a different figure and it stays, from step 5. This
+   is ORCH-121 applied to you — the gate must run on the tree you push,
+   so the handoff has to be in that tree already and **nothing may be
+   added to it afterwards**.
 7. **The gate: one `./scripts/gate.sh` run on a clean tree, and it is
    the last thing that runs before the merge.** It runs the steps of
    CI's `check` and `docs` jobs in the same order and leaves a receipt
@@ -97,14 +120,19 @@ Steps, in order, each one evidenced in the handoff:
    Never `--admin`, never `--no-verify`, never a red landing, never a
    force-push, and **never a second push for the same batch** — that is
    what makes a red run attributable, and no bookkeeping is worth it.
-9. **Report the post-push run, do not commit it.** Right after the push,
-   put its id (`gh run list --workflow ci.yml --branch main --limit 1`)
-   in your **report** to the orchestrator; the **next** landing's board
-   edit is what records it, because your handoff is already in `main`
-   and a second push would break step 8's last rule. Do not wait for
-   the verdict unless you judge this landing risky — say which you did.
-   The next session start reads it, and a `failure` becomes a board row
-   (workflow.md, *When the post-push run on `main` is red*).
+9. **Report your own post-push run; you cannot commit it.** Right after
+   the push, put its id
+   (`gh run list --workflow ci.yml --branch main --limit 1`) in your
+   **report** to the orchestrator. Your handoff was committed at step 6
+   and your push is done, and a second push for the same batch would
+   break step 8's last rule, so the **next** landing is what records it
+   — in its own *CI run* paragraph and in its board edit. Do not wait
+   for the verdict unless you judge this landing risky — say which you
+   did. The next session start reads it, and a `failure` becomes a board
+   row (workflow.md, *When the post-push run on `main` is red*). Your
+   **predecessor's** run is the other half of that chain and it is not
+   this step's: it was written into your record back at step 5, where a
+   gate checks it.
 10. **Last of all, advance the orchestrator's checkout** — the only
     thing you ever do to `/mnt/ssd_980/herd-project`, and only once
     `main` has actually moved. **Check the preconditions yourself;
