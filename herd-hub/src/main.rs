@@ -135,7 +135,10 @@ struct Args {
     ///
     /// A reading takes no slot and no capability — it builds and boots
     /// nothing (D159) — so this is the only thing that bounds how many of
-    /// them one machine is given. Two by default. It exists because a
+    /// them one machine is given *by their kind*; since ORCH-323 the memory
+    /// admission charges a figureless reading the per-job cap like every
+    /// other figureless job, and weighs it with them. Two by default. It
+    /// exists because a
     /// consumer submitted 214 jobs in one second, every one of them needing
     /// a reading first, and the hub put some two hundred of those readings
     /// on the one runner it had. Beyond this figure a reading **queues**: it

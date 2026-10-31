@@ -2529,7 +2529,7 @@ mod tests {
     /// assertion be made on a host with no delegation — and it is the right
     /// seam, because `memory.max` is written with `fs::write` either way and
     /// what is being asserted is *which number Herd writes*. That the kernel
-    /// then enforces it is a different claim, and the twelve standing skips
+    /// then enforces it is a different claim, and the thirteen standing skips
     /// in `scripts/expected-skips/local.txt` are where it is made.
     #[test]
     fn each_job_s_cgroup_carries_the_ceiling_that_job_was_costed_at() {

@@ -15,11 +15,19 @@
 //! a **charge** over that set that the runner can honour, and after ORCH-312
 //! they do, because they charge through one function —
 //! `herd_proto::charged_ceiling_mib`. Never *below* the grant rather than
-//! equal to it, and the difference is deliberate: a reading with no figure is
-//! charged nothing on purpose (see the last test here), and a runner that
-//! announced no count is charged conservatively because there is no cap to
-//! clamp by. Over-charging costs throughput; under-charging costs attempts,
-//! which is what D181 measured.
+//! equal to it, and the difference is deliberate: a runner that announced no
+//! count is charged conservatively because there is no cap to clamp by.
+//! Over-charging costs throughput; under-charging costs attempts, which is
+//! what D181 measured.
+//!
+//! **A requirement reading is charged with them, since ORCH-323** (the last
+//! test here). It reaches a runner with no `JobNeed` on it, which is what
+//! `herdctl submit -- true` reaches it with, and the runner cannot tell the
+//! two apart: it grants both the whole cap. While a reading was charged
+//! nothing this hub charged less than the grant for one job in the product,
+//! and the announced count was the only thing covering the gap — so closing
+//! it is what let `admission` stop applying that count to its own records,
+//! and this file is the proof the sum can carry the bound alone.
 //!
 //! The claim, said once:
 //!
@@ -93,14 +101,16 @@ fn the_runner(
 /// wrong on purpose.
 type Charge = fn(Option<herd_proto::JobNeed>, herd_hub::matcher::TheRoom) -> u64;
 
-/// What the hub really charges (`matcher::charged_against_the_room`, for a job
-/// that is not a reading).
+/// What the hub really charges (`matcher::charged_against_the_room`), for
+/// every job alike: since ORCH-323 that function is told a declaration and a
+/// room and nothing else, so a reading is not a case here any more than it is
+/// a case on the wire.
 fn as_the_hub_charges(need: Option<herd_proto::JobNeed>, room: herd_hub::matcher::TheRoom) -> u64 {
     let (memory_mib, tmpfs_mib) = match need {
         Some(need) => (Some(need.memory_mib), need.tmpfs_mib),
         None => (None, 0),
     };
-    charged_against_the_room(memory_mib, tmpfs_mib, room, false)
+    charged_against_the_room(memory_mib, tmpfs_mib, room)
 }
 
 /// **The known-bad fixture.** What the hub charged before ORCH-312: the
@@ -120,10 +130,12 @@ fn as_the_hub_charged_before(
 /// **Walked over the triples where the runner's division did not hit its
 /// `.max(1)` floor**, which is where the claim holds and is stated to hold.
 /// A host that lends less after its floor than it caps a job at announces one
-/// place, and the hub then charges that one job the whole of `lent − floor`
-/// while the runner grants it the cap: the charge *is* below the grant there,
-/// on purpose, and what bounds the machine is that one job is all either side
-/// admits. That branch has a test of its own —
+/// place, so `C_hub` is the whole of `lent − floor` and a job the hub charges
+/// less than its runner grants it is, there, a job charged that whole room:
+/// the charge *is* below the grant, on purpose, and the job is admitted
+/// **alone**, so what the runner grants for the set is one cap — which is the
+/// most either side ever permitted and is what that machine permitted before
+/// any of this. That branch has a test of its own —
 /// [`a_host_too_small_for_one_ceiling_admits_one_job_on_both_sides`] — and
 /// leaving it inside this walk would have made this property false rather
 /// than made that machine safer.
@@ -222,9 +234,19 @@ fn the_charge_this_hub_made_before_is_caught_by_that_property() {
 /// implication.
 ///
 /// Walked over the grid: jobs are admitted one at a time against
-/// `lent − floor` and never more than the count the runner announced, exactly
-/// as `admission` admits them, and after each one the sum of what the
-/// **runner** would grant is checked.
+/// `lent − floor` and against nothing else — exactly as `admission` admits
+/// them since ORCH-323 — and after each one the sum of what the **runner**
+/// would grant is checked.
+///
+/// **The count the runner announced is no longer a term in this walk**, and
+/// removing it is what makes the walk the real question. It used to stop at
+/// `admitted < at_once`, which could only ever make the set smaller: the
+/// claim is that the *sum alone* admits no set the runner refuses, and a walk
+/// that stopped at the count was answering it over the sets the count let
+/// through. On a queue of jobs each charged the whole cap the two stop at the
+/// same place, because `at_once × C_hub ≤ lent − floor`; on a queue of jobs
+/// charged less, this walk now goes further, which is the packing ORCH-323
+/// delivers and the thing that has to be proved safe.
 ///
 /// The bound checked is `max(lent − floor, cap)` and not `lent − floor`
 /// alone, because of the one liberty both sides take and take identically:
@@ -243,7 +265,7 @@ fn no_set_the_hub_admits_is_a_set_the_runner_cannot_hold() {
             let mut charged_so_far = 0_u64;
             let mut granted_so_far = 0_u64;
             let mut admitted = 0_u32;
-            while charged_so_far + charged <= admissible && admitted < at_once {
+            while charged_so_far + charged <= admissible {
                 charged_so_far += charged;
                 granted_so_far += granted_mib;
                 admitted += 1;
@@ -292,12 +314,21 @@ fn a_host_too_small_for_one_ceiling_admits_one_job_on_both_sides() {
             "a host lending {admissible} MiB after its floor and capping a job at {cap_mib} \
              has to announce one place ({lent} lent, {floor} kept)"
         );
-        // And the hub's own cap is that whole admission, so a second job of
-        // any size whatever is refused by the count before the sum is
-        // consulted: `admission` checks the announced count first.
+        // And the hub's own cap is that whole admission, so the one job that
+        // is charged it is the whole of what this machine admits and the next
+        // one of its kind is refused by the sum. **By the sum and no longer
+        // by the count** (ORCH-323): `admission` applies that count to its
+        // own records nowhere any more, and it did not need to here — a job
+        // charged `lent − floor` leaves nothing for a second.
         assert_eq!(
             the_hubs_room(lent, floor, at_once).per_job_cap_mib,
             Some(admissible)
+        );
+        let charged = as_the_hub_charges(None, the_hubs_room(lent, floor, at_once));
+        assert_eq!(
+            charged, admissible,
+            "a job costed at nothing is charged the whole room on such a machine ({lent} lent, \
+             {floor} kept, {cap_mib} a job), which is what admits one of them and no more"
         );
     }
     assert!(
@@ -307,56 +338,68 @@ fn a_host_too_small_for_one_ceiling_admits_one_job_on_both_sides() {
     );
 }
 
-/// **A requirement reading is charged nothing, and that is deliberate** —
-/// with the bound that makes it safe named in the same test (D159, D169).
+/// **A requirement reading is charged the per-job cap, exactly as every other
+/// figureless job is, and that is what ORCH-323 changed** (D159, D169).
 ///
-/// `reading_job` gives a reading no figure: it builds and boots nothing, and
-/// no figure is invented for one. But the **runner** cannot tell a reading
-/// from `herdctl submit -- true` — both arrive with no `JobNeed` and both are
-/// granted the whole of `--job-memory-max` — so for a reading, and a reading
-/// alone, the hub charges less than the runner grants. What keeps that safe is
-/// the count the runner announced, which `admission` still applies as a hard
-/// bound: at most `at_once` jobs out there, and `at_once × cap ≤ lent − floor`
-/// by the runner's own arithmetic.
+/// This test was
+/// `a_reading_is_charged_nothing_and_the_announced_count_is_what_bounds_it`,
+/// and it said in as many words that *"if the count bound is ever dropped in
+/// favour of the sum alone, this test is where it has to be answered"*. It is
+/// answered here rather than deleted, because the trade it recorded is the
+/// reason the count was load-bearing and the reason it no longer is.
 ///
-/// This test is the record of that trade. If the count bound is ever dropped
-/// in favour of the sum alone, this test is where it has to be answered.
+/// **What it recorded.** `reading_job` gives a reading no figure: it builds
+/// and boots nothing, and nought is not a figure. But the **runner** cannot
+/// tell a reading from `herdctl submit -- true` — both arrive with no
+/// `JobNeed` and both are granted the whole of `--job-memory-max` — so while
+/// a reading was charged nothing, the hub charged less than the runner grants
+/// for up to `READINGS_AT_ONCE` jobs per machine, and the only thing covering
+/// that was `at_once × cap ≤ lent − floor`.
+///
+/// **What it records now.** One charge for both, so there is no gap for the
+/// count to cover: a figureless job is charged `C_hub` whether a reading or
+/// not, which is never below the whole cap the runner grants it. The frame is
+/// untouched — nothing on it says which jobs are readings, and
+/// `PROTOCOL_VERSION` stays 3 — and `READINGS_AT_ONCE` is untouched with it:
+/// it bounds how many readings one machine runs at once (D169), which is a
+/// statement about their kind and not about memory.
 #[test]
-fn a_reading_is_charged_nothing_and_the_announced_count_is_what_bounds_it() {
+fn a_reading_is_charged_the_per_job_cap_like_every_other_figureless_job() {
     let room = the_hubs_room(8192, 1024, 1);
     assert_eq!(room.per_job_cap_mib, Some(7168));
-    let reading = charged_against_the_room(None, 0, room, true);
-    assert_eq!(reading, 0, "no figure is invented for a reading");
-    // And the same job, if it were not a reading, is charged the whole cap —
-    // which is what the runner grants it either way.
-    let not_a_reading = charged_against_the_room(None, 0, room, false);
-    assert_eq!(not_a_reading, 7168);
+    // The one figure, for the one shape both jobs arrive in: no `JobNeed`,
+    // and nothing anywhere saying which of them was the hub's own reading.
+    assert_eq!(
+        charged_against_the_room(None, 0, room),
+        7168,
+        "a job costed at nothing is charged the whole per-job cap, a reading included"
+    );
     let (_, granted) = the_runner(8192, 1024, 7168, None);
     assert_eq!(
         granted, 7168,
         "the runner grants a reading the whole cap, because nothing on the frame says it is one"
     );
-    // The bound that covers the difference, on every triple of the grid:
-    // `at_once × cap` never exceeds what the host admits, except on
-    // `jobs_at_once`'s own `.max(1)` branch, where one job is what both sides
-    // allow.
-    for lent in LENT_MIB {
-        for floor in FLOOR_MIB {
-            if floor >= lent {
-                continue;
-            }
-            let admissible = lent - floor;
-            for cap_mib in CAP_MIB {
-                let (at_once, _) = the_runner(lent, floor, cap_mib, None);
-                if at_once == 1 && cap_mib > admissible {
-                    continue;
-                }
-                assert!(
-                    u64::from(at_once) * cap_mib <= admissible,
-                    "{at_once} × {cap_mib} MiB is more than the {admissible} MiB this host \
-                     admits, so the count would not bound what the readings are not charged"
-                );
-            }
+    // And over the whole grid, for the job the hub cannot distinguish: the
+    // charge is never below the grant, which is the property the other tests
+    // here walk — asserted once more on this one job, because this is the
+    // charge that used to be nought.
+    let mut checked = 0;
+    for (lent, floor, cap_mib, admissible) in triples() {
+        if admissible < cap_mib {
+            continue;
         }
+        let (at_once, granted_mib) = the_runner(lent, floor, cap_mib, None);
+        let charged = as_the_hub_charges(None, the_hubs_room(lent, floor, at_once));
+        assert!(
+            charged >= granted_mib,
+            "a figureless job on a host lending {lent} MiB, keeping {floor} and capping a job \
+             at {cap_mib} ({at_once} places announced) is charged {charged} MiB and granted \
+             {granted_mib} MiB: that is the under-charge the announced count used to cover"
+        );
+        checked += 1;
     }
+    assert!(
+        checked > 100,
+        "only {checked} triples were walked, so this is asserting over almost nothing"
+    );
 }
