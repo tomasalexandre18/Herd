@@ -58,13 +58,24 @@ Steps, in order, each one evidenced in the handoff:
    that one is a gate rather than bookkeeping: `check-orchestration.sh`
    (*a landing records its predecessor's post-push run*, ORCH-333)
    reads the newest `<date>-merge-<batch>.md` and refuses a record that
-   does not name the previous landing's batch together with a run id
-   and a verdict for that run, **inside one paragraph** — a paragraph
-   ends at a blank line, at the next bullet or at the next heading, so
-   the three may wrap over two or three lines but may not sit in three
-   different bullets. It runs at step 2 of the `gate.sh` you run in
-   step 7, so a missing paragraph turns **your own** landing red; your
-   run cannot be in your record (step 9), and your predecessor's has
+   does not carry the one labelled field that may hold that claim,
+   `- **Previous run:** batch <n-1> · ci.yml <id> · <verdict>` — one
+   top-level bullet, that label, that capitalisation, no `<placeholder>`
+   left in it, and exactly one such bullet in the record. The field may
+   wrap over as many lines as it needs and may carry a nested
+   sub-bullet; what ends it is a blank line or a line that is not
+   indented. **The field is the claim and a fence is only evidence:** a
+   `gh run view` paste in a fenced block does not satisfy it, and
+   neither does a paragraph of prose or a table row — batch 33's record
+   put both of its owed runs in a fence, and a record like it now fires,
+   deliberately. `templates/landing.md`, *CI run*, has the exact shape.
+   The field is required of landings dated **2026-11-01 or later**
+   (`lr_from`); batch 34's record predates it and is not rewritten, so
+   the first landing on or after that date is the first that must carry
+   the field — very likely yours. The case runs at step 2 of the
+   `gate.sh` you run in step 7, before any cargo step, so a missing
+   field turns **your own** landing red for about a minute; your run
+   cannot be in your record (step 9), and your predecessor's has
    nowhere else to go. Take the id from the previous merger's report as
    your brief relays it, or find it yourself with
    `gh run list --workflow ci.yml --branch main --limit 10` matched to
@@ -72,15 +83,18 @@ Steps, in order, each one evidenced in the handoff:
    with `gh run view <id>`, never off a list line, and write GitHub's
    own word (`success`, `failure`, `cancelled`, `timed_out`, …) — or the
    literal `no ci.yml run` when that push started none. The check has no
-   network and cannot tell a verdict you read from one you invented, so
-   a figure you did not look up passes the gate and is a false entry in
-   the audit trail.
+   network and no toolchain: it asks that the field is there and well
+   shaped, never that the verdict is true, so a mistyped digit passes
+   and a figure you did not look up is a false entry in the audit
+   trail. That comparison is a human's (workflow.md, *No docs gate can
+   check the record itself*).
 6. **Write your handoff and commit it**, as
    `docs/orchestration/history/<date>-merge-<batch>.md`. It is the last
    change to the tree: its *Gates* section names the receipt `gate.sh`
    will write for the sha you are about to gate, and it says that
    **your own** post-push run id is in your report and not here. Your
-   predecessor's is a different figure and it stays, from step 5. This
+   predecessor's is a different figure, carried by step 5's field, and
+   it stays. This
    is ORCH-121 applied to you — the gate must run on the tree you push,
    so the handoff has to be in that tree already and **nothing may be
    added to it afterwards**.
@@ -126,7 +140,8 @@ Steps, in order, each one evidenced in the handoff:
    **report** to the orchestrator. Your handoff was committed at step 6
    and your push is done, and a second push for the same batch would
    break step 8's last rule, so the **next** landing is what records it
-   — in its own *CI run* paragraph and in its board edit. Do not wait
+   — in the `- **Previous run:**` field of its own *CI run* section, and
+   in its board edit. Do not wait
    for the verdict unless you judge this landing risky — say which you
    did. The next session start reads it, and a `failure` becomes a board
    row (workflow.md, *When the post-push run on `main` is red*). Your
