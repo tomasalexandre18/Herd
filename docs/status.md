@@ -1,4 +1,4 @@
-# Status — 2026-10-30
+# Status — 2026-10-31
 
 State now, replaced every session. **What is owed and what Alexa has not
 decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
@@ -6,17 +6,18 @@ decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
 one batch, one `--no-ff` landing, a green `./scripts/gate.sh` for the merge's
 **second parent on an identical tree**, every gate through Herd (**D258**).
 
-## Releases, and what v1.0.0 will mean
+## Releases
 
-**v0.4.1 is published, tagged by `herd-merger`** (**D212**, **D211**); nothing
-since; notes are **Alexa's** (ORCH-162, **D210**). Next tag: v1.0.0 (ORCH-217).
-
-**Stable means v1.0.0** (**D204**) and **it ships 42 of 44 musts** (**D248**):
-M11's pack half is in it; **E-50 is withdrawn and E-49 waived**, both named in
-the notes as not met. **All three versions have moved** —
-`PROTOCOL_VERSION` **3**, `RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** — no
-migration path (**D243**). **`cut-v1.0.0` (`f3e9df0`) is unlanded and unsigned,
-its scope table wrong three ways** (ORCH-300).
+**v1.0.0 is landed and tagged by `herd-merger`** (**D212**, **D277**); a
+release's own notes stay **Alexa's** (**D210**). **Stable means v1.0.0**
+(**D204**); the notes carry **no headline figure** — his choice — and a
+sourced table: the 44 `must` cells at `f7f2ea1` read **36 / 5 / 1 / 2**,
+E-14's still `planned` (ORCH-305). **Named as not met, five**: E-49 waived and
+**unmeasured**, E-50 and E-14 **withdrawn** (**D248**, **D275**), record
+retention cut to **v1.1**, **one known-unstable test shipping**, breaking
+blocker **B8**. **All three versions have moved** — `PROTOCOL_VERSION` **3**,
+`RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** — and there is **no migration
+path** (**D243**).
 
 ## What is known about the consumer's machines, and when
 
@@ -84,7 +85,6 @@ are latently red (ORCH-291) and the hollow green is closed (**D273**).
    a lost pack. `JobFact` and six reason codes ride untouched (D230).
 3. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
-4. **The runner's half of D225 has never run against a real hub**, though both
-   halves are in the tree — the cheapest gap before v1.0.0 (ORCH-222).
-5. **`coverage.md`'s E-12 and E-17 rows are recounted** against `71efccf`
-   (ORCH-302): both stay `part`, 36 of 44 unmoved, the push is what is left.
+4. **The runner's half of D225 has never run against a real hub** (ORCH-222).
+5. **`coverage.md`'s E-16 note names two clauses that ship** (ORCH-307); the
+   row stays `part` and the table does not move.
