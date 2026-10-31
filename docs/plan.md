@@ -588,8 +588,11 @@ flipping the switch within 10 s (E-33).
 Close every chatOnS-gated acceptance with their deliverables (declaration
 file, pack and `test --pack`, results.json, push hook, nightly command,
 their executor and the status document): E-02's real verdicts, E-11's
-one-entry change, E-12's `0 crates compiled`, E-14's prepare timing,
-E-20's every-QEMU listing, E-41 live at 03:00, E-42 from their hook.
+one-entry change, E-12's `0 crates compiled`, E-20's every-QEMU
+listing, E-41 live at 03:00, E-42 from their hook. **E-14's prepare
+timing left this enumeration on 2026-10-31**, with the row itself,
+when the consumer withdrew the must (**D275**): a retired requirement
+is not M18's to walk.
 **Done when** `docs/coverage.md`'s *Gated on chatOnS* list — the one
 list, and the members above are **derived from it** rather than kept
 beside it — is walked with chatOnS on the real machines; each item
