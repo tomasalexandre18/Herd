@@ -17,9 +17,13 @@ The three documents that send the post-push run id somewhere a check
 cannot reach now also send it where the check reads: **the previous
 landing's `ci.yml` run id and a verdict for it go in the landing
 record, in one paragraph that also names the batch they belong to.**
-What they already said about the merger's *report*, the handoff's
-*Resume point* and the board edit is kept — nothing was replaced, the
-record was added beside it.
+What they already said about the merger's *report* and the board edit
+is kept — the record was added beside it, not in place of it. **One
+sentence was removed rather than kept**, on the orchestrator's decision
+of 2026-10-31 taken mid-task: `workflow.md:366`'s *"and in its
+handoff's *Resume point*"*, which ORCH-121 makes impossible. Finding 1
+has the evidence and the fix, and `:364`-`:367` is still four lines at
+`:364`-`:367`.
 
 The guard this serves is `scripts/check-orchestration.sh`'s section *a
 landing records its predecessor's post-push run* (ORCH-333), which
@@ -32,7 +36,7 @@ exist; the other landed alone traps the next merger, who would follow
 
 | File | What was added |
 |---|---|
-| `docs/orchestration/workflow.md` | two new bullets at the end of *What a landing is*: *The next landing writes that run into its own record* (what the case refuses, the one-paragraph scope and its boundaries, the wrapped form as accepted, the literal `no ci.yml run`) and *What that case does not do* (no network, no toolchain, co-occurrence only, with batch 32 as the shape refused and batch 33 as the shape accepted). The one pre-existing sentence changed is at `:344`-`:346`, *"the next landing's board edit records it"* → *"the next landing writes it into its own record, and into its board edit"*, rewrapped inside the same four lines so that no line number moved before it |
+| `docs/orchestration/workflow.md` | two new bullets at the end of *What a landing is*: *The next landing writes that run into its own record* (what the case refuses, the one-paragraph scope and its boundaries, the wrapped form as accepted, the literal `no ci.yml run`) and *What that case does not do* (no network, no toolchain, co-occurrence only, with batch 32 as the shape refused and batch 33 as the shape accepted). The one pre-existing sentence changed is at `:344`-`:346`, *"the next landing's board edit records it"* → *"the next landing writes it into its own record, and into its board edit"*, rewrapped inside the same four lines so that no line number moved before it. **And `:364`-`:367` is corrected**, also in place and in the same four lines: it asked the merger to put its own post-push run id *"in its handoff's *Resume point*"*, which cannot be done; it now says that the merger's **own** id goes in its **report**, the only place it can go, and that the **predecessor's** id and verdict go in the record. It does not re-describe the guard — the two new bullets below it already do |
 | `docs/orchestration/templates/landing.md` | the *CI run* section gains the required paragraph (the three fields, where to read the conclusion back from, GitHub's conclusion words, the literal `no ci.yml run`, and that unlike the landing's own run it is **not** deferred and goes in the committed copy); the check and its one-paragraph scope stated under it, with what it cannot do; the header bullet becomes `- **CI run:** <id> — recorded, not waited on. Batch <n-1>'s own run, …`, which is itself an accepted shape; the *two copies are not identical* table row for the `ci.yml` run id now points at the next landing's record as well as its board edit, with a short paragraph naming the predecessor's run as the figure that is deferred nowhere |
 | `.claude/agents/herd-merger.md` | step 5 (write the record) gains the instruction and the reason it is a gate and not bookkeeping, including that it runs at step 2 of the merger's own `gate.sh` at step 7; step 6 now says **your own** post-push run id is in the report and not in the handoff, and that the predecessor's is a different figure that stays; step 9's title becomes *Report your own post-push run; you cannot commit it*, and it ends by pointing at step 5 for the predecessor's |
 
@@ -90,12 +94,12 @@ silence on `a`, `b` and `d` is a result and not an absence.
   the batch's own `./scripts/gate.sh` run at integration, which is
   `herd-merger`'s. No `cargo`, no Herd job, no `CARGO_TARGET_DIR`, no
   build tree created.
-- **`workflow.md:364`-`:367` was left exactly as it stands**, including
-  the claim that the merger puts the run id *"in its handoff's *Resume
-  point*"*. The brief asked for it to be kept and it is cited by line.
-  It is also, on the evidence below, not achievable — see *Risks and
-  findings*, finding 1 — so it was not propagated into the two other
-  documents.
+- **`board.md:147`'s stale citations into `workflow.md` are not fixed
+  here.** They are real and they are in finding 2 with the new numbers.
+  The orchestrator ruled on 2026-10-31 that `board.md` is the merger's
+  at integration and that it is briefing the merger there, so this
+  branch leaves the row alone rather than touching a file outside its
+  write paths.
 
 ## Gates
 
@@ -115,13 +119,23 @@ its existing cases red. Last line, verbatim:
 check-orchestration: 324 passed, 0 failed
 ```
 
+**Both were run twice**: once on the first three-file commit, and again
+after the `:364`-`:367` correction was folded in, with the same two
+results. The second `check-docs.sh` run is the one named below.
+
 Width, measured over the three edited files with the same column rule
 `check-docs.sh:85`-`:98` applies, and **without** its fence exemption,
 so stricter than the gate: **no line this branch wrote or rewrapped is
-over 79 columns**, in any of the three and in this handoff. The
-over-long lines that remain in them are pre-existing and width-exempt:
-the role and template table rows, and `herd-merger.md`'s YAML
-`description:` at `:3`.
+over 79 columns in any of the three files.** The over-long lines that
+remain in them are pre-existing and width-exempt: the role and template
+table rows, and `herd-merger.md`'s YAML `description:` at `:3`.
+
+**One line in this handoff is 80 columns, and it is named rather than
+hidden**: finding 1's fourth quoted line, which is `workflow.md:367`
+at 77 columns plus the three spaces of list indentation the fence sits
+at. It must stay byte-faithful to the line it quotes, it is inside a
+fence, and `check-docs.sh:85`-`:90` exempts fenced lines — `docs ok`
+is the confirmation, not an assumption.
 
 **The last run, named and not quoted:** `./scripts/check-docs.sh` on
 the tree that carries this handoff, run after this commit and before
@@ -137,30 +151,52 @@ test suite was run.
 
 ## Risks and findings
 
-1. **`workflow.md:366` asks the merger for something ORCH-121 makes
-   impossible, and it is not mine to edit.** It says the merger
-   *"puts its id in its **report** to the orchestrator and in its
-   handoff's *Resume point*"*. But the merger's handoff is **the last
-   change before the gate** (`workflow.md:336`-`:347`,
+1. **`workflow.md:366` asked the merger for something ORCH-121 makes
+   impossible. Found mid-task, decided by the orchestrator the same
+   day, and fixed in this branch.** The sentence read *"puts its id in
+   its **report** to the orchestrator and in its handoff's *Resume
+   point*"*. But the merger's handoff is **the last change before the
+   gate** (`workflow.md:336`-`:347`,
    `.claude/agents/herd-merger.md` step 6), so it is committed before
    the push that starts the run exists. Batch 33's own merge handoff
-   confirms the practice rather than the sentence:
+   answers it honestly rather than following it:
    `history/2026-10-31-merge-batch-33.md:315` reads *"**None yet — this
    push starts it.** The id comes from `gh run list …` immediately
-   after the push, goes into the merger's **report**"*. The brief told
-   me to keep those four lines and they are cited by line, so I kept
-   them; I did **not** carry the *Resume point* into the two other
-   documents, which now source the id from the previous merger's report
-   or from `gh run list --workflow ci.yml --branch main --limit 10`
-   matched to that landing's merge sha. **Decision for the
-   orchestrator, not an edit I took:** either drop *"and in its
-   handoff's *Resume point*"* from `workflow.md:366`, or reword it to
-   *"and its handoff says where the id is"*. Doing it in this branch
-   would have moved `:364`-`:367`, which the brief protects.
+   after the push, goes into the merger's **report**"*. A live
+   instruction that cannot be followed is worse than a missing one: the
+   next agent either invents the figure or quietly ignores the
+   document. The four lines now read as follows — verbatim, indented
+   three spaces to sit inside this list item:
+
+   ```text
+   - **The post-push run is recorded, then read.** Immediately after the
+     push, `herd-merger` puts its own run id in its **report** — the only
+     place it can go, ORCH-121 having frozen the tree before the push. The
+     **predecessor's** id and verdict go in the record. It does not wait for the
+   ```
+
+   Rewrapped **in place**, four lines for four, so `:364`-`:367` is
+   still at `:364`-`:367` and `workflow.md` is still 1064 lines — the
+   same technique as `:344`-`:346`. The widths are 69, 70, 71 and 77
+   columns, and `:367` still ends mid-sentence so that `:368`'s
+   *"verdict — that wait is the nine minutes …"* continues it unchanged.
+   It deliberately does **not** re-describe the guard; the two bullets
+   added below it do that. Nothing in either gate is keyed on the
+   removed wording: `grep -n "Resume point"` and `grep -n "post-push"`
+   over `scripts/check-docs.sh`, `main`'s `check-orchestration.sh` and
+   `origin/orch-333-figure-and-record`'s version return no case,
+   only the ORCH-333 section's own heading and message. The two other
+   documents never carried the *Resume point* claim: they source the id
+   from the previous merger's report or from
+   `gh run list --workflow ci.yml --branch main --limit 10` matched to
+   that landing's merge sha.
 2. **`workflow.md` gained 31 lines and every one of them is after line
-   374.** `:330` (*"that comparison is a human's"*) and `:364`-`:367`
-   are byte-identical and at the same line numbers — verified by
-   printing them after the edit. Everything below `:374` moved by
+   374.** `:330` (*"that comparison is a human's"*) is byte-identical
+   and at the same line number; `:364`-`:367` is **four lines at the
+   same four numbers**, with new text in them (finding 1) and no line
+   added or removed. Both verified by printing them after the edits,
+   and the file is 1064 lines before and after the fold-in. Everything
+   below `:374` moved by
    exactly +31 (file 1033 → 1064 lines), and **one live document cites
    into that range**: `docs/orchestration/board.md:147`, the ORCH-250
    row, whose *Evidence* cell names `docs/orchestration/workflow.md:620`-
@@ -244,14 +280,18 @@ else, with no figure in the same paragraph.
 
 ## Decisions needed
 
-**One, and it is the orchestrator's, not Alexa's** — it is a *how*.
-`workflow.md:366` asks the merger to put the post-push run id in its
-handoff's *Resume point*, which ORCH-121 makes impossible (finding 1).
-Recommendation: a one-line follow-up branch rewording it to *"and its
-handoff says where the id is"*, after this batch lands, so that
-`:364`-`:367` does not move while briefs still cite it. Fallback: leave
-it; the sentence is harmless in practice, since every merger so far has
-done the achievable thing and said so in its handoff.
+**None open.** One was raised and **answered inside the task**, so it
+is recorded here rather than left hanging: `workflow.md:366` asked the
+merger to put its post-push run id in its handoff's *Resume point*,
+which ORCH-121 makes impossible (finding 1). The recommendation was a
+follow-up branch after this one, to keep `:364`-`:367` from moving
+while briefs cite it. The orchestrator decided on 2026-10-31 to take it
+**now instead**, reasoning that a known-false instruction left in the
+method's own document on the day machinery was ruled to beat memory
+would be incoherent — and the constraint it had been held back for was
+satisfiable anyway: the correction is four lines for four, in place.
+Nothing is waiting on Alexa: this is a *how*, not a change to what the
+product is or promises.
 
 ## Resume point
 

@@ -362,9 +362,9 @@ thing a second machine would ever have said about its own landing.
   merge nobody had to read, and a silent revert with nothing to resolve
   is caught by this check and by nothing else. It takes a minute.
 - **The post-push run is recorded, then read.** Immediately after the
-  push, `herd-merger` puts its id in its **report** to the orchestrator
-  and in its handoff's *Resume point*; the board gets it at the **next**
-  landing, for the reason in the bullet above. It does not wait for the
+  push, `herd-merger` puts its own run id in its **report** — the only
+  place it can go, ORCH-121 having frozen the tree before the push. The
+  **predecessor's** id and verdict go in the record. It does not wait for the
   verdict — that wait is the nine minutes this change exists to stop
   paying — unless it judges a landing risky, and it says which it did.
   The next session start reads
