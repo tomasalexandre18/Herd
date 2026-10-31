@@ -614,6 +614,111 @@ impl Requirements {
     }
 }
 
+/// How much more than a job declared its kernel ceiling allows: **one tenth
+/// of the declared sum**, and this is the only margin in the product.
+///
+/// **Why there has to be one at all.** The consumer's kernel memcg
+/// out-of-memory report for their job `j0000000069`, on a Herd job cgroup,
+/// read `memory: usage 8388608kB, limit 8388608kB … shmem 4219834368` while
+/// the killed process's own `shmem-rss` was **0** — 4.03 GiB of anonymous
+/// memory plus 3.93 GiB of shmem against an 8.00 GiB ceiling. Tmpfs pages a
+/// job writes are charged to the cgroup that wrote them, and a job cgroup
+/// sets `memory.swap.max` to 0, so those pages cannot be reclaimed either: a
+/// job's tmpfs reservation sits **inside** its memory ceiling, not beside it.
+/// Herd admits [`Requirements::memory_mib`] (E-29) and
+/// [`Requirements::tmpfs_mib`] (E-31) as two independent quantities and they
+/// are not independent. A ceiling of `memory_mib + tmpfs_mib` exactly is the
+/// figure that killed that job, because the last page of a reservation the
+/// job is entitled to use is the page that trips the limit — so a ceiling
+/// with no margin would kill every job that uses the tmpfs it reserved, on
+/// the first day it was enforced.
+///
+/// **Why one tenth, and why a proportion.** The report's own figures do not
+/// close on its limit: 8.00 GiB less 4.03 GiB of anon and 3.93 GiB of shmem
+/// leaves about 40 MiB — a residue of that order at that rounding, and the
+/// only measurement of it there is. That residue is what the kernel charges
+/// the cgroup on the job's behalf and no declaration can see: page tables,
+/// slab, kernel stacks, socket buffers. It scales with the job's own
+/// footprint and its process count, not with the host, so the margin is a
+/// proportion and not a figure of bytes. One tenth is an order of magnitude
+/// above that residue, which is the side to be wrong on for a cap whose
+/// purpose is to kill a runaway job and not a working one; and it is small
+/// enough that packing by the granted sum, which will charge this ceiling
+/// against the memory a host lends, pays a tenth of a job for it rather than
+/// a whole one.
+///
+/// **One figure, in one place.** Both sides have to charge the same ceiling —
+/// `herd-hub/src/matcher.rs` is explicit that a hub counting a different set
+/// from the runner is the defect — so the margin lives here, on the contract,
+/// and neither crate carries a second copy of it.
+pub const CEILING_MARGIN_PERCENT: u64 = 10;
+
+/// What the hub costed one job at, as the runner receives it (E-29, E-31).
+///
+/// The hub has always known this and the runner never did: `AssignJob`
+/// carried a command, a declaration and a time cap, and the runner — the only
+/// thing in the product that writes a kernel memory ceiling — capped every
+/// job at the one figure its owner gave it at startup. D180 named that gap
+/// and refused to close it by guessing (*"`AssignJob` carries no declared
+/// memory need, only a command"*); carrying the figure was left as a protocol
+/// decision, and it has been made.
+///
+/// **Both figures, because one of them is useless alone.** See
+/// [`CEILING_MARGIN_PERCENT`]: the tmpfs a job reserves is charged to the
+/// job's own cgroup, so a ceiling derived from the memory figure alone kills
+/// a job for using exactly what it declared.
+///
+/// **Sent whole or not at all.** A job that declares no whole-job memory need
+/// is a real state — `herdctl submit -- true` — and the hub says so by
+/// sending no `JobNeed` rather than by sending a zero: a runner handed
+/// `memory_mib: 0` would have to decide what nought meant, and nought is not
+/// a figure (the rule [`Requirements::read`] already enforces on a reading).
+/// Nothing sent means *this job was costed at nothing*, and the runner holds
+/// it to the ceiling its own owner gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobNeed {
+    /// What the whole job needs, in MiB (E-29). Never zero: a job with no
+    /// figure carries no `JobNeed` at all.
+    pub memory_mib: u64,
+    /// What it reserves on the runner's tmpfs while it runs, in MiB (E-31).
+    /// Nought is a real answer here, unlike the memory figure.
+    pub tmpfs_mib: u64,
+}
+
+impl JobNeed {
+    /// The kernel ceiling this grant earns, in MiB: both figures, plus
+    /// [`CEILING_MARGIN_PERCENT`] of their sum.
+    ///
+    /// Saturating rather than wrapping, and the saturation is not reachable
+    /// from a real declaration: a figure near `u64::MAX` MiB is a submission
+    /// no host could satisfy, so the job is refused by admission long before
+    /// a runner writes a ceiling for it.
+    pub fn ceiling_mib(&self) -> u64 {
+        self.memory_mib
+            .saturating_add(self.tmpfs_mib)
+            .saturating_mul(100 + CEILING_MARGIN_PERCENT)
+            / 100
+    }
+
+    /// The same figure in bytes, which is the unit `memory.max` is written
+    /// in.
+    pub fn ceiling_bytes(&self) -> u64 {
+        self.ceiling_mib().saturating_mul(1 << 20)
+    }
+
+    /// The one line a runner says this grant in: its own log, and the
+    /// sentence a host that cannot enforce the ceiling has to print.
+    pub fn line(&self) -> String {
+        format!(
+            "{} MiB of memory and {} MiB of tmpfs, which is {} MiB of ceiling once the \
+             {CEILING_MARGIN_PERCENT}% margin is on",
+            self.memory_mib,
+            self.tmpfs_mib,
+            self.ceiling_mib()
+        )
+    }
+}
+
 /// One `<key>=<value>` out of a line, when the line is one.
 ///
 /// The key is one lowercase word: `GROVE_OUT=/data/out` in a shell's own
@@ -985,6 +1090,89 @@ fetch cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
         assert_eq!(
             capped.line(),
             "run: 2700.000 s, no exit code: stopped at the time cap, 2700 s"
+        );
+    }
+
+    /// The margin is the whole reason a ceiling is a function of the two
+    /// figures and not their sum, and the figures here are the consumer's own.
+    ///
+    /// Their job `j0000000069` died on a Herd job cgroup at
+    /// `usage 8388608kB, limit 8388608kB`, of which `shmem 4219834368` —
+    /// 3.93 GiB — was tmpfs the job had written, while the killed process's
+    /// own `shmem-rss` was 0. A job declaring 4096 MiB of memory and
+    /// reserving 4096 MiB of tmpfs declares exactly that 8.00 GiB, so a
+    /// ceiling of the sum is the ceiling it died at.
+    #[test]
+    fn a_ceiling_clears_the_sum_that_killed_j0000000069() {
+        let need = JobNeed {
+            memory_mib: 4096,
+            tmpfs_mib: 4096,
+        };
+        assert_eq!(
+            need.memory_mib + need.tmpfs_mib,
+            8192,
+            "8192 MiB is the 8.00 GiB limit the kernel reported"
+        );
+        assert!(
+            need.ceiling_mib() > 8192,
+            "a ceiling equal to the declared sum is the figure that killed that job, so a \
+             margin of nought would ship the defect: {} MiB",
+            need.ceiling_mib()
+        );
+        assert_eq!(need.ceiling_mib(), 9011);
+        assert_eq!(need.ceiling_bytes(), 9011 * (1 << 20));
+    }
+
+    /// The tmpfs reservation is **inside** the ceiling, not beside it: shmem
+    /// is charged to the cgroup that writes it and `memory.swap.max` is 0, so
+    /// those pages are part of what the limit counts.
+    #[test]
+    fn the_tmpfs_reservation_is_inside_the_ceiling() {
+        let reserving = JobNeed {
+            memory_mib: 4096,
+            tmpfs_mib: 4096,
+        };
+        let reserving_none = JobNeed {
+            memory_mib: 4096,
+            tmpfs_mib: 0,
+        };
+        assert_eq!(reserving_none.ceiling_mib(), 4505);
+        assert!(
+            reserving.ceiling_mib() >= reserving_none.ceiling_mib() + 4096,
+            "a job that reserves 4096 MiB of tmpfs must be allowed all of it on top of its \
+             memory figure: {} MiB against {} MiB",
+            reserving.ceiling_mib(),
+            reserving_none.ceiling_mib()
+        );
+    }
+
+    /// A figure no machine could serve **saturates**, and the direction is
+    /// the point: a wrapped ceiling is a *small* number, which is the one
+    /// failure of this arithmetic that would be silent.
+    #[test]
+    fn an_impossible_figure_saturates_rather_than_wrapping() {
+        let absurd = JobNeed {
+            memory_mib: u64::MAX,
+            tmpfs_mib: u64::MAX,
+        };
+        assert_eq!(absurd.ceiling_mib(), u64::MAX / 100);
+        assert_eq!(absurd.ceiling_bytes(), u64::MAX);
+    }
+
+    /// The line a runner prints names both declared figures and the ceiling
+    /// they earn, because an operator reading one figure cannot tell which of
+    /// the three it is.
+    #[test]
+    fn the_line_names_both_figures_and_the_ceiling() {
+        let said = JobNeed {
+            memory_mib: 4096,
+            tmpfs_mib: 4096,
+        }
+        .line();
+        assert_eq!(
+            said,
+            "4096 MiB of memory and 4096 MiB of tmpfs, which is 9011 MiB of ceiling once the \
+             10% margin is on"
         );
     }
 }

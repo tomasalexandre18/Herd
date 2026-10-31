@@ -45,7 +45,29 @@ impl Harness {
     async fn new(label: &str, shape: impl FnOnce(&mut Confinement)) -> Self {
         let own = TempDir::new(label);
         let data_root = own.path().to_path_buf();
-        Self::rooted_at(data_root, Some(own), label, shape).await
+        Self::rooted_at(data_root, Some(own), label, None, shape).await
+    }
+
+    /// The same harness on a machine that **says how much memory it lends**,
+    /// which is what the hub needs before it will admit a job that declares a
+    /// memory need at all.
+    ///
+    /// `herd_runner::metrics::host_size` answers a total and a thread count
+    /// and **no floor**, and `HostSize::admissible_memory_mib` is `None`
+    /// unless both are there — so `herd-hub`'s matcher answers `NotHere` for
+    /// every costed job on a runner that named no floor. The binary fills the
+    /// default in before it dials (`herd-runner/src/main.rs`, D180); a runner
+    /// started through the library, as every test here starts one, does not.
+    /// So a test about a declared figure has to say the figure the declaration
+    /// is weighed against, and this is where it says it.
+    async fn lending(
+        label: &str,
+        host: herd_proto::HostSize,
+        shape: impl FnOnce(&mut Confinement),
+    ) -> Self {
+        let own = TempDir::new(label);
+        let data_root = own.path().to_path_buf();
+        Self::rooted_at(data_root, Some(own), label, Some(host), shape).await
     }
 
     /// The same harness with its data root **given** rather than made: a
@@ -55,6 +77,7 @@ impl Harness {
         data_root: PathBuf,
         own_root: Option<TempDir>,
         label: &str,
+        host: Option<herd_proto::HostSize>,
         shape: impl FnOnce(&mut Confinement),
     ) -> Self {
         let state = TempDir::new(&format!("{label}-state"));
@@ -79,13 +102,16 @@ impl Harness {
             let _ = hub.serve().await;
         });
         let running = tokio::spawn({
-            let config = herd_runner::Config {
+            let mut config = herd_runner::Config {
                 hub_url: hub_url.clone(),
                 name: Some(format!("m4-{label}")),
                 token: Some(token),
                 confinement,
                 ..herd_runner::Config::default()
             };
+            if let Some(host) = host {
+                config.host = host;
+            }
             async move {
                 if let Err(error) = herd_runner::run(config).await {
                     eprintln!("herd-runner (test): {error:#}");
@@ -130,6 +156,43 @@ impl Harness {
             herd_proto::LabelSet::default(),
             herd_proto::Priority::Step,
             herdctl::Declared::default(),
+            |stream, data| match stream {
+                LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
+                LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
+            },
+            |said| {
+                if let herdctl::Said::Note(note) = said {
+                    notes.push(note.to_owned());
+                }
+            },
+        )
+        .await
+        .expect("the hub answers with an outcome");
+        Ran {
+            outcome: finished.outcome,
+            metrics: finished.metrics,
+            out,
+            err,
+            notes,
+        }
+    }
+
+    /// The same, for a job that **declares what it needs** (E-29, E-31).
+    ///
+    /// A separate entry point rather than a parameter on [`Harness::run`]
+    /// because almost every test here is about a cap the machine's owner set,
+    /// and the two questions must not be confused: this one is about the
+    /// figure the *job* stated and the hub costed it at.
+    async fn run_declaring(&self, script: &str, declared: herdctl::Declared) -> Ran {
+        let mut out = String::new();
+        let mut err = String::new();
+        let mut notes = Vec::new();
+        let finished = herdctl::run_job(
+            &self.requester(),
+            shell(script),
+            herd_proto::LabelSet::default(),
+            herd_proto::Priority::Step,
+            declared,
             |stream, data| match stream {
                 LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
                 LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
@@ -744,9 +807,15 @@ impl Drop for TheOnlyWayIn {
 async fn a_job_cannot_hide_what_it_wrote_from_its_disk_budget() {
     let budget = 8 << 20;
     let way_in = TheOnlyWayIn::around("blinded-budget");
-    let harness = Harness::rooted_at(way_in.data_root(), None, "blinded-budget", |confinement| {
-        confinement.disk_budget = budget;
-    })
+    let harness = Harness::rooted_at(
+        way_in.data_root(),
+        None,
+        "blinded-budget",
+        None,
+        |confinement| {
+            confinement.disk_budget = budget;
+        },
+    )
     .await;
     // The enclosure is blinded first and the hiding place second: in that
     // order an enclosing walk that is already on its way down cannot reach
@@ -3522,4 +3591,105 @@ fn workspace_root() -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// **A job runs under the ceiling it declared, not under the one figure its
+/// runner's owner lent every job** — on a real hub, a real runner and the real
+/// kernel (invariant 5).
+///
+/// This is the defect, end to end. The hub has always read `memory_mib` off
+/// the record and admitted the job against it; the runner is the only thing
+/// in the product that writes a kernel memory ceiling, and until now the
+/// frame carried no figure at all, so a job admitted against 512 MiB of
+/// declared need ran under whatever `--job-memory-max` said. On the
+/// consumer's fleet that was an 8 GiB cap killing a job whose memory figure
+/// and tmpfs reservation came to exactly 8 GiB.
+///
+/// **The pair is the assertion, and the second half is what makes it worth
+/// anything.** The same script, on the same runner, with the same allowance
+/// of real memory: declared, it survives; undeclared, the machine's 32 MiB
+/// stops it. A test with only the first half would pass on a runner whose own
+/// figure happened to be generous, which is to say it would pass against the
+/// defect.
+///
+/// **Nothing here skips.** The figure is enforced by the job's own cgroup
+/// where this host has one and by `RLIMIT_AS` where it does not, and the
+/// direction asserted — 32 MiB stops a 67 MiB string, 563 MiB does not — is
+/// the same under both. What the fallback cannot do is bound a process
+/// *tree*, and that is asserted where it belongs, on the sentence the runner
+/// prints (`herd_runner::job_ceiling`'s own tests).
+#[tokio::test]
+async fn a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s() {
+    // A machine that says what it lends and what it keeps, because a hub
+    // admits no costed job to one that does not say both
+    // (`HostSize::admissible_memory_mib`).
+    let harness = Harness::lending(
+        "declared-ceiling",
+        herd_proto::HostSize::new(Some(8192), Some(4)).with_floor(Some(1024)),
+        |confinement| {
+            // What this machine's owner lends every job: far less than the
+            // job below declares, and far less than it uses.
+            confinement.memory_max = 32 << 20;
+            confinement.timeout = Duration::from_secs(60);
+        },
+    )
+    .await;
+
+    // A bounded hog: twenty-five doublings of one byte is a 32 MiB string in
+    // the shell's own process, and building it holds the old copy and the
+    // new at once — past the machine's 32 MiB and well inside the 563 MiB
+    // the job declares. Bounded rather than the unbounded doubling that
+    // `an_allocation_past_the_ceiling...` uses: the job has to be able to finish.
+    let hog = "a=x; n=0; while [ $n -lt 25 ]; do a=\"$a$a\"; n=$((n+1)); done; \
+               echo held ${#a} bytes";
+
+    let declared = harness
+        .run_declaring(
+            hog,
+            herdctl::Declared {
+                // 512 MiB, which with the margin is a 563 MiB ceiling.
+                memory_mib: Some(512),
+                ..herdctl::Declared::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        declared.outcome,
+        JobOutcome::Exited { code: 0 },
+        "a job that declared 512 MiB was stopped by its runner's own 32 MiB: {:?} / {} / {}",
+        declared.outcome,
+        declared.out,
+        declared.err
+    );
+    assert_eq!(
+        declared.out.trim(),
+        "held 33554432 bytes",
+        "and it held the whole 32 MiB: {} / {}",
+        declared.out,
+        declared.err
+    );
+
+    // The control, and the reason the half above is a measurement: the same
+    // script declaring nothing is held to the machine's figure, exactly as
+    // every job was before this field existed.
+    let undeclared = harness.run(hog).await;
+    assert_ne!(
+        undeclared.outcome,
+        JobOutcome::Exited { code: 0 },
+        "a job that declared nothing must still be held to --job-memory-max, or this \
+         runner has stopped capping the jobs nobody costed: {:?} / {} / {}",
+        undeclared.outcome,
+        undeclared.out,
+        undeclared.err
+    );
+    assert!(
+        !undeclared.out.contains("held 33554432"),
+        "the undeclared job ran past the machine's 32 MiB: {}",
+        undeclared.out
+    );
+
+    // And the runner is unharmed by either of them.
+    let after = harness.run("echo the runner lived").await;
+    assert_eq!(after.outcome, JobOutcome::Exited { code: 0 });
+    assert_eq!(after.out.trim(), "the runner lived");
 }

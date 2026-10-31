@@ -33,9 +33,9 @@ pub use capability::{
 };
 pub use declaration::{
     args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, CommitRun,
-    Declaration, Executor, LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN,
-    IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN, RAN_TOKEN, READING_KEYS,
-    SCENARIOS_KEY, TMPFS_KEY,
+    Declaration, Executor, JobNeed, LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN,
+    CEILING_MARGIN_PERCENT, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY,
+    OUT_TOKEN, RAN_TOKEN, READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use outputs::{
     check_relative, JobOutputs, OutputFile, FRAME_CEILING, INLINE_OUTPUT_MAX, OUTPUT_CHUNK_BYTES,
@@ -2416,6 +2416,36 @@ pub enum FromHub {
         /// this build runs.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         packs_out: BTreeMap<String, String>,
+
+        /// What the hub costed this job at, when it costed it at anything
+        /// (E-29, E-31, [`JobNeed`]).
+        ///
+        /// **Here and not inside `declaration`, for the reason `timeout_s`
+        /// is here.** A [`Declaration`] is what the requester's own file
+        /// said — a command, a commit, arguments and four steps — and it is
+        /// `None` for every job that was not declared. The figures a job is
+        /// held to are not that: they come off the job's record, where a
+        /// `labels_from` reading may have replaced what the submission
+        /// carried (D74), and `herdctl submit --memory-mib 4700 -- cargo
+        /// build` is a job with a memory figure and **no declaration at
+        /// all** — exactly the job this project's own gate submits. Put
+        /// inside `declaration`, the figure would be lost for precisely the
+        /// jobs that state it without declaring a command.
+        ///
+        /// **Absent is "this job was costed at nothing", and the runner then
+        /// uses `--job-memory-max` as it always has.** That is a real class
+        /// and not a gap: `herd_hub::JobRecord::memory_need_mib` answers
+        /// `Ok(None)` for `herdctl submit -- true`, which is admitted on its
+        /// capabilities alone. Absent is also what a hub built before this
+        /// field sends, and what a runner built before it reads: the field
+        /// is `#[serde(default)]`, so an older runner decodes the frame and
+        /// ignores it, and keeps the global cap it already had. That costs
+        /// no [`PROTOCOL_VERSION`] bump — a defaulted field on an existing
+        /// variant is additive, and the constant's own doc comment lists
+        /// this exact shape among the three it leaves the number alone for
+        /// (D124, D128).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        need: Option<JobNeed>,
     },
     /// The runner is asked to end a job it is executing, and told why.
     ///

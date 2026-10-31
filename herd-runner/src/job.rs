@@ -177,11 +177,11 @@ impl Packs {
 /// Run one job: announce it, stream every step's output, cap each step,
 /// report how it ended and what it cost.
 ///
-/// Nine arguments, and they are the job: what to run, how it was declared,
-/// which packs it consumes and leaves, what it is allowed to cost, who to
-/// tell and how full this machine already is. Collapsing them into a struct
-/// would name the struct after this function and move the same list one line
-/// up.
+/// Ten arguments, and they are the job: what to run, how it was declared,
+/// which packs it consumes and leaves, what it is allowed to cost, what the
+/// hub costed it at, who to tell and how full this machine already is.
+/// Collapsing them into a struct would name the struct after this function
+/// and move the same list one line up.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     job_id: JobId,
@@ -193,6 +193,7 @@ pub async fn execute(
     session: Session,
     confined: Arc<Confined>,
     ceiling: Arc<JobsAtOnce>,
+    need: Option<herd_proto::JobNeed>,
 ) {
     // Taken in hand first, before a byte is written anywhere: that is what
     // numbers this job's output, holds its result against an acknowledgement,
@@ -272,7 +273,18 @@ pub async fn execute(
         }
     };
 
-    let caps = confined.caps();
+    // **This job's own ceiling, instead of this runner's one figure for every
+    // job.** The caps are cloned and the memory one replaced, rather than
+    // read per site, so that every sentence downstream names the figure this
+    // job was actually held to: the `memory.max` written into its cgroup, the
+    // address-space limit a host with no cgroup falls back to, and the figure
+    // reported with `stopped_by_cap { memory }` are then one number by
+    // construction and cannot drift apart. The other four caps are the
+    // machine's and are untouched.
+    let memory_ceiling = crate::confine::job_ceiling(confined.caps().memory_max, need);
+    let mut per_job_caps = confined.caps().clone();
+    per_job_caps.memory_max = memory_ceiling.memory_max();
+    let caps = &per_job_caps;
     let stages = match &declaration {
         // Exactly the job Herd has run since M4: one command line, one
         // process, the runner's own cap, and no step on the record at all.
@@ -356,7 +368,22 @@ pub async fn execute(
     // lines about it. Unique per runner process, so one job's kill can never
     // reach another job's processes.
     let tag = JobTag::mint(&job_id);
-    let cgroup = confined.ceiling().open_for_job(&tag);
+    let cgroup = confined
+        .ceiling()
+        .open_for_job(&tag, memory_ceiling.memory_max());
+
+    // **What this job is held to, said per job, because the figure is now per
+    // job.** Silence for a job the hub costed at nothing: its ceiling is the
+    // one the startup report already named. Loud for a job that declares a
+    // figure on a host that cannot enforce one — the fallback bounds one
+    // process's address space and not the job's tree, so what the hub
+    // admitted this job against is not enforced there, and a runner that
+    // printed the figure without that word would be reporting a ceiling it
+    // does not hold.
+    if let Some(said) = memory_ceiling.line(cgroup.is_some(), confined.ceiling().fallback_reason())
+    {
+        eprintln!("herd-runner: job {job_id} {said}");
+    }
 
     // Counted across every step and both streams: the log the hub keeps and
     // the requester reads is one log, whatever produced it.

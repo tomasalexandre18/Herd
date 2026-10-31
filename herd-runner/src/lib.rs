@@ -83,8 +83,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub use confine::{
-    jobs_at_once, Confined, Confinement, JobsAtOnce, A_RUNNERS_OWN_CEILING, DEFAULT_MEMORY_MAX,
-    JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
+    job_ceiling, jobs_at_once, Confined, Confinement, JobCeiling, JobsAtOnce,
+    A_RUNNERS_OWN_CEILING, DEFAULT_MEMORY_MAX, JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
 };
 use spool::Spooled;
 
@@ -4672,6 +4672,13 @@ async fn serve_hub(
                 // exists to prevent.
                 packs_in,
                 packs_out,
+                // What the hub costed this job at, which until now it kept
+                // to itself: the runner is the only thing that writes a
+                // kernel memory ceiling, and it had never been told the
+                // figure the job was admitted against (D180's open half).
+                // `None` is a job costed at nothing, and keeps this
+                // runner's own `--job-memory-max`.
+                need,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
@@ -4705,6 +4712,7 @@ async fn serve_hub(
                         session,
                         confined,
                         ceiling,
+                        need,
                     )
                     .await
                 });

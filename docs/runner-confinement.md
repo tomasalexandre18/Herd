@@ -17,7 +17,7 @@ variable, in the style of `--hub` / `HERD_HUB_URL`.
 | Flag | Environment | Default | What |
 |---|---|---|---|
 | `--data-root` | `HERD_DATA_ROOT` | `$XDG_STATE_HOME/herd-runner`, else `~/.local/state/herd-runner` | The one directory this runner may write in |
-| `--job-memory-max` | `HERD_JOB_MEMORY_MAX` | `2GiB` | Kernel memory ceiling per job. Refused below `16MiB` |
+| `--job-memory-max` | `HERD_JOB_MEMORY_MAX` | `2GiB` | Kernel memory ceiling for a job the hub costed at nothing. Refused below `16MiB` |
 | `--job-timeout` | `HERD_JOB_TIMEOUT` | `3600` | Time cap per job, in seconds |
 | `--job-log-cap` | `HERD_JOB_LOG_CAP` | `64MiB` | Log one job may produce |
 | `--job-disk-budget` | `HERD_JOB_DISK_BUDGET` | `20GiB` | Workspace one job may hold |
@@ -403,6 +403,48 @@ only the job: the runner sits in a sibling cgroup and so does every other job.
 The runner then reports `stopped_by_cap { memory }` rather than a bare signal,
 because it reads `memory.events`.
 
+### Whose figure the ceiling is (E-29, E-31)
+
+**A job the hub costed is held to its own figure, not to the machine's.**
+`AssignJob` carries what the record says the job needs — the memory figure and
+the tmpfs reservation — and the runner writes `memory.max` from the two of
+them. `--job-memory-max` is what a job the hub costed at **nothing** gets, and
+that is a real class and not a leftover: `herdctl submit -- true` declares no
+whole-job memory need and is admitted on its capabilities alone, so the
+machine's own figure is the only one anybody has stated about it.
+
+The ceiling is `(memory_mib + tmpfs_mib) + 10%`, floored at `16MiB`.
+
+- **The tmpfs is in it** because tmpfs pages are charged to the cgroup that
+  writes them and `memory.swap.max` is 0, so they cannot be reclaimed: a job's
+  reservation sits inside its memory ceiling and not beside it. Herd admits the
+  two figures as independent (E-29, E-31) and they are not. The consumer's
+  kernel report for their job `j0000000069` read `limit 8388608kB` with
+  `shmem 4219834368` of it — 3.93 GiB of tmpfs inside an 8.00 GiB ceiling,
+  while the killed process's own `shmem-rss` was 0.
+- **The 10% is one named figure with one reason**, and it lives in
+  `herd_proto::CEILING_MARGIN_PERCENT` so that neither crate holds a second
+  copy. A ceiling of the declared sum exactly is the figure that killed that
+  job, and the residue the report does not account for — about 40 MiB of
+  8 GiB, at that rounding — is what the kernel charges the cgroup on the job's
+  behalf and no declaration can see: page tables, slab, kernel stacks, socket
+  buffers. It scales with the job, so the margin is a proportion.
+- **The floor is `MINIMUM_MEMORY_MAX`** for the reason a global figure under it
+  is refused: invariant 2 asks for a cap and not for a wall. A declaration too
+  small to start a shell is raised to the floor, the job still runs, and the
+  runner's line says the floor is what was written.
+
+**The figure is per job, and so is what the runner says about it.** A job the
+hub costed at nothing gets no line: its ceiling is the one the startup report
+already named. A job that declares a figure gets one line naming both figures,
+the ceiling they earn, and whether this host enforces it.
+
+**An older runner is unaffected.** The field is `#[serde(default)]`, so a
+runner built before it decodes the assignment, ignores the key and keeps the
+global cap. That is why `PROTOCOL_VERSION` did not move: a defaulted field on
+an existing variant whose absence means what its default says is the first of
+the three additive shapes the constant's own doc comment lists (D124, D128).
+
 ### The deployment this needs
 
 Creating a cgroup and *putting a process into one* are two different rights.
@@ -453,8 +495,13 @@ reason. This is documented behaviour, not a silence, and it is weaker in
   one that erases its own environment, which a cgroup kill would still catch.
 
 Invariant 2 still holds either way: every job runs under an explicit memory
-cap enforced by the kernel. The WSL replay of the 2026-10-12 out-of-memory
-event is a manual check in M17, against the real ceiling on the owner's PC.
+cap enforced by the kernel. **What does not hold here is the job's own
+ceiling.** `RLIMIT_AS` is per process, so a figure the hub costed a job at
+bounds the job's first process and not its tree; a runner on such a host says
+so per job, in the job's own line, with the words `NOT ENFORCED` — a figure
+printed without them would be a ceiling reported and not held. The WSL replay
+of the 2026-10-12 out-of-memory event is a manual check in M17, against the
+real ceiling on the owner's PC.
 
 ## What a runner measures (E-15)
 

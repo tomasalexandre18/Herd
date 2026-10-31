@@ -600,11 +600,23 @@ impl Ceiling {
     }
 
     /// Make this job's cgroup, or `None` on a host that fell back.
-    pub fn open_for_job(&self, tag: &JobTag) -> Option<JobCgroup> {
+    ///
+    /// **`memory_max` is this job's own**, and it is the one bound of the six
+    /// that is. The others belong to the machine — a share under contention,
+    /// a pid count, an IO ceiling an operator declared — while the memory
+    /// ceiling is what the hub admitted *this* job against
+    /// ([`herd_proto::Granted`], [`crate::job_ceiling`]). A job the hub
+    /// costed at nothing arrives here carrying `--job-memory-max`, which is
+    /// the figure this used to write for every job without being told.
+    pub fn open_for_job(&self, tag: &JobTag, memory_max: u64) -> Option<JobCgroup> {
         let Ceiling::Cgroups { base, limits, .. } = self else {
             return None;
         };
-        match JobCgroup::create(base, tag, limits) {
+        let limits = JobLimits {
+            memory_max,
+            ..limits.clone()
+        };
+        match JobCgroup::create(base, tag, &limits) {
             Ok(cgroup) => Some(cgroup),
             Err(error) => {
                 // Detection succeeded and creation failed, which means the
@@ -1483,7 +1495,7 @@ mod tests {
         assert!(why.contains("herd-no-such-cgroup-m4"), "{why}");
         assert!(ceiling.base().is_none());
         assert!(ceiling
-            .open_for_job(&JobTag::mint(&herd_proto::JobId::new("j1")))
+            .open_for_job(&JobTag::mint(&herd_proto::JobId::new("j1")), 1 << 20)
             .is_none());
     }
 
@@ -2410,5 +2422,62 @@ mod tests {
         ceiling
             .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
             .expect("a base that hands io down takes the ceiling");
+    }
+
+    /// **The figure a job is costed at is the figure written into its own
+    /// cgroup**, read back out of `memory.max`.
+    ///
+    /// Two jobs under one base, with two different ceilings, because one job
+    /// alone proves nothing here: before this change `open_for_job` wrote the
+    /// `JobLimits` it was built with at startup, so a test that made one
+    /// cgroup and found the startup figure in it would have passed against
+    /// the defect. Two figures in one base is the assertion that cannot: if
+    /// the argument is ignored, the two files hold the same number.
+    ///
+    /// The base is a directory and not a cgroup, which is what lets this
+    /// assertion be made on a host with no delegation — and it is the right
+    /// seam, because `memory.max` is written with `fs::write` either way and
+    /// what is being asserted is *which number Herd writes*. That the kernel
+    /// then enforces it is a different claim, and the twelve standing skips
+    /// in `scripts/expected-skips/local.txt` are where it is made.
+    #[test]
+    fn each_job_s_cgroup_carries_the_ceiling_that_job_was_costed_at() {
+        let temp = TempDir::new("per-job-ceiling");
+        let base = temp.path().join("base");
+        fs::create_dir_all(&base).expect("a base");
+        let ceiling = Ceiling::Cgroups {
+            base: base.clone(),
+            // What the machine's owner lends every job, and what every job
+            // used to get whatever it declared.
+            limits: JobLimits::with_memory_max(2 << 30),
+            unenforced: Vec::new(),
+        };
+
+        let big = JobTag::mint(&herd_proto::JobId::new("j-declares-more"));
+        let held = ceiling
+            .open_for_job(&big, 9011 * (1 << 20))
+            .expect("a writable base makes a cgroup");
+        let written = fs::read_to_string(base.join(big.as_str()).join("memory.max"))
+            .expect("memory.max is written before anything is in the cgroup");
+        assert_eq!(
+            written.trim(),
+            (9011u64 * (1 << 20)).to_string(),
+            "the ceiling in the cgroup must be this job's own, not the machine's 2 GiB"
+        );
+        drop(held);
+
+        let small = JobTag::mint(&herd_proto::JobId::new("j-costed-at-nothing"));
+        let _held = ceiling
+            .open_for_job(&small, 2 << 30)
+            .expect("a writable base makes a cgroup");
+        let global = fs::read_to_string(base.join(small.as_str()).join("memory.max"))
+            .expect("memory.max is written for this one too");
+        assert_eq!(global.trim(), (2u64 << 30).to_string());
+        assert_ne!(
+            written.trim(),
+            global.trim(),
+            "two jobs under one base were given two ceilings: a build that ignored the \
+             argument would have written one number twice"
+        );
     }
 }

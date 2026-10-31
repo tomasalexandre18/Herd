@@ -5570,6 +5570,37 @@ fn where_its_packs_are(
     ))
 }
 
+/// What one attempt is costed at, as [`herd_proto::JobNeed`], or `None` for a
+/// job the hub costs at nothing.
+///
+/// Three answers collapse to two here, on purpose. A declared figure travels.
+/// A job that declares no whole-job memory need — `herdctl submit -- true`,
+/// `memory_need_mib` answering `Ok(None)` — travels as nothing, and the
+/// runner holds it to the ceiling its own owner gave it, exactly as it did
+/// before this field existed. And a need that **cannot be costed** also
+/// travels as nothing: `Err` is a job declaring what one build thread needs
+/// with no `-j` to multiply it by, which admission refuses to place at all
+/// (D82), so a dispatch that somehow reached it must not invent a ceiling out
+/// of half a figure. In none of the three does the hub send a zero: nought is
+/// not a memory figure here any more than it is in a reading.
+fn need_for(
+    record: &JobRecord,
+    parallelism: Option<herd_proto::Parallelism>,
+) -> Option<herd_proto::JobNeed> {
+    let costed = record
+        .memory_need_mib(parallelism.map(|derived| derived.threads))
+        .ok()
+        .flatten()?;
+    Some(herd_proto::JobNeed {
+        memory_mib: costed,
+        // Off the record and not off the submission, for the reason the
+        // memory figure is: a reading's answer replaces what the requester
+        // stated (D74). Nought is a real answer — `build` and `check` need no
+        // tmpfs — and it is the answer for every job that declares none.
+        tmpfs_mib: record.tmpfs_need_mib(),
+    })
+}
+
 /// Hand one job to the runner, recording the attempt before the frame goes
 /// out.
 fn dispatch(
@@ -5635,6 +5666,13 @@ fn dispatch(
             // and a path the job itself writes to, and both are the
             // requester's words.
             packs_out: record.leaves.clone(),
+            // **The figure the hub has always had and the runner never
+            // did**: what this job declares it needs, so the ceiling the
+            // kernel enforces on it is the ceiling it was admitted against.
+            // Derived here, beside the `-j` it is computed for, and from the
+            // record rather than from the submission — a `labels_from`
+            // reading takes the place of what the requester stated (D74).
+            need: need_for(record, parallelism),
         })
         .is_err()
     {
@@ -12497,5 +12535,63 @@ mod tests {
             1,
             "the job that waited starts as soon as a holder says so"
         );
+    }
+
+    /// A record as a submission would have made it, for the two figures
+    /// below and nothing else about it.
+    fn a_record(new: NewJob) -> JobRecord {
+        JobRecord::hypothetical(new, Timestamp::now())
+    }
+
+    /// What goes on an assignment as the job's cost: a declared figure, and
+    /// **nothing at all** for the two states that are not a figure.
+    ///
+    /// The three answers of `memory_need_mib` collapse to two on the wire,
+    /// and each of the two silences has to be the silence it is.
+    /// `Ok(None)` — `herdctl submit -- true` — is a job admitted on its
+    /// capabilities alone, and the runner holds it to `--job-memory-max`.
+    /// `Err` is a job declaring what one build thread needs with no `-j` to
+    /// multiply it by, which is a need that **cannot be costed** (D82): a
+    /// ceiling invented out of half a figure would be worse than the one the
+    /// machine's owner lent, so it is not invented.
+    #[test]
+    fn an_assignment_carries_a_declared_figure_and_never_a_guessed_one() {
+        let declared =
+            a_record(NewJob::new(vec!["true".to_owned()]).with_admission(Some(512), Some(4096)));
+        assert_eq!(
+            need_for(&declared, None),
+            Some(herd_proto::JobNeed {
+                memory_mib: 512,
+                tmpfs_mib: 4096,
+            })
+        );
+
+        // A job that reserves no tmpfs says nought, which is a real answer
+        // and is what every job of the first consumer's `build` says.
+        let no_tmpfs =
+            a_record(NewJob::new(vec!["true".to_owned()]).with_admission(Some(512), None));
+        assert_eq!(
+            need_for(&no_tmpfs, None),
+            Some(herd_proto::JobNeed {
+                memory_mib: 512,
+                tmpfs_mib: 0,
+            })
+        );
+
+        // Costed at nothing: no figure travels, and the runner's own ceiling
+        // is the answer — which is the whole reason `--job-memory-max`
+        // survives this change.
+        let uncosted = a_record(NewJob::new(vec!["true".to_owned()]));
+        assert_eq!(need_for(&uncosted, None), None);
+
+        // And a need that cannot be costed is a silence too, never a
+        // per-thread figure sent as if it were a whole-job one.
+        let per_thread =
+            a_record(NewJob::new(vec!["true".to_owned()]).with_build_thread_mib(Some(900)));
+        assert!(
+            per_thread.memory_need_mib(None).is_err(),
+            "the premise of the case below: with no -j this need cannot be costed"
+        );
+        assert_eq!(need_for(&per_thread, None), None);
     }
 }
