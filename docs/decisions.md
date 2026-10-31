@@ -15250,3 +15250,67 @@ they rot: they were true on their date. And the rule is about where a
 citation points, not about whether what it points at is true. Nothing
 mechanical reads it, exactly as `check-orchestration.sh`'s
 predecessor-run case cannot read GitHub (D288's neighbour, ORCH-334).
+
+## 2026-10-31 — D290 A claim a machine checks is a labelled field,
+never prose
+
+**Context.** ORCH-333 gave the landing record a machine-checked claim:
+the newest record must carry its predecessor's `ci.yml` run, because a
+landing cannot record its own and the chain had already broken once at
+batch 32. The check asked whether some **paragraph** of the record
+mentioned the predecessor's batch near eight digits and a verdict word.
+`herd-reviewer` extracted that `awk` and measured three ways to pass it
+with nothing recorded (2026-10-31): a record laid out as a **table**
+whose predecessor row said *not read yet* — a table has no blank line
+and no bullet, so the whole table is one paragraph; the word
+*successful* beside a byte count, `success` having no word boundary and
+"any eight digits" matching `22649270272 bytes`; and a record merely
+**quoting one of the check's own case names**, which is the likely next
+record and not a contrived one. The document class is the problem: a
+landing record's whole job is to discuss runs and verdicts, so
+co-occurrence in prose is ordinary there.
+
+**Choice.** A claim a machine checks is a **labelled field, never
+prose** — one line, anchored, with a label of its own, refused while it
+holds a placeholder, and shape-checked. It is the construction
+`check-docs.sh` already used for **Batch:**, **Gate:**, **Skips:** and
+**CI run:**, and the predecessor's run now joins them as
+`- **Previous run:** batch <n-1> · ci.yml <id> · <verdict>`. A rule
+whose check is a search of the prose is not held; it is narrated. The
+generalisation is the half worth keeping: **before adding a check that
+reads a document, name the field it reads.** A new field needs a floor
+date, so that records written before it existed are not refused for not
+using it — `check-docs.sh`'s `landing_from` is the precedent and has
+been moved once already.
+
+**Why not retire the section instead.** The rule is sound: batch 32
+really did break the chain. Retiring the check would leave it in prose
+with nothing holding it, which is the state that produced batch 32. And
+reverting is not cheap — `templates/landing.md`, `workflow.md`,
+`.claude/agents/herd-merger.md` and the board all document the check,
+and D288 cites the predecessor-run case, so under D148 a correction
+there would be its own entry. Fix forward, once.
+
+**What this does not claim.** Nothing about truth. The gate has no
+network: it cannot ask GitHub whether a run exists or whether the
+verdict is honest, and a mistyped digit still passes. What the field
+buys over the paragraph is that the claim cannot be assembled out of
+two unrelated sentences and cannot be made by accident. The verdict's
+truth stays a human's (`workflow.md`, *What a landing is*).
+
+**Measured.** Old oracle vs new, on the reviewer's own fixtures and the
+nine synthetic shapes: every shape the paragraph rule refused is still
+refused; three it accepted now fire; the false RED on a nested
+sub-bullet is gone; the pinned batch-31/32 fixture still fires naming
+batch 31. `check-orchestration.sh`: 350 passed, 0 failed, 1 skipped —
+the skip being the real-tree case, which the floor defers to the first
+landing dated 2026-11-01 or later.
+
+**On the number.** Allocated **D290** at batch 34's re-gate, the next
+free number above D289 on `origin/main` and above every unlanded
+branch: all 32 non-ancestor remote refs were read at this integration
+and none holds a `D` above 289, so no gap was closed and **D143**,
+**D154** and **D170** stay (D148, invariant 8). ORCH-337 drafted no
+entry of its own, correctly — it carries this same decision into
+`.claude/agents/herd-merger.md`, and a second number for one choice is
+what D148 forbids.

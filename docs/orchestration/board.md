@@ -331,6 +331,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ORCH-336 | **`check-orchestration.sh` let the host's own load decide 45 of its cases, and reported the result as a defect in the tree.** `gate_run` built every child with `env -i` and a fixed assignment list that omitted `HERD_GATE_LOADAVG`, so each of the 25 of 40 call sites that supplies no value of its own had `gate.sh` read the real `/proc/loadavg` — and `gate.sh` refuses outright above `HERD_GATE_LOAD_MAX`, default 24. Measured on this host 2026-10-31: 334 passed / 1 failed at load1 1.66, and 297 passed / 45 failed at load1 24.45 with all 45 reading `gate: REFUSED … above the ceiling 24`. On a machine the consumer's production shares, that is a fact about the host printed as a red tree. Fixed with one default inside `gate_run`, a quiet loadavg file rewritten per call; the 15 sites that drive the load cases still override it, because `env` applies assignments in order and `"$@"` comes last. **What was deliberately not done:** setting or exporting `HERD_GATE_LOAD_MAX` — raising a gate's own ceiling to get past it is the move `workflow.md`'s *Failure* forbids, wearing a different hat | measured by the orchestrator, 2026-10-31, while gating `orch-333-figure-and-record`; mechanism confirmed by `herd-reviewer` the same day | herd-step | done | Nothing. A load-gated red in this script is now impossible by construction rather than by luck of the hour | — | `scripts/check-orchestration.sh`, `gate_run`; `scripts/gate.sh:118` and `:279`; `history/2026-10-31-orch-335-labelled-previous-run.md` |
 | ORCH-337 | **`.claude/agents/herd-merger.md` still tells the merger to write the predecessor's run as a paragraph, which ORCH-335 retired, so the next landing's own gate goes red at step 2 for following its instructions.** Steps 5, 6 and 9 say the record must name the batch, the id and the verdict *"inside one paragraph"* and spell out that a paragraph ends at a blank line, at the next bullet or at the next heading. After ORCH-335 the only accepted form is the `- **Previous run:**` bullet. The cost is bounded — `check-orchestration.sh` is step 2 of `gate.sh`, before any cargo step, so the trap costs about a minute and the message names the field and points at `templates/landing.md` — but it is still a trap, and an agent file is a rule change that wants its own `herd-reviewer` pass rather than a hunk of a gate branch. The replacement text is drafted verbatim in the handoff | ORCH-335's own out-of-scope finding, 2026-10-31 | herd-step | done | Nothing. **Done on `orch-337-merger-field`, 2026-10-31**, from ORCH-335's drafted text and no further design: step 5 now names the field, its shape, the wrap-and-sub-bullet rule and what ends it, and says in its own sentence that **the field is the claim and a fence is only evidence** — a `gh run view` paste in a fenced block, a paragraph of prose and a table row all fail it, which is the verdict batch 33's fenced record would now get, deliberately. It also carries the floor: required of landings dated **2026-11-01 or later**, batch 34's record predates it and is not rewritten, so the first landing on or after that date is the first that must write the field. Step 6 points its *predecessor's figure* sentence at step 5's field, and step 9's *"its own *CI run* paragraph"* is now the `- **Previous run:**` field of the next record's *CI run* section. The sentence about truth is strengthened rather than dropped: no network and no toolchain, shape and not truth, a mistyped digit passes, and *"that comparison is a human's"* is cited where `workflow.md` says it. `check-docs.sh` alone, `.claude/` and `docs/` being prose-exempt; the four Rust gates are the batch's own `gate.sh` at integration | ORCH-335 | `.claude/agents/herd-merger.md`, steps 5, 6 and 9 (the *CI run* paragraph of step 5, *"a different figure, carried by step 5's field"* in step 6, and step 9's *"the next landing is what records it"*); `docs/orchestration/templates/landing.md` *CI run*; `docs/orchestration/workflow.md` *The next landing writes that run into its own record* and *No docs gate can check the record itself*; `history/2026-10-31-orch-335-labelled-previous-run.md`, *Not done* and *Drafted for `herd-merger`*; `history/2026-10-31-orch-337-merger-field.md`; **D289** |
 | ORCH-338 | **Only the newest landing record is ever asked for its predecessor's run, so a gap in the middle of the chain is permanent once a newer landing exists.** The check reads exactly one file, the newest `<date>-merge-<batch>.md`, which is what makes it reachable by name; the consequence is that a record which lands without the field is never asked again, and batch 32's gap is only visible today because a pinned fixture freezes it. The per-file half — every landing record on or after the floor carries a `- **Previous run:**` field — belongs in `check-docs.sh` beside the four fields it already checks, where it is paid per file and not 38 times. Not folded into ORCH-335 because it changes which records a gate reads, not how one is read, and because every record now on `main` would need the floor to exempt it | ORCH-335's residual, 2026-10-31 | herd-planner | open | Size it: one `want()` in `check-docs.sh`'s landing-record awk, floored at the first landing that carries the field, plus the question of whether a retroactive sweep of the landed records is wanted at all (it would be a rewrite of landed records, which `workflow.md` forbids) | ORCH-335 | `scripts/check-docs.sh:221`-`:262`; `scripts/check-orchestration.sh`, `lr_prev_run`; `history/2026-10-31-orch-335-labelled-previous-run.md` |
+| ORCH-339 | **The `herd-reviewer` pass `workflow.md` step 6 requires leaves no evidence in the tree, so a landed rule change cannot be shown to have been reviewed.** Step 6 makes a review mandatory before integration for a change to `CLAUDE.md`, an agent file, `permissions.md`, hooks, `check-docs.sh` or an invariant. ORCH-335 is exactly that case and the review happened — it is what found the three false passes of ORCH-333's paragraph oracle — but it was written to the orchestrator's scratchpad, `/mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/2026-10-31-review-orch-333-guard.md`, which is outside the repository and is session-scoped, so it is unreadable to anyone who was not in that session and will not survive it. What landed instead is **13 board rows and two handoffs quoting it**, which is a citation of a document the tree does not hold. `history/` holds five `*review*` files, none of them this one, so the convention exists and was not followed here rather than being absent. The consequence is bounded but real: the gate cannot check a review happened (it checks records, not agent files — ORCH-337's own finding), so the only evidence is prose pointing at a path that will 404 | ORCH-337's out-of-scope finding, 2026-10-31, relayed at batch 34's re-gate | — | open | Decide the cheap half first: whether a required review must land as `docs/orchestration/history/<date>-review-<task>.md` like a handoff, and if so whether `check-docs.sh` can hold it at all — it cannot tell which changes needed a review without reading prose, which is the thing D290 retires, so the honest candidate is a rule with no detector, or a `pre-push` check keyed on the paths step 6 names. Do not retro-fit ORCH-335's review: it is this session's artefact and copying it in now would be the merger writing a reviewer's record | ORCH-337 | `docs/orchestration/workflow.md` *The loop* step 6; `docs/orchestration/history/` (five `*review*` files, none for ORCH-333's guard); `history/2026-10-31-orch-337-merger-field.md`; `history/2026-10-31-merge-batch-34.md` |
 
 ## Active — an agent holds it
 
@@ -1606,3 +1607,54 @@ to touch (D161).
     message and the merger's report, and **its post-push run id is in
     the report alone**, because this item is committed before the gate
     runs (ORCH-121).
+
+29. **A claim a machine checks becomes a labelled field** — batch 34,
+    **four branches, one merge**, no tag: nothing here is a release.
+    This is a **re-gate**: batch 34 went red at step 2 earlier the same
+    evening and never landed, and the red was a defect in the guard the
+    batch was itself landing, not in the integration.
+
+    **The batch was a linear chain, so it is one `--no-ff` merge and
+    not four.** `orch-337-merger-field` (`b89c811`) descends from
+    `orch-335-labelled-previous-run` (`46d0611`), which descends from
+    `batch-34-integration` (`6565e8d`), which already carried the two
+    original merges; containment was verified with
+    `git merge-base --is-ancestor` on each link rather than assumed,
+    and the earlier branches were **not** re-merged. In arrival order:
+    **`orch-333-figure-and-record`** (`74296d7`, ORCH-333, closing
+    **ORCH-070**), **`orch-align-record-run`** (`71d028f`, ORCH-334),
+    **`orch-335-labelled-previous-run`** (`46d0611`, ORCH-335 and
+    **ORCH-336**) and **`orch-337-merger-field`** (`b89c811`,
+    ORCH-337). All four handoffs are under `history/` and each is
+    byte-identical to its own branch's copy.
+
+    **One decision, D290**, pasted verbatim from `orch-335`'s *Drafted
+    for `herd-merger`* with only `D-NEXT` replaced: a claim a machine
+    checks is a labelled field, never prose. ORCH-337 drafted none,
+    correctly — a second number for one choice is what D148 forbids.
+    **D143, D154 and D170 stay.**
+
+    **Two things a step could not fix were fixed here.** The unlanded
+    `batch-34-integration` record claimed `335 passed, 0 failed` with
+    all eleven cases ok, which was true of a tree that was never
+    pushed — the pushed tree gave **334 passed, 1 failed** — and it
+    owed its **Gate:** line and listed two branches of four; it was
+    rewritten, which costs nothing because it had never reached `main`.
+    And one clause of `.claude/agents/herd-merger.md` said the first
+    landing needing the new field was *"— very likely yours"*, true
+    that night and false for every merger after: **deleted** on the
+    orchestrator's own ruling that a phrase which rots is removed
+    rather than maintained. ORCH-337's author had flagged it.
+
+    **ORCH-339 is opened** and has no owner: the `herd-reviewer` pass
+    `workflow.md` step 6 requires lives outside the repository, so the
+    tree holds no evidence that a required review happened.
+
+    **Batch 33's post-push run, which only this landing can record:**
+    `ci.yml` run **41228366473** on `main` at `7309b167`,
+    `completed`/`success` at 18:24:15Z, read back **by id** with
+    `gh run view` at this integration and not off a list line. Batch
+    34's own gate job id, verbatim verdict, skip list and gated sha are
+    in the merge message and the merger's report, and **its post-push
+    run id is in the report alone**, because this item is committed
+    before the gate runs (ORCH-121).

@@ -72,12 +72,12 @@ Steps, in order, each one evidenced in the handoff:
    The field is required of landings dated **2026-11-01 or later**
    (`lr_from`); batch 34's record predates it and is not rewritten, so
    the first landing on or after that date is the first that must carry
-   the field — very likely yours. The case runs at step 2 of the
-   `gate.sh` you run in step 7, before any cargo step, so a missing
-   field turns **your own** landing red for about a minute; your run
-   cannot be in your record (step 9), and your predecessor's has
-   nowhere else to go. Take the id from the previous merger's report as
-   your brief relays it, or find it yourself with
+   the field. The case runs at step 2 of the `gate.sh` you run in step
+   7, before any cargo step, so a missing field turns **your own**
+   landing red for about a minute; your run cannot be in your record
+   (step 9), and your predecessor's has nowhere else to go. Take the id
+   from the previous merger's report as your brief relays it, or find
+   it yourself with
    `gh run list --workflow ci.yml --branch main --limit 10` matched to
    that landing's merge sha; then read the conclusion back **by id**
    with `gh run view <id>`, never off a list line, and write GitHub's
