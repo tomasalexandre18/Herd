@@ -6,10 +6,12 @@ nothing about how many there are.
 
 Why a list and not a count. D27 says a skipped assertion is printed as
 skipped and never reported as passed. A count cannot carry that: this
-workstation skips 12 at rest and 14 under load, GitHub Actions skips 14, and
-one red CI run on 2026-10-27 printed "AT LEAST 15" because it had not
-finished. None of those four numbers means anything on its own. The name of
-an assertion that was not checked does.
+workstation's at-rest number moved when batch 31 added one name, and
+nothing about the rule behind it moved; GitHub Actions skipped 14 on green
+run 40564336703; and one red CI run on 2026-10-27 printed "AT LEAST 15"
+because it had not finished. None of those numbers means anything on its
+own. The name of an assertion that was not checked does — and this
+directory's files hold the names, so nothing here states a total.
 
 Why these files are here and not under `docs/`. `scripts/check-docs.sh`
 width-checks every `docs/*.md` at 79 columns and a skip line is far longer
@@ -76,17 +78,19 @@ Updating a list is a decision, not a chore: a new name on it is an
 assertion nobody checks any more. Say in the landing record why it is
 there.
 
-## An in-scope list is not `local.txt` minus twelve (2026-10-30)
+## An in-scope list is not `local.txt` minus its delegation names (2026-10-30)
 
-The twelve names in `local.txt` all name cgroup v2 delegation, and a run
-inside a delegated scope can make all twelve — the invocation that does is
-in `docs/runner-confinement.md`, *Making those twelve*, and the obvious
+Every name in `local.txt` comes back to cgroup v2 delegation, and a run
+inside a delegated scope can make all of them — the invocation that does
+is in `docs/runner-confinement.md`, *Making those*, and the obvious
 invocation makes **zero**. Before anybody blesses a list from such a run,
 two measured facts, because the arithmetic is wrong without them:
 
-- **The net is +11, not +12.** `a_fallback_is_shouted_not_mentioned`
-  cannot be made on a host that no longer falls back, and it skips with
-  its own reason. So the list loses twelve names and **gains that one**.
+- **The net is +11, not +12**, measured against the twelve names
+  `local.txt` held on 2026-10-30; the shape, not the figures, is what
+  carries over. `a_fallback_is_shouted_not_mentioned` cannot be made on a
+  host that no longer falls back, and it skips with its own reason. So the
+  list loses its delegation names and **gains that one**.
 - **`pressure_refuses_nothing_and_delays_nothing` appeared in one of
   three in-scope runs.** Condition-dependent, unrelated to delegation,
   and enough on its own to make a blessed in-scope list flap.

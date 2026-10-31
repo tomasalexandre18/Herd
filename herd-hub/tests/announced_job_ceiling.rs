@@ -15,14 +15,21 @@
 //! ordinary operation. It was reachable because the memory admission charged
 //! a job only what it *declared*, and a job that declared nothing cost zero:
 //! a queue of such jobs was placed on one runner without bound, and this
-//! field was the only thing that stopped them. ORCH-312 changed the charge —
-//! the hub now charges the **ceiling the runner will grant**
-//! (`herd_hub::matcher::charged_against_the_room`), which for a job costed at
-//! nothing is the whole per-job cap — so the memory sum and this count now
-//! bound an uncosted queue to the same figure. The count is still the bound
-//! that is reached first for one job and one only: a requirement reading,
-//! which is charged nothing deliberately and whose arithmetic is in
-//! `herd-hub/tests/packed_by_declaration.rs`.
+//! field was the only thing that stopped them.
+//!
+//! **What holds the queue back now is the memory sum, and it holds it at the
+//! same figure** (ORCH-312, then ORCH-323). The hub charges the **ceiling the
+//! runner will grant** (`herd_hub::matcher::charged_against_the_room`), which
+//! for a job costed at nothing — a requirement reading included, since
+//! ORCH-323 — is the whole per-job cap `(lent − floor) ÷ at_once`. So a
+//! queue of memory-silent jobs fills this file's runner to exactly
+//! [`CEILING`] of them and no further, and the surplus waits on a sentence
+//! about mebibytes instead of one about a count. `admission` applies the
+//! announced count to its own records nowhere any more: it is kept for a host
+//! that will not say how much memory it lends, and for a machine that has
+//! said it is holding more than the records know of (D182). The arithmetic is
+//! in `herd-hub/tests/packed_by_declaration.rs`, with the runner's own
+//! function as its oracle.
 //!
 //! So the oracle here is Alexa's, and it is not "no attempt is ever spent":
 //!
@@ -217,12 +224,16 @@ fn attempts_of(state_dir: &std::path::Path, job_id: &JobId) -> usize {
 /// two, and the figure that matters is the one the hub never spent.
 ///
 /// Memory-silent on purpose: `herdctl::Declared::default()` declares no
-/// memory need, so `admission` costs each of these jobs at zero and the
-/// memory seat accounting can never be what bounds them. The announced
-/// ceiling is the only thing in the hub that can, and this test fails on the
-/// code as it stood before D181 — the hub assigns all eight in one pass, the
-/// runner takes two and hands six back, and six attempts are spent on
-/// refusals that were certain before they were sent.
+/// memory need, so each of these jobs is charged the whole per-job cap —
+/// `(4096 − 2048) ÷ 2`, one gibibyte, because one gibibyte is what this
+/// runner grants a job nobody costed — and two of them are the whole of what
+/// that machine admits. **Which bound says so changed with ORCH-323 and the
+/// figure did not**: it was the announced count and it is now the memory sum,
+/// at `at_once × C_hub = lent − floor`, which is the same arithmetic read the
+/// other way. This test fails on the code as it stood before D181 — the hub
+/// assigns all eight in one pass, the runner takes two and hands six back,
+/// and six attempts are spent on refusals that were certain before they were
+/// sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     let (harness, _data_root, running) = a_hub_and_a_runner_holding_two().await;
@@ -330,15 +341,23 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     }
 
     // ---- And what the surplus was told while it waited.
+    //
+    // **The hub's memory sentence, and no longer its count sentence**
+    // (ORCH-323). The figures are built from this file's own three constants
+    // rather than written out, so that a test asserting "0 B free of 2 GiB"
+    // cannot go on passing against a machine of another size.
+    let admission = herd_proto::size_mib(LENT_MIB - FLOOR_MIB);
+    let per_job = herd_proto::size_mib((LENT_MIB - FLOOR_MIB) / CEILING as u64);
+    let full = format!("0 MiB free of its {admission} memory admission");
     let said: Vec<String> = submitted
         .iter()
         .flat_map(|id| waiting_reasons(&state_dir, id))
-        .filter(|reason| reason.contains(THE_HUBS_CEILING_SENTENCE))
+        .filter(|reason| reason.contains(&full))
         .collect();
     assert!(
         !said.is_empty(),
-        "with eight jobs and a ceiling of two, some of them have to have been told they were \
-         waiting for the ceiling — a queue that moved silently would leave an operator with \
+        "with eight jobs and room for two, some of them have to have been told they were \
+         waiting for that room — a queue that moved silently would leave an operator with \
          nothing to read. All the waiting lines written: {:?}",
         submitted
             .iter()
@@ -347,14 +366,28 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     );
     let one = said.first().expect("at least one");
     assert!(
-        one.contains("capped-runner") && one.contains("at most 2 at once"),
-        "the sentence has to name the machine and both figures: {one}"
+        one.contains("capped-runner")
+            && one.contains(&format!("this job's ceiling would be {per_job}")),
+        "the sentence has to name the machine and the figures: {one}"
     );
     assert!(
-        one.contains("until one of them ends"),
-        "and say what ends the wait, or it is a job told it is stuck: {one}"
+        one.contains("2 jobs running there hold"),
+        "and say what is holding the room, or it is a job told it is stuck: {one}"
     );
-    println!("what a queued job is told behind the ceiling:\n  {one}");
+    // And the count sentence is **not** what held them: it is kept for a
+    // silent host and for D182's correction, neither of which is this run.
+    let by_the_count: Vec<String> = submitted
+        .iter()
+        .flat_map(|id| waiting_reasons(&state_dir, id))
+        .filter(|reason| reason.contains(THE_HUBS_CEILING_SENTENCE))
+        .collect();
+    assert!(
+        by_the_count.is_empty(),
+        "this machine said how much memory it lends, so the sum is what bounds it and the \
+         announced count is not applied to the hub's own records at all (ORCH-323): \
+         {by_the_count:?}"
+    );
+    println!("what a queued job is told behind a full machine:\n  {one}");
 
     // And no `events.jsonl` line anywhere in this run is of a kind an older
     // hub could not read. `JobEventKind` is `#[serde(tag = "event")]` with no
