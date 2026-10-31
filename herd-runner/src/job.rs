@@ -2451,7 +2451,7 @@ mod tests {
     fn a_session(job_id: &JobId) -> (Session, CancelToken) {
         let session = Session::new();
         let cancel = session
-            .take_job(job_id, 1, 4)
+            .take_job(job_id, 1, &Room::seats_only(4))
             .expect("a fresh session is not draining and is not full");
         (session, cancel)
     }

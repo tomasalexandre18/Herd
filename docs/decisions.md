@@ -14945,3 +14945,139 @@ not a decision.
 `one_oom_kill_is_charged_to_one_step` replays the consumer's own two
 readings and asserts the **old** rule true on them in the same test;
 `history/2026-10-31-oom-step-attribution.md`.
+
+## 2026-10-31 — D285 A runner bounds itself by the sum of what it
+granted, and the hub charges the same figure over the same set
+
+ORCH-325. A job is held to its own ceiling since `per-job-memory-ceiling`
+(D180), so a job granted less than `--job-memory-max` costs its machine
+less than a whole seat. Two things followed and both are done here, as
+one landing, because either alone is a hub and a runner counting
+differently — which is the defect `herd-hub/src/matcher.rs` names in so
+many words (D159, D169).
+
+**The runner.** `Session::take_job` admits while
+`Σ granted ≤ lent − floor` and refuses the job that would cross it.
+Today's bound was `seats × --job-memory-max ≤ lent − floor`: the same
+bound, finer granularity. Every grant is at most the cap, so the sum
+admits every set the count admitted, and invariant 2's exposure does not
+move. A machine too small to hold one job at its own ceiling holds one
+anyway, which is `jobs_at_once`'s own `.max(1)` said over the sum. The
+count is kept as the bound a host that will not say how much memory it
+lends has, as the figure the hub is told, and as the arithmetic every
+refusal quotes; it is not kept as a second hard bound on a host that did
+say its size, because `seats × cap ≤ lent − floor` means it would always
+bite first and the sum would be unreachable. The refusal spends none of
+the job's goes (D182).
+
+**The hub.** It already summed declared needs against
+`admissible_memory_mib()`; it now charges `herd_proto::charged_ceiling_mib`
+— the ceiling the runner will grant, tmpfs inside it and margin on top —
+bounded by `C_hub := (lent − floor) / jobs_at_once`. That is this hub's
+only upper bound on the runner's own `--job-memory-max`, since no frame
+carries it (D180), and it is never below it, because the runner derives
+the count it announced from the cap:
+`at_once = max(floor((lent − floor) / cap), 1)`. So the hub's charge is
+never below the runner's grant, every set the hub admits is a set the
+runner accepts, and no attempt is spent on a refusal. No frame changed
+and `PROTOCOL_VERSION` stays 3. A job costed at nothing is charged all of
+`C_hub`, because all of that cap is what the runner grants it; on a
+runner that announced no count there is no `C_hub`, and both are charged
+what they were charged before.
+
+**The charge has to be the figure the job will really be held to**, and
+bounding it by the whole room instead was tried and reverted: a job
+declaring 1 GiB of memory with 3 GiB of tmpfs earns a 4.4 GiB ceiling and
+is held to 512 MiB on a runner capping every job there, so charging it
+that machine's whole 1.5 GiB admission would be safe arithmetic and a
+false sentence in an operator's record.
+
+**One consequence, found by the gate and not by reading.** Once the
+charge is the figure the runner will honour, `n` jobs charge at most
+`n × C_hub`, which cannot pass `lent − floor` until `n` passes
+`at_once` — so on every runner that announced a count the hub's two
+bounds **coincide**. That is the truth about a machine whose per-job cap
+is one figure: `jobs_at_once` *is* the memory arithmetic, and it was a
+separate bound only because the hub charged a figure no runner would
+honour. The memory admission is still the only bound on a runner that
+announced none, and it still refuses a job that can never fit however
+empty the machine gets.
+
+`herd-hub/tests/packed_by_declaration.rs` is the proof over a grid of
+triples with `herd_runner::job_ceiling` as its oracle, and it is run
+twice — once over the charge the hub makes, which passes, and once over
+the charge it made before, which must fail and does, on 384 triples.
+
+**`MINIMUM_MEMORY_MAX` moved to `herd-proto`** beside
+`CEILING_MARGIN_PERCENT`, as `MINIMUM_CEILING_MIB`. A grant is floored at
+16 MiB, so a job declaring 1 MiB is granted 16; a hub charging what it
+clamped under-charged every such job. One figure, in one place
+(invariant 4).
+
+**The upgrade order is runner first, the reverse of D181's.** D181 says
+hub first, because a runner that counts fewer seats than the hub offers
+refuses work. Here it is the other way round: a hub that packs beside a
+runner still counting seats is over-placement, and over-placement is
+D181's own measured refusal storm — eight refusals, then exit 125 with no
+verdict.
+
+**What this does not deliver, and why it is a separate decision.** No
+runner holds more jobs after this than before it. A job costed at nothing
+is charged `C_hub`, so `n` of them charge at most `n × C_hub`, which
+cannot pass `lent − floor` until `n` passes `at_once`: the announced count
+is still the bound that binds, and the hub still offers at most that many
+jobs. The count cannot be dropped while a requirement reading is charged
+nothing: `reading_job` gives a reading no figure (D159, D169,
+deliberately), and the runner grants every job that arrives with no
+`JobNeed` the whole cap, because nothing on the frame says which jobs are
+readings. The hub therefore under-charges by up to
+`READINGS_AT_ONCE × --job-memory-max`, and `at_once × cap ≤ lent − floor`
+is the only thing covering it. ORCH-323 carries the two ways out, and the
+orchestrator ruled between them at this landing, inside its own mandate
+and reversibly: **(b)**, a figureless reading is charged `C_hub` exactly
+as every other figureless job already is. The other way — a frame field
+saying which jobs are readings — was refused as protocol surface that
+buys nothing (b) does not, so `PROTOCOL_VERSION` stays 3 and nothing in
+this goes to Alexa. Implementing it is the next task, not this landing.
+
+## 2026-10-31 — D286 D280's closing tally was stale on arrival, and the
+correction is this entry rather than an edit
+
+**Context.** **D280** ends *"re-derived mechanically from the 44 `must`
+State cells rather than carried forward: 36 `merged`, 5 `part`, 1
+`planned`, 1 `waived`, 1 `withdrawn` = 44, over 55 rows"*. Two of those
+five cells were already wrong when the entry landed. D280 was composed
+against a reading taken earlier **inside its own batch**, and batch 30
+had since landed `e16-reverify`, whose `5aa84ca` moved E-14 from
+`planned` to `withdrawn`. So the sentence described a tree that had
+stopped existing before the commit carrying it was written. This is
+ORCH-322, raised by batch 31's own landing while re-deriving the tally
+rather than copying it.
+
+**The correction.** Re-derived mechanically from `docs/coverage.md`'s 44
+`must` State cells at batch 32's integration tip: **36 `merged`, 5
+`part`, 0 `planned`, 1 `waived`, 2 `withdrawn` = 44, over 55 rows**. The
+`part` rows are E-12, E-16, E-17, E-37 and E-42; the waived row is E-49;
+the withdrawn rows are E-14 and E-50. There is no `planned` `must` row
+in the tree and there was none when D280 landed. The figures agree with
+the independent derivation ORCH-322 recorded at batch 31's integration,
+and `docs/coverage.md` is untouched by batch 32, so nothing in this
+landing moves them.
+
+**The rule.** A tally is **derived at the tip that carries it**, by
+reading the State cells, and never carried forward from a sibling
+branch, an earlier reading in the same batch, or a previous entry. A
+batch that moves a State cell falsifies every tally composed before that
+move, including one composed hours earlier in the batch that moves it.
+An entry that states a tally says where it was derived from, so the next
+reader can redo it instead of trusting it.
+
+**What it does not cover.** **D280 is not edited and its number is not
+reused**: `docs/decisions.md` is append-only and a number is an
+identifier (invariant 8, **D148**). D280's substantive finding — that
+E-16 stays `part` on three clauses nobody named — is untouched and
+remains the decision; only its closing arithmetic is superseded, by this
+entry. The **headline figures were never wrong** and are not restated
+here as if they had been: `coverage.md`'s delivery figure and scope
+figure both still derive from the cells above, and
+`deploy/release-notes/1.0.0.md` is unaffected.
