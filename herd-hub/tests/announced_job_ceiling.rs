@@ -12,10 +12,17 @@
 //! `ToHub::AttemptAbandoned`, the hub requeues it through
 //! `give_the_job_another_go`, and **each one spends one of that job's goes**
 //! against `attempts_allowed`. On the real hub that cost is reachable in
-//! ordinary operation, because the memory admission charges a job only what
-//! it *declared* (`herd-hub/src/matcher.rs`, `needs_memory` of `None` costs
-//! zero), so a queue of jobs that declare no memory need costs a machine
-//! nothing and is placed on one runner without bound.
+//! ordinary operation. It was reachable because the memory admission charged
+//! a job only what it *declared*, and a job that declared nothing cost zero:
+//! a queue of such jobs was placed on one runner without bound, and this
+//! field was the only thing that stopped them. ORCH-312 changed the charge —
+//! the hub now charges the **ceiling the runner will grant**
+//! (`herd_hub::matcher::charged_against_the_room`), which for a job costed at
+//! nothing is the whole per-job cap — so the memory sum and this count now
+//! bound an uncosted queue to the same figure. The count is still the bound
+//! that is reached first for one job and one only: a requirement reading,
+//! which is charged nothing deliberately and whose arithmetic is in
+//! `herd-hub/tests/packed_by_declaration.rs`.
 //!
 //! So the oracle here is Alexa's, and it is not "no attempt is ever spent":
 //!
@@ -482,6 +489,122 @@ fn the_figure_announced_is_the_one_the_runner_derives() {
     );
 }
 
+/// Every shape of line that would be a hub inventing a ceiling for itself, as
+/// one list, so that the guard and the fixture that proves it fires read the
+/// same list.
+///
+/// **Extended by ORCH-312, never widened.** The hub now derives a *per-job
+/// cap* from the field — `(lent − floor) / at_once`, `matcher::per_job_cap_mib`
+/// — which is arithmetic on a figure the runner really announced and is what
+/// this guard has always permitted. What it must go on refusing is a figure
+/// put *into* the field, or an absence read as one, and the three shapes
+/// added here are the ones the new arithmetic could reach for:
+/// `unwrap_or_default` (nought is not an announcement), `take`/`replace` (a
+/// value written over the field), and `map_or_else`/`is_none_or` (a silence
+/// given an answer by a closure).
+const TURNING_SILENCE_INTO_A_FIGURE: [&str; 10] = [
+    ".unwrap_or(",
+    ".or(",
+    ".map_or(",
+    ".unwrap_or_else(",
+    ".get_or_insert",
+    ".unwrap_or_default",
+    ".take(",
+    ".replace(",
+    ".map_or_else(",
+    ".is_none_or(",
+];
+
+/// Whether one line of hub source fills a ceiling in or reads a silence as
+/// one, and the clause of it that does — the whole of the guard's logic, in a
+/// function, so that [`the_detector_for_an_invented_ceiling_fires`] can prove
+/// it fires on lines nobody shipped.
+fn invents_a_ceiling(line: &str) -> Option<String> {
+    // Everything before a `//`. This also truncates a `//` inside a string
+    // literal, which costs a little reach and never a false failure; there is
+    // no such line in either file today.
+    let code = line.split("//").next().unwrap_or("");
+    for (at, _) in code.match_indices("jobs_at_once") {
+        let rest = &code[at + "jobs_at_once".len()..];
+        // What the hub does legitimately: declare the field, read it
+        // (`if let Some(at_once) = seat.jobs_at_once`), do arithmetic on what
+        // it read, and move it along unchanged. What it must never do is put
+        // a value *into* it. So the shape under test is "the field, then a
+        // `:` or an `=`, then something built here" — which is where `Some(`
+        // would appear, in whatever punctuation. A `Some(` to the **left** of
+        // the field name is a read and is fine.
+        let filled_in = rest
+            .strip_prefix(':')
+            .or_else(|| rest.strip_prefix(" ="))
+            .or_else(|| rest.strip_prefix('='))
+            .filter(|after| !after.starts_with('='));
+        if filled_in.is_some_and(|after| after.contains("Some(")) {
+            return Some("fills in a ceiling the runner did not announce".to_owned());
+        }
+        // And the silence must not be read as a number by any of the shapes
+        // that turn a `None` into one.
+        for shape in TURNING_SILENCE_INTO_A_FIGURE {
+            if rest.starts_with(shape) {
+                return Some(format!(
+                    "reads a runner's silence as a ceiling, with `{shape}`"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// **The guard above is proved on lines nobody shipped**, because a detector
+/// whose silence has never been tested is not evidence (and two hollow greens
+/// were found in this tree in two days).
+///
+/// Each line here is a hub really inventing a ceiling, in the spelling it
+/// would really use. The review of PR #82 mutated the shipped
+/// `jobs_at_once: Some(999),` and the guard of the day passed; that exact line
+/// is the first fixture below.
+#[test]
+fn the_detector_for_an_invented_ceiling_fires() {
+    for bad in [
+        "            jobs_at_once: Some(999),",
+        "        runner.jobs_at_once = Some(12);",
+        "        let at_once = seat.jobs_at_once.unwrap_or(8);",
+        "        let at_once = seat.jobs_at_once.unwrap_or_default();",
+        "        let at_once = seat.jobs_at_once.map_or_else(|| 8, |said| said);",
+        "        let announced = runner.jobs_at_once.take();",
+        "        runner.jobs_at_once.replace(4);",
+        "        if seat.jobs_at_once.is_none_or(|said| said > 0) {",
+    ] {
+        assert!(
+            invents_a_ceiling(bad).is_some(),
+            "this guard does not catch a hub inventing a ceiling, so its silence over the \
+             shipped hub means nothing: {bad}"
+        );
+    }
+    // And it stays quiet over the lines the hub legitimately has, including
+    // the arithmetic ORCH-312 added: a cap derived from an announced count is
+    // not a ceiling invented.
+    //
+    // The runner's own `jobs_at_once: Some(...)` is deliberately **not**
+    // here. That line is in `herd-runner/src/lib.rs` and is the machine
+    // stating its own figure, which is the one thing this guard exists to
+    // tell apart from a hub stating it: the same spelling in hub source is
+    // the defect, and it stays in the list above.
+    for good in [
+        "    pub jobs_at_once: Option<u32>,",
+        "                        jobs_at_once: runner.jobs_at_once,",
+        "    if let Some(at_once) = seat.jobs_at_once {",
+        "        per_job_cap_mib(&seat.host, seat.jobs_at_once),",
+        "            let cap = matcher::per_job_cap_mib(&runner.host, runner.jobs_at_once)?;",
+    ] {
+        assert_eq!(
+            invents_a_ceiling(good),
+            None,
+            "this guard refuses a line the hub legitimately has, which is how a guard gets \
+             weakened to make a build green: {good}"
+        );
+    }
+}
+
 /// Nothing in this change let the hub invent a ceiling for itself.
 ///
 /// The one thing a hub must not do with this field is derive it: the runner's
@@ -501,6 +624,16 @@ fn the_figure_announced_is_the_one_the_runner_derives() {
 /// that fill in a silence — the only lines the shipped hub needs are the
 /// field's two declarations and the places it is moved along unchanged, and
 /// none of those names `Some`.
+///
+/// **Extended by ORCH-312.** The hub now derives a per-job *cap* from the
+/// field — `(lent − floor) / at_once` — which is arithmetic on a figure the
+/// runner really announced, and which this guard has always permitted; what
+/// it refuses is a figure put into the field or a silence read as one, and
+/// three more spellings of the second are on
+/// [`TURNING_SILENCE_INTO_A_FIGURE`]. The matching itself is
+/// [`invents_a_ceiling`], which
+/// [`the_detector_for_an_invented_ceiling_fires`] proves fires, on the very
+/// line PR #82 mutated.
 #[test]
 fn the_hub_never_derives_a_ceiling_of_its_own() {
     let matcher = include_str!("../src/matcher.rs");
@@ -529,47 +662,14 @@ fn the_hub_never_derives_a_ceiling_of_its_own() {
         );
         let mut found_the_field = false;
         for (number, line) in shipped.lines().enumerate() {
-            // Everything before a `//`. This also truncates a `//` inside a
-            // string literal, which costs a little reach and never a false
-            // failure; there is no such line in either file today.
-            let code = line.split("//").next().unwrap_or("");
-            for (at, _) in code.match_indices("jobs_at_once") {
+            if line.contains("jobs_at_once") {
                 found_the_field = true;
-                let rest = &code[at + "jobs_at_once".len()..];
-                // What the hub does legitimately: declare the field, read it
-                // (`if let Some(at_once) = seat.jobs_at_once`), and move it
-                // along unchanged. What it must never do is put a value
-                // *into* it. So the shape under test is "the field, then a
-                // `:` or an `=`, then something built here" — which is where
-                // `Some(` would appear, in whatever punctuation. A `Some(`
-                // to the **left** of the field name is a read and is fine.
-                let filled_in = rest
-                    .strip_prefix(':')
-                    .or_else(|| rest.strip_prefix(" ="))
-                    .or_else(|| rest.strip_prefix('='))
-                    .filter(|after| !after.starts_with('='));
-                if let Some(after) = filled_in {
-                    assert!(
-                        !after.contains("Some("),
-                        "{name}:{} fills in a ceiling the runner did not announce: {line}",
-                        number + 1
-                    );
-                }
-                // And the silence must not be read as a number by any of the
-                // shapes that turn a `None` into one.
-                for turning_silence_into_a_figure in [
-                    ".unwrap_or(",
-                    ".or(",
-                    ".map_or(",
-                    ".unwrap_or_else(",
-                    ".get_or_insert",
-                ] {
-                    assert!(
-                        !rest.starts_with(turning_silence_into_a_figure),
-                        "{name}:{} reads a runner's silence as a ceiling: {line}",
-                        number + 1
-                    );
-                }
+            }
+            // One predicate, shared with
+            // [`the_detector_for_an_invented_ceiling_fires`], which proves on
+            // known-bad lines that it fires at all.
+            if let Some(what) = invents_a_ceiling(line) {
+                panic!("{name}:{} {what}: {line}", number + 1);
             }
         }
         // And the field is still named in both files, so a rename that left
@@ -638,6 +738,59 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
         "neither clause may be a substring of the other: {THE_RUNNERS_CEILING_SENTENCE:?} and \
          {THE_HUBS_CEILING_SENTENCE:?}"
     );
+    // ---------------------------------------------------------------------
+    // And the third clause, which ORCH-312 added: the runner's own running
+    // sum.
+    // ---------------------------------------------------------------------
+    //
+    // There are now three sentences about room on a machine that reach the
+    // same record, and attribution still has to be decidable from the words:
+    // this one and the runner's count inside an `attempt_ended` line, the
+    // hub's on a `waiting` line. A reader who cannot tell which bound bit
+    // cannot tell a job that waited (which costs nothing) from a job whose go
+    // was spent.
+    let sum_clause = herd_runner::A_RUNNERS_OWN_MEMORY_SUM;
+    for (name, clause) in [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's", THE_HUBS_CEILING_SENTENCE),
+    ] {
+        assert!(
+            !sum_clause.contains(clause) && !clause.contains(sum_clause),
+            "neither {name} clause may be a substring of the sum clause, or the three cannot \
+             be told apart: {clause:?} and {sum_clause:?}"
+        );
+    }
+    // And the sum **sentence**, as it is really built. It quotes the runner's
+    // arithmetic whole on purpose — a refusal that did not carry what the
+    // machine lends and keeps back would not let a reader tell a full machine
+    // from a broken one — so it does contain the runner's own clause, which
+    // is right: it is the runner speaking. What it must never do is become a
+    // substring of either sentence, or carry the hub's clause.
+    let sum_said = herd_runner::testing::a_refusal_for_the_memory_sum();
+    assert!(
+        sum_said.contains(sum_clause) && sum_said.contains(THE_RUNNERS_CEILING_SENTENCE),
+        "the sum's sentence has to be attributable to the sum and carry the arithmetic: \
+         {sum_said}"
+    );
+    assert!(
+        sum_said.contains("floor"),
+        "and to the floor the machine keeps, which is half of the arithmetic: {sum_said}"
+    );
+    assert!(
+        !sum_said.contains(THE_HUBS_CEILING_SENTENCE),
+        "a runner's sentence that carries the hub's clause makes a refusal indistinguishable \
+         from a wait: {sum_said}"
+    );
+    for said in [&runner_said, &silent_said, &hub_said] {
+        assert!(
+            !said.contains(sum_clause),
+            "and no older sentence may acquire the sum's clause: {said}"
+        );
+        assert!(
+            !sum_said.eq(said) && !said.contains(&sum_said),
+            "the sum's sentence must not become a substring of an existing one: {said}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -32,9 +32,10 @@ pub use capability::{
     LabelSet, Occupant, OfferedCapability,
 };
 pub use declaration::{
-    args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, CommitRun,
-    Declaration, Executor, JobNeed, LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN,
-    CEILING_MARGIN_PERCENT, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY,
+    args_as_line, charged_ceiling_mib, declared_spans, filled_outside_the_arguments,
+    per_job_cap_mib, shell_quote, CommitRun, Declaration, Executor, JobNeed, LabelsFrom,
+    Requirements, Step, StepRun, ARGS_TOKEN, CEILING_MARGIN_PERCENT, COMMIT_TOKEN, IN_TOKEN,
+    JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, MINIMUM_CEILING_MIB, MINIMUM_MEMORY_MAX,
     OUT_TOKEN, RAN_TOKEN, READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use outputs::{

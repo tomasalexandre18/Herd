@@ -439,10 +439,98 @@ floored at `16MiB`. **So a declaration can only ever tighten it.**
   8 GiB, at that rounding — is what the kernel charges the cgroup on the job's
   behalf and no declaration can see: page tables, slab, kernel stacks, socket
   buffers. It scales with the job, so the margin is a proportion.
-- **The floor is `MINIMUM_MEMORY_MAX`** for the reason a global figure under it
-  is refused: invariant 2 asks for a cap and not for a wall. A declaration too
-  small to start a shell is raised to the floor, the job still runs, and the
-  runner's line says the floor is what was written.
+- **The floor is `herd_proto::MINIMUM_CEILING_MIB`** for the reason a global
+  figure under it is refused: invariant 2 asks for a cap and not for a wall. A
+  declaration too small to start a shell is raised to the floor, the job still
+  runs, and the runner's line says the floor is what was written. It lives on
+  the contract, beside the margin, because the hub has to charge the figure
+  the runner grants and not the one it clamped.
+
+### What a runner admits against (ORCH-312)
+
+**`jobs_at_once` stopped being the only bound.** A job is held to its own
+ceiling now, so a job granted less than `--job-memory-max` costs the machine
+less than a whole place. What `Session::take_job` admits against is the
+running sum of the ceilings this runner has granted:
+
+    Σ granted ≤ lent − floor        was        seats × cap ≤ lent − floor
+
+**The same bound, finer granularity.** Invariant 2's exposure does not move:
+every grant is at most the cap, so the sum admits every set the count admitted
+and refuses nothing the count would have taken. A host lending 8 GiB, keeping
+1 GiB and capping a job at 7 GiB held **one** job however small it was; it now
+holds two jobs that declared 1700 MiB each, at 1870 MiB of granted ceiling
+apiece. A machine too small to hold one job at its own ceiling still holds
+one — `jobs_at_once`'s own `max(1)`, said over the sum.
+
+The count is kept beside the sum and is the bound a host that will not say how
+much memory it lends has: there is nothing to sum against there. It is also
+still the one figure the hub is told, because no frame carries
+`--job-memory-max`.
+
+A refusal for the sum is a `ToHub::AttemptAbandoned` with `at_its_ceiling`
+set, exactly as a refusal for the count is, so it **spends none of the job's
+goes** (D182). Its sentence carries `herd_runner::A_RUNNERS_OWN_MEMORY_SUM`,
+a third clause that is not a substring of the runner's count clause nor of the
+hub's, and quotes the count's whole arithmetic after it — what the machine
+lends, what it keeps as its own floor, and what it caps a job at.
+
+**What the hub charges, over the same set.** The hub has always summed
+declared needs against `lent − floor`; it now sums
+`herd_proto::charged_ceiling_mib` — the ceiling the runner will grant, the
+tmpfs inside it and the margin on top — bounded by
+
+    C_hub := (lent − floor) ÷ jobs_at_once
+
+which is this hub's only upper bound on the runner's own `--job-memory-max`,
+since no frame carries that figure, and is **never below it**, because the
+runner derives the count it announced from the cap. So the hub's charge is
+never below the runner's grant, every set the hub admits is a set the runner
+accepts, and there is no refusal for an attempt to be spent on.
+`herd-hub/tests/packed_by_declaration.rs` is that proof, over a grid of
+`(lent, floor, cap)` triples with `herd_runner::job_ceiling` as its oracle,
+run twice: over the charge the hub makes, which passes, and over the charge
+it made before, which must fail and does, on 384 triples.
+
+A job **costed at nothing** is charged all of `C_hub`, because all of
+`--job-memory-max` is what the runner grants it. On a runner that announced
+no count there is no `C_hub`: a costed job is then bounded by the whole room
+and an uncosted one is charged nothing, which is what both were charged
+before any of this existed.
+
+**The charge has to be the figure the job will really be held to.** A job
+declaring 1 GiB of memory and 3 GiB of tmpfs earns a 4.4 GiB ceiling, and on
+a runner capping every job at 512 MiB that job is held to 512 MiB. Charging
+it the 1.5 GiB such a machine admits in all would be safe arithmetic and a
+false sentence: `1 job running there holds 1.5 GiB` written into an
+operator's record about a job holding a third of that.
+
+**And so the two bounds coincide on a runner that announced a count.** `n`
+jobs charge at most `n × C_hub`, which cannot pass `lent − floor` until `n`
+passes `jobs_at_once` — which the count has already refused. That is the
+truth about a machine whose per-job cap is one figure: `jobs_at_once` *is*
+the memory arithmetic. The memory admission remains the only bound on a
+runner that announced no count, and it still refuses a job that can never
+fit there however empty it gets, which are the two things it is for.
+
+**One job is charged nothing and that is deliberate**: a requirement reading
+with no figure, which declares nothing because it builds and boots nothing
+(D159, D169). A reading that *does* carry a figure is charged that figure's
+ceiling like any other job — slot-free is not admission-free (D119). The
+runner cannot tell a figureless reading from `herdctl submit -- true` —
+nothing on the frame says which — so it grants a reading the whole cap while
+the hub charges it zero. What covers the difference is the count the hub
+still applies as a hard bound: at most `jobs_at_once` jobs out there, and
+`jobs_at_once × cap ≤ lent − floor`. Dropping that count in favour of the sum
+alone would be an over-placement of up to
+`READINGS_AT_ONCE × --job-memory-max`, which is D181's measured refusal
+storm, and closing it needs the frame to say which jobs are readings.
+
+**The lend is a startup snapshot** (`herd-runner/src/room.rs`, D186 measured
+the same binaries announcing 1 seat and then 2 an hour later on one host).
+Packing does not create that and is not blocked by it — erring low is the
+only direction invariant 2 allows, so a stale snapshot is stale downwards —
+but nothing in either bound reads the figure as current.
 
 **The figure is per job, and so is what the runner says about it.** A job the
 hub costed at nothing gets no line: its ceiling is the one the startup report

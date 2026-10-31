@@ -2379,6 +2379,34 @@ impl State {
         })
     }
 
+    /// What each connected runner has to weigh a job against, by name
+    /// (`matcher::the_room`).
+    ///
+    /// Read off the peers because it is derived from what the **runner**
+    /// announced — the memory it lends, the floor it keeps and the count it
+    /// holds at once — and not from any job record, which is why
+    /// [`matcher::reserved`] cannot work them out for itself. A runner that
+    /// announced neither figure carries a [`matcher::TheRoom`] of two
+    /// `None`s: there is then nothing to clamp a charge by, and the charge is
+    /// what it was before this existed.
+    ///
+    /// Taken under the `peers` lock alone, the way [`State::seats`] is, so
+    /// the hub's one lock order — `dispatching` before `peers` — is unchanged.
+    fn per_runner_rooms(&self) -> BTreeMap<String, matcher::TheRoom> {
+        self.with_peers(|peers| {
+            peers
+                .runners
+                .values()
+                .map(|runner| {
+                    (
+                        runner.name.clone(),
+                        matcher::the_room(&runner.host, runner.jobs_at_once),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// What the fleet is doing, as the status document says it (E-35, E-40).
     ///
     /// **Two sources and no overlap between their locks.** The records are
@@ -4113,11 +4141,12 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     // there is none to leak and none to rebuild after a restart (D79).
     let held = matcher::holdings(&unfinished);
     // And what every runner has reserved, from the same records and the same
-    // filter: the memory a running job *declared* it needs and the tmpfs it
-    // *declared* it would take (E-29, E-31). There is no reservation table in
-    // this hub, so there is none to release on any of the eight ways a job
-    // ends and none to rebuild after a restart (D79).
-    let reserved = matcher::reserved(&unfinished);
+    // filter: the memory **ceiling** a running job was granted from what it
+    // declared, and the tmpfs it declared it would take (E-29, E-31,
+    // ORCH-312). There is no reservation table in this hub, so there is none
+    // to release on any of the eight ways a job ends and none to rebuild
+    // after a restart (D79).
+    let reserved = matcher::reserved(&unfinished, &state.per_runner_rooms());
     let mut seats = state.seats(&held, &reserved);
     // One moment for the whole pass, so that the order cannot change halfway
     // through it, and the moment the figures in the sentences are computed
@@ -9049,7 +9078,7 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
         .unfinished_jobs()
         .context("reading the queue a dry run is judged against")?;
     let held = matcher::holdings(&unfinished);
-    let reserved = matcher::reserved(&unfinished);
+    let reserved = matcher::reserved(&unfinished, &state.per_runner_rooms());
     let mut seats = state.seats(&held, &reserved);
     let now = Timestamp::now();
     let hypothetical = JobRecord::hypothetical(new, now);

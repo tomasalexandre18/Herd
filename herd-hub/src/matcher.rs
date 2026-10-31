@@ -100,12 +100,19 @@ pub struct Seat {
     /// (D181, invariant 2). `None` from a runner that did not say.
     ///
     /// **A bound beside the memory admission, never instead of it.** The two
-    /// answer different questions and neither subsumes the other: admission
-    /// weighs what a job *declared* it would take, so a queue of jobs that
-    /// declare nothing costs a machine nothing and this is the only figure
-    /// that stops them; and this one knows nothing about size, so a single
-    /// job larger than the machine is still admission's to refuse. Whichever
-    /// bites first is the one that bites.
+    /// answer different questions and neither subsumes the other, and
+    /// whichever bites first is the one that bites.
+    ///
+    /// **Which one that is changed with ORCH-312, and the count did not
+    /// move.** Admission used to weigh what a job *declared*, so a queue of
+    /// jobs that declared nothing cost a machine nothing and this was the
+    /// only figure that stopped them; it now weighs the **ceiling the runner
+    /// will grant** ([`charged_against_the_room`]), which for a job costed at
+    /// nothing is the whole per-job cap. So the memory sum is the bound that
+    /// bites first for a costed job of any size, and this count is what
+    /// bounds the one job the sum still charges nothing — a requirement
+    /// reading, deliberately (D159, D169). It knows nothing about size, so a
+    /// single job larger than the machine is still admission's to refuse.
     ///
     /// Never derived here. The runner's arithmetic uses the cap it puts on
     /// every job, which no frame carries, so the hub either has the runner's
@@ -469,6 +476,148 @@ fn out_there(records: &[JobRecord]) -> impl Iterator<Item = (&str, &JobRecord)> 
     })
 }
 
+/// What a machine weighs one job against: the room it has in all, and the
+/// most any **one** job may be charged there.
+///
+/// Two figures and not one, because the two answer different questions.
+/// `per_job_cap_mib` is `(lent − floor) / jobs_at_once`, the only upper bound
+/// this hub has on the runner's own `--job-memory-max` (D180: no frame
+/// carries it), and it is the most **one** job may be charged: a job costed
+/// at nothing is charged all of it, because all of `--job-memory-max` is what
+/// the runner grants such a job, and a costed one is bounded by it because
+/// that is what its runner will hold it to. `admissible_mib` is
+/// `lent − floor`, what the machine has in all — the figure a running sum is
+/// weighed against, and the fallback bound on one job where the runner
+/// announced no count to divide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TheRoom {
+    /// What this machine admits in all: `lent − floor`, or `None` when
+    /// either figure is absent — an absent figure is not zero.
+    pub admissible_mib: Option<u64>,
+    /// The most **one** job may be charged here, or `None` from a runner
+    /// that announced no count to divide by.
+    pub per_job_cap_mib: Option<u64>,
+}
+
+/// The two figures, read off what this runner announced and off nothing else.
+///
+/// **From an announcement, never from a silence.** A runner that said no
+/// count gives `None` for the per-job cap, and `None` charges a job costed at
+/// nothing exactly what it was charged before this field existed.
+/// `herd-hub/tests/announced_job_ceiling.rs` reads this file's source and
+/// fails on any line that fills the field in or reads its absence as a
+/// number.
+pub fn the_room(host: &HostSize, announced: Option<u32>) -> TheRoom {
+    TheRoom {
+        admissible_mib: host.admissible_memory_mib(),
+        per_job_cap_mib: per_job_cap_mib(host, announced),
+    }
+}
+
+/// The most one job costed at nothing may be charged here, in MiB, or `None`
+/// when there is no announcement to divide.
+///
+/// `(lent − floor) / at_once`, which is an upper bound on the runner's own
+/// `--job-memory-max` — the figure no frame carries (D180). The whole of why
+/// that is safe is in [`herd_proto::per_job_cap_mib`], and
+/// `herd-hub/tests/packed_by_declaration.rs` is the proof rather than the
+/// paragraph.
+pub fn per_job_cap_mib(host: &HostSize, announced: Option<u32>) -> Option<u64> {
+    let at_once = std::num::NonZeroU32::new(announced?)?;
+    Some(herd_proto::per_job_cap_mib(
+        host.admissible_memory_mib()?,
+        at_once,
+    ))
+}
+
+/// What this hub charges one job against the memory a machine lends after its
+/// floor, in MiB.
+///
+/// **The charge, and this is what ORCH-312 changed.** The hub has always
+/// summed (`Reserved::memory_mib` against
+/// [`HostSize::admissible_memory_mib`]); what it summed was the memory a job
+/// *declared*, while the runner holds that job to
+/// `min(declared + margin, --job-memory-max)` floored at
+/// [`herd_proto::MINIMUM_CEILING_MIB`] — the tmpfs inside the ceiling, because
+/// tmpfs pages are charged to the cgroup that writes them, and the margin on
+/// top. A job declaring 1792 MiB with 2560 MiB of tmpfs was charged 1792 here
+/// and granted 4787 there. Seven of them read as 12 544 MiB on a host lending
+/// 14 336 after its floor, and were 33 509 MiB of permitted ceilings on it:
+/// the hub counting a different figure from the runner over the same set, which
+/// is the defect the paragraph above `admission`'s own first bound names in so
+/// many words. The charge is now [`herd_proto::charged_ceiling_mib`] — the one
+/// function the runner charges through as well.
+///
+/// **A requirement reading is charged what it is charged today, which in
+/// production is nothing** (D159, D169). `reading_job` gives it no figure —
+/// it builds and boots nothing — and nought is not a figure here any more
+/// than it is in a reading's own answer, so no figure is invented for one;
+/// [`READINGS_AT_ONCE`] is what bounds them, with the count the runner
+/// announced beside it. A reading that *does* carry a figure is charged that
+/// figure's ceiling like any other job, because D119 and D159 are explicit
+/// that a reading is slot-free and never admission-free.
+///
+/// **And that zero is why the announced count stays a hard bound.** The
+/// runner cannot tell a reading from `herdctl submit -- true`: both arrive
+/// with no `JobNeed` and both are granted the whole of `--job-memory-max`.
+/// So for a reading, and for a reading alone, this hub charges less than the
+/// runner grants — by at most `READINGS_AT_ONCE × --job-memory-max`, and only
+/// that. What keeps it safe is the bound beside this one: at most `at_once`
+/// jobs out there, and `at_once × --job-memory-max ≤ lent − floor` by the
+/// runner's own arithmetic, so the permitted total is bounded whatever the
+/// readings were charged. Dropping that count in favour of this sum alone
+/// would be an over-placement of exactly that size, which is D181's measured
+/// refusal storm; closing it needs the frame to say which jobs are readings,
+/// and that is a protocol decision and not this one.
+pub fn charged_against_the_room(
+    memory_mib: Option<u64>,
+    tmpfs_mib: u64,
+    room: TheRoom,
+    a_reading: bool,
+) -> u64 {
+    // The most one job may be charged here: the per-job cap where the runner
+    // announced a count to derive it from, and the whole room where it did
+    // not — a job never costs a machine more than the machine has, and on a
+    // runner that said nothing that is the only bound this hub holds.
+    let most = room.per_job_cap_mib.or(room.admissible_mib);
+    match memory_mib {
+        // A job with a figure is charged the ceiling that figure earns,
+        // bounded by the most one job may be charged.
+        //
+        // **Bounded there and not at the whole room, because the figure has
+        // to be true.** A job declaring 1 GiB of memory and 3 GiB of tmpfs
+        // earns a 4.4 GiB ceiling, and on a runner capping every job at
+        // 512 MiB its runner will hold it to 512 MiB — so 512 MiB is what it
+        // holds, and a hub charging it the 1.5 GiB that machine admits in all
+        // would be writing `1 job running there holds 1.5 GiB` into an
+        // operator's record about a job holding a third of that.
+        //
+        // **A reading is not exempt**: D119 and D159 are explicit that a
+        // reading is slot-free and never admission-free, so one that declares
+        // more than is free waits exactly as a job does
+        // (`a_reading_is_still_admitted_against_the_room_it_runs_in`).
+        Some(memory_mib) => herd_proto::charged_ceiling_mib(
+            Some(herd_proto::JobNeed {
+                memory_mib,
+                tmpfs_mib,
+            }),
+            most,
+        ),
+        // A **reading** with no figure is charged nothing, which is exactly
+        // what it is charged today: `reading_job` gives it none, because it
+        // builds and boots nothing, and nought is not a figure here any more
+        // than it is in a reading's own answer. No figure is invented for
+        // one, and [`READINGS_AT_ONCE`] is what bounds them.
+        None if a_reading => 0,
+        // And every other job with no figure — `herdctl submit -- true` — is
+        // charged the per-job cap, because the whole of `--job-memory-max` is
+        // what the runner grants it and the cap is this hub's upper bound on
+        // that. `None` is a runner that announced no count, and then there is
+        // nothing to charge it with: today's figure, unchanged.
+        None => herd_proto::charged_ceiling_mib(None, room.per_job_cap_mib),
+    }
+}
+
 /// What the jobs already out on one runner **declared** they would take
 /// (E-29, E-31).
 ///
@@ -488,7 +637,14 @@ fn out_there(records: &[JobRecord]) -> impl Iterator<Item = (&str, &JobRecord)> 
 /// closes it.
 #[derive(Debug, Clone, Default)]
 pub struct Reserved {
-    /// The sum of the declared memory needs, in MiB.
+    /// The sum of what those jobs are **charged**, in MiB
+    /// ([`charged_against_the_room`]).
+    ///
+    /// The ceilings their runner granted them and no longer the figures they
+    /// declared: a job declaring 1792 MiB with 2560 MiB of tmpfs is held to
+    /// 4787 MiB on the machine, and a sum of declarations read that machine as
+    /// holding 1792. One figure, charged by one function on both sides
+    /// (ORCH-312).
     pub memory_mib: u64,
     /// The sum of the declared tmpfs reservations, in MiB.
     pub tmpfs_mib: u64,
@@ -545,19 +701,31 @@ impl Reserved {
     }
 }
 
-/// What every runner has reserved, read from the job records alone (D79).
-pub fn reserved(records: &[JobRecord]) -> BTreeMap<String, Reserved> {
+/// What every runner has reserved, read from the job records alone (D79) and
+/// charged at the ceilings those jobs were granted.
+///
+/// `rooms` is [`TheRoom`] of each machine, by runner name — the two figures
+/// the records cannot carry, because they are derived from what the *runner*
+/// announced and not from any job. A name missing from it is a machine
+/// nothing is known about, and its jobs are charged exactly as they were
+/// before any of this existed.
+pub fn reserved(
+    records: &[JobRecord],
+    rooms: &BTreeMap<String, TheRoom>,
+) -> BTreeMap<String, Reserved> {
     let mut taken: BTreeMap<String, Reserved> = BTreeMap::new();
     for (runner, record) in out_there(records) {
+        let room = rooms.get(runner).copied().unwrap_or_default();
         let here = taken.entry(runner.to_owned()).or_default();
+        let tmpfs_mib = record.tmpfs_need_mib();
         match record.memory_held_mib() {
             Ok(memory) => here.take(
-                memory.unwrap_or(0),
-                record.tmpfs_need_mib(),
+                charged_against_the_room(memory, tmpfs_mib, room, record.is_a_reading()),
+                tmpfs_mib,
                 record.occupant(),
             ),
             Err(why) => {
-                here.take(0, record.tmpfs_need_mib(), record.occupant());
+                here.take(0, tmpfs_mib, record.occupant());
                 here.uncostable.push((record.id.clone(), why));
             }
         }
@@ -747,7 +915,21 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
         // not do is cost the job at zero.
         Err(why) => return Admission::NotHere(format!("{}: {why}", record.id)),
     };
-    if needs_memory.is_some_and(|need| need > 0) {
+    // **What this job is charged, which is what the runner will grant it and
+    // no longer only what it declared** ([`charged_against_the_room`]). The
+    // tmpfs is read here because it is *inside* the ceiling — tmpfs pages are
+    // charged to the cgroup that writes them — and it is weighed against the
+    // tmpfs capacity again further down, which is not a double charge: the two
+    // budgets are different budgets, and a reservation that fits in the
+    // machine's memory can still be larger than its tmpfs.
+    let tmpfs_mib = record.tmpfs_need_mib();
+    let charge_mib = charged_against_the_room(
+        needs_memory,
+        tmpfs_mib,
+        the_room(&seat.host, seat.jobs_at_once),
+        record.is_a_reading(),
+    );
+    if charge_mib > 0 {
         if let Some((job, why)) = seat.reserved.uncostable.first() {
             return Admission::NotHere(format!(
                 "{} is holding {job} and {why}, so nothing more is admitted there until it ends",
@@ -755,9 +937,10 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
             ));
         }
     }
-    let memory_mib = match needs_memory {
-        None => 0,
-        Some(need) => match seat.host.admissible_memory_mib() {
+    let memory_mib = if charge_mib == 0 {
+        0
+    } else {
+        match seat.host.admissible_memory_mib() {
             // A figure that cannot be read is not read as zero, and is not
             // read as plenty either (D23's rule, and M4's `Some(0)` defect).
             None => {
@@ -769,12 +952,20 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
                         (None, _) => "how much memory it lends",
                         _ => "how much memory it keeps back for itself",
                     },
-                    herd_proto::size_mib(need)
+                    herd_proto::size_mib(charge_mib)
                 ))
             }
             Some(admissible) => {
-                let free = admissible.saturating_sub(seat.reserved.memory_mib);
-                if need > admissible {
+                // **Can this machine honour what the job declared at all?**
+                // The *declared* figure and not the charge, and the two are
+                // different questions. A runner clamps a job's ceiling to its
+                // owner's cap, so a job declaring 20 GiB is *charged* what it
+                // will really be held to on a machine that caps a job at 3 —
+                // but a machine that would run it at a tenth of what it asked
+                // for has not run that job (D180), and the requester's
+                // question is answered by the requester's figure. Unchanged
+                // by ORCH-312, deliberately.
+                if needs_memory.is_some_and(|need| need > admissible) {
                     return Admission::NotHere(format!(
                         "{} admits at most {} of memory ({} lent, {} kept as its own floor) and \
                          this job needs {}, so it can never fit there however empty it gets",
@@ -782,24 +973,28 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
                         herd_proto::size_mib(admissible),
                         herd_proto::size_mib(seat.host.memory_mib.unwrap_or(0)),
                         herd_proto::size_mib(seat.host.memory_floor_mib.unwrap_or(0)),
-                        herd_proto::size_mib(need)
+                        herd_proto::size_mib(needs_memory.unwrap_or(0))
                     ));
                 }
-                if need > free {
+                // **And is there room for it now?** The charge, because the
+                // room is what the ceilings already granted take up and this
+                // job's ceiling is what it would add.
+                let free = admissible.saturating_sub(seat.reserved.memory_mib);
+                if charge_mib > free {
                     return Admission::ShortNow(format!(
-                        "on {}, {} free of its {} memory admission, {} needed: {}",
+                        "on {}, {} free of its {} memory admission and this job's ceiling \
+                         would be {}: {}",
                         seat.name,
                         herd_proto::size_mib(free),
                         herd_proto::size_mib(admissible),
-                        herd_proto::size_mib(need),
+                        herd_proto::size_mib(charge_mib),
                         seat.reserved.sentence()
                     ));
                 }
-                need
+                charge_mib
             }
-        },
+        }
     };
-    let tmpfs_mib = record.tmpfs_need_mib();
     if tmpfs_mib > 0 {
         let Some(capacity) = seat.host.tmpfs_mib else {
             return Admission::NotHere(format!(
@@ -2721,6 +2916,14 @@ mod tests {
         record
     }
 
+    /// Nothing is known about any runner in this fleet, so a costed job is
+    /// charged its declared ceiling whole and one costed at nothing is
+    /// charged nothing — which is what [`reserved`] charged before there was
+    /// a room to clamp by.
+    fn no_announced_rooms() -> BTreeMap<String, TheRoom> {
+        BTreeMap::new()
+    }
+
     /// A fleet of one seat, with what the records say is already out on it.
     fn fleet_with(mut seat: Seat, running: &[JobRecord]) -> Vec<Seat> {
         let held = holdings(running);
@@ -2728,7 +2931,13 @@ mod tests {
             seat.holdings
                 .already_holding(&holding.job, holding.labels.clone(), holding.occupant);
         }
-        seat.reserved = reserved(running).remove(&seat.name).unwrap_or_default();
+        // The seat's own cap, so that what the records are charged here and
+        // what `admission` charges the next job are the one figure — as they
+        // are in the hub, where both come from `State::per_job_caps`.
+        let rooms = BTreeMap::from([(seat.name.clone(), the_room(&seat.host, seat.jobs_at_once))]);
+        seat.reserved = reserved(running, &rooms)
+            .remove(&seat.name)
+            .unwrap_or_default();
         vec![seat]
     }
 
@@ -2739,8 +2948,9 @@ mod tests {
     #[test]
     fn two_jobs_that_each_fit_alone_do_not_both_fit_in_one_pass() {
         // 31 GiB lent less a 6 GiB floor is 25 GiB admitted; two 14 GiB jobs
-        // are 28. Both ask for `build`, of which that machine has two slots,
-        // so nothing but the memory can be what stops the second.
+        // are 28, and 30.8 once the ceilings they are granted carry the 10%
+        // margin (ORCH-312). Both ask for `build`, of which that machine has
+        // two slots, so nothing but the memory can be what stops the second.
         let mut fleet = vec![their_server()];
         let first = a_test("j1", 14 * 1024, 0);
         let second = a_test("j2", 14 * 1024, 0);
@@ -2753,7 +2963,7 @@ mod tests {
         ));
         assert_eq!(runner, "build-host");
         assert!(
-            why.contains("admitted 14 GiB of memory, 11 GiB free of 25 GiB after it"),
+            why.contains("admitted 15.3 GiB of memory, 9.6 GiB free of 25 GiB after it"),
             "{why}"
         );
         let why = waited(place(
@@ -2764,11 +2974,14 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("11 GiB free of its 25 GiB memory admission, 14 GiB needed"),
+            why.contains(
+                "9.6 GiB free of its 25 GiB memory admission and this job's ceiling would be \
+                 15.3 GiB"
+            ),
             "the second job of one pass must be weighed against the first: {why}"
         );
         assert!(
-            why.contains("1 job running there holds 14 GiB of memory"),
+            why.contains("1 job running there holds 15.3 GiB of memory"),
             "{why}"
         );
 
@@ -2801,17 +3014,26 @@ mod tests {
     }
 
     /// **Attack 2.** A job admitted a second ago has allocated nothing yet,
-    /// and is costed at every byte it **declared** all the same. A hub that
-    /// looked at real usage would let a second job in beside it and watch
-    /// both grow.
+    /// and is costed at every byte of the ceiling it was **granted** all the
+    /// same. A hub that looked at real usage would let a second job in
+    /// beside it and watch both grow.
+    ///
+    /// **Granted, not declared, and ORCH-312 is the difference.** 20 480 MiB
+    /// of memory with 6 144 of tmpfs is 29 286 MiB of ceiling: the tmpfs is
+    /// inside it, because tmpfs pages are charged to the cgroup that writes
+    /// them, and the 10% margin is on top. That is the figure the runner
+    /// writes into the job's cgroup, so it is the figure the machine is read
+    /// as holding. Here there is no announced count to clamp it by, so the
+    /// whole declared ceiling is charged — which is more than the machine
+    /// admits, and the sentence the next job gets says so.
     #[test]
-    fn a_job_admitted_and_still_idle_is_costed_at_what_it_declared() {
+    fn a_job_admitted_and_still_idle_is_costed_at_the_ceiling_it_was_granted() {
         // `assigned` is the state of a job handed over and not yet started:
         // nothing of it is running, nothing of it has allocated a page.
         let mut idle = out_on(a_test("j1", 20 * 1024, 6 * 1024), "build-host");
         idle.state = JobState::Assigned;
-        let taken = reserved(std::slice::from_ref(&idle));
-        assert_eq!(taken["build-host"].memory_mib, 20 * 1024);
+        let taken = reserved(std::slice::from_ref(&idle), &no_announced_rooms());
+        assert_eq!(taken["build-host"].memory_mib, 29286);
         assert_eq!(taken["build-host"].tmpfs_mib, 6 * 1024);
 
         let mut fleet = fleet_with(their_server(), std::slice::from_ref(&idle));
@@ -2823,7 +3045,10 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("5 GiB free of its 25 GiB memory admission, 6 GiB needed"),
+            why.contains(
+                "0 MiB free of its 25 GiB memory admission and this job's ceiling would be \
+                 6.5 GiB"
+            ),
             "a job that has allocated nothing still holds what it declared: {why}"
         );
     }
@@ -3028,7 +3253,10 @@ mod tests {
     #[test]
     fn a_build_is_admitted_against_its_per_thread_figure_times_the_derived_j() {
         // Their server: 31 GiB, 12 threads, two build slots, so `-j 6` and
-        // 6 x 1 792 = 10 752 MiB of declared need.
+        // 6 x 1 792 = 10 752 MiB of declared need, which is 11 904 MiB of
+        // granted ceiling once the 10% margin is on — the figure the runner
+        // writes into the job's cgroup, and therefore the figure the hub
+        // charges (ORCH-312).
         let mut fleet = vec![their_server()];
         let (_, why) = placed(place(
             &a_build("j1", 1792),
@@ -3038,9 +3266,9 @@ mod tests {
             &Placing::default(),
         ));
         assert!(why.contains("-j 6"), "{why}");
-        assert!(why.contains("admitted 10.5 GiB of memory"), "{why}");
+        assert!(why.contains("admitted 11.5 GiB of memory"), "{why}");
         // Both of their build slots fit at once, which is the arithmetic the
-        // first consumer's own fleet depends on: 2 x 10.5 GiB under 25 GiB.
+        // first consumer's own fleet depends on: 2 x 11.5 GiB under 25 GiB.
         let (_, why) = placed(place(
             &a_build("j2", 1792),
             &mut fleet,
@@ -3048,11 +3276,14 @@ mod tests {
             Stickiness::default(),
             &Placing::default(),
         ));
-        assert!(why.contains("admitted 10.5 GiB of memory"), "{why}");
+        assert!(why.contains("admitted 11.5 GiB of memory"), "{why}");
         assert!(why.contains("build slot 2 of 2"), "{why}");
 
         // And her PC derives `-j 7` on one slot: 7 x 1 792 = 12 544 MiB,
-        // against 17 GiB less a 3 GiB floor. It fits, and barely.
+        // which is 13 798 MiB of ceiling against 17 GiB less a 3 GiB floor.
+        // It fits, and barely — one 538 MiB narrower than it did before the
+        // margin was charged, which is the tenth of a job
+        // `CEILING_MARGIN_PERCENT` says it costs.
         let mut fleet = vec![her_pc()];
         let (_, why) = placed(place(
             &a_build("j3", 1792),
@@ -3062,7 +3293,7 @@ mod tests {
             &Placing::default(),
         ));
         assert!(why.contains("-j 7"), "{why}");
-        assert!(why.contains("admitted 12.2 GiB of memory"), "{why}");
+        assert!(why.contains("admitted 13.4 GiB of memory"), "{why}");
     }
 
     /// **Attack 3, 9 and 10.** A reservation is a field on a record whose
@@ -3073,7 +3304,7 @@ mod tests {
     fn a_reservation_is_released_by_every_way_a_job_ends() {
         let running = out_on(a_test("j1", 8192, 4096), "build-host");
         assert_eq!(
-            reserved(std::slice::from_ref(&running))["build-host"].tmpfs_mib,
+            reserved(std::slice::from_ref(&running), &no_announced_rooms())["build-host"].tmpfs_mib,
             4096
         );
 
@@ -3116,7 +3347,7 @@ mod tests {
             let mut ended = running.clone();
             ended.state = state.clone();
             assert!(
-                reserved(&[ended]).is_empty(),
+                reserved(&[ended], &no_announced_rooms()).is_empty(),
                 "a job that is {} reserves nothing",
                 state.name()
             );
@@ -3129,18 +3360,20 @@ mod tests {
         never_started.state = JobState::Queued;
         never_started.attempts[0].ended_at = Some(Timestamp::now());
         never_started.attempts[0].ended = Some("the runner went before it started".to_owned());
-        assert!(reserved(&[never_started]).is_empty());
+        assert!(reserved(&[never_started], &no_announced_rooms()).is_empty());
 
         // **Attack 10**: a hub killed mid-job leaves the record
         // `interrupted`, and the machine may well still be running it — so it
-        // still holds every byte it declared, read off the same record the
-        // new hub reads.
+        // still holds every byte of the ceiling it was granted, read off the
+        // same record the new hub reads. 8 192 MiB of memory and 4 096 of
+        // tmpfs is 13 516 MiB of ceiling once the 10% margin is on, because
+        // the tmpfs is *inside* that ceiling (ORCH-312).
         let mut interrupted = running.clone();
         interrupted.state = JobState::Interrupted {
             reason: "this hub was killed while the job was running".to_owned(),
         };
-        let after_a_restart = reserved(std::slice::from_ref(&interrupted));
-        assert_eq!(after_a_restart["build-host"].memory_mib, 8192);
+        let after_a_restart = reserved(std::slice::from_ref(&interrupted), &no_announced_rooms());
+        assert_eq!(after_a_restart["build-host"].memory_mib, 13516);
         assert_eq!(after_a_restart["build-host"].tmpfs_mib, 4096);
         assert_eq!(after_a_restart["build-host"].jobs, 1);
     }
@@ -3153,7 +3386,7 @@ mod tests {
     fn a_holding_that_cannot_be_costed_is_named_and_never_counted_as_zero() {
         let mut uncostable = out_on(a_build("j1", 1792), "build-host");
         uncostable.parallelism = None;
-        let taken = reserved(std::slice::from_ref(&uncostable));
+        let taken = reserved(std::slice::from_ref(&uncostable), &no_announced_rooms());
         assert_eq!(taken["build-host"].memory_mib, 0);
         assert_eq!(taken["build-host"].uncostable.len(), 1);
 
@@ -4018,7 +4251,9 @@ mod tests {
             &Placing::default(),
         ));
         assert!(why.contains("free of its"), "{why}");
-        assert!(why.contains("8 GiB needed"), "{why}");
+        // 8 GiB declared is 8.7 GiB of ceiling once the margin is on, and
+        // the ceiling is what the room has to cover (ORCH-312).
+        assert!(why.contains("this job's ceiling would be 8.7 GiB"), "{why}");
     }
 
     /// And what a short job is told, when some of the room is held by a
@@ -4037,8 +4272,9 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("1 job running there holds 10 GiB of memory"),
-            "{why}"
+            why.contains("1 job running there holds 11 GiB of memory"),
+            "a reading that declared a figure holds the ceiling that figure \
+             earns, margin included, exactly as a job does (D119, D159): {why}"
         );
         assert!(why.contains("of which 1 is a requirement reading"), "{why}");
     }
@@ -4290,6 +4526,18 @@ mod tests {
 
     /// **A bound beside the memory one, never instead of it.** Whichever
     /// bites first is the one that bites, and the sentence names that one.
+    ///
+    /// **Which one it is changed with ORCH-312, and the finding is the
+    /// change.** The charge is now the ceiling the runner will grant, bounded
+    /// by `(lent − floor) ÷ at_once`, so a sum of charges cannot pass
+    /// `lent − floor` before the job count passes `at_once` — which the count
+    /// has already refused. **On a runner that announced a count the two
+    /// bounds therefore coincide**, and that is the truth about a machine
+    /// whose per-job cap is one figure: `jobs_at_once` *is* the memory
+    /// arithmetic. The memory admission is still the only bound on a runner
+    /// that announced no count, and it still refuses a job that can never fit
+    /// however empty the machine gets — the two things `Seat::jobs_at_once`'s
+    /// own doc says it is for. All three are below.
     #[test]
     fn the_ceiling_and_the_memory_admission_are_two_bounds_and_either_may_bite() {
         // The ceiling bites first: two jobs of 1 GiB on a machine admitting
@@ -4317,10 +4565,10 @@ mod tests {
              quote 23 GiB of free memory at a machine that will not take it: {why}"
         );
 
-        // The memory bites first: one 20 GiB job on a machine that announced
-        // room for eight, and the second 20 GiB job does not fit although
-        // seven places are open.
-        let mut fleet = vec![their_server_holding_at_most(8)];
+        // **The memory admission still bites, on a runner that announced no
+        // count.** Two 20 GiB jobs on a machine admitting 25: the second does
+        // not fit, and nothing about a seat count is what stops it.
+        let mut fleet = vec![their_server()];
         placed(place(
             &costing("j0", 20 * 1024),
             &mut fleet,
@@ -4336,10 +4584,50 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("5 GiB free of its 25 GiB memory admission"),
-            "a ceiling with places left must not stop the memory admission doing its job: \
-             {why}"
+            why.contains("3 GiB free of its 25 GiB memory admission"),
+            "a machine that announced no count is bounded by its memory and by nothing \
+             else: {why}"
         );
+
+        // **And on a runner that announced one, the two bounds coincide —
+        // which is the arithmetic and not a coincidence** (ORCH-312).
+        //
+        // A charge is the ceiling the runner will grant, bounded by
+        // `(lent − floor) ÷ at_once` (`charged_against_the_room`,
+        // `per_job_cap_mib`), so `n` jobs charge at most
+        // `n × (lent − floor) ÷ at_once`, which cannot pass `lent − floor`
+        // until `n` passes `at_once` — and the count has refused by then.
+        // That is the truth about a machine whose per-job cap is one figure:
+        // `jobs_at_once` **is** the memory arithmetic, so a machine that
+        // announced eight places takes eight jobs whatever each one declared.
+        //
+        // Two jobs that each declared 20 GiB both fit here: each will be held
+        // to the 3.1 GiB that machine's own cap implies, and 3.1 GiB is what
+        // the hub charges, because charging 20 — or charging the whole 25 the
+        // machine admits — would be writing a figure into an operator's
+        // record that no runner will honour.
+        //
+        // Dropping the count in favour of the sum is therefore its own piece
+        // of work and not a side effect of this one (ORCH-323).
+        let mut fleet = vec![their_server_holding_at_most(8)];
+        assert_eq!(
+            per_job_cap_mib(&fleet[0].host, fleet[0].jobs_at_once),
+            Some(3200),
+            "25 GiB admitted between eight announced places"
+        );
+        for n in 0..2 {
+            let (_, why) = placed(place(
+                &costing(&format!("j{n}"), 20 * 1024),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+            assert!(
+                why.contains("admitted 3.1 GiB of memory"),
+                "a job is charged what its runner will hold it to: {why}"
+            );
+        }
 
         // And a job larger than the machine is still *impossible* there,
         // not a wait: the ceiling knows nothing about size and must not

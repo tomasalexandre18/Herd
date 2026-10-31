@@ -442,21 +442,42 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     );
     assert!(said.contains("1 job running there holds"), "{said}");
 
-    // And the memory half of the same fact: 1.5 GiB of admission here (2 GiB
-    // lent less a 512 MiB floor), 1 GiB of it held by the inherited job, so
-    // 512 MiB free and another gibibyte does not fit.
-    let too_much_memory = herd
-        .submit_reserving(Some(1024), None, "printf 'should wait too\\n'")
+    // And the memory half of the same fact, read off the figure in that same
+    // sentence: the inherited job holds 512 MiB of this machine's 1.5 GiB
+    // admission, counted off the record alone by a hub that never saw the job
+    // start.
+    //
+    // **512 MiB and not the 1 GiB it declared**, because what a job costs a
+    // machine is the ceiling its runner will grant it (ORCH-312). 1 GiB of
+    // memory with 3 GiB of tmpfs — the tmpfs is *inside* the ceiling — earns
+    // 4.4 GiB, and this lender caps every job at 512 MiB, so 512 MiB is what
+    // it holds and what the hub charges.
+    //
+    // **Why this half no longer ends in a memory refusal.** It used to submit
+    // another gibibyte and assert that it waited. On this lender the per-job
+    // cap is 512 MiB and the announced count is three, so three jobs of
+    // 512 MiB are the whole 1.5 GiB admission: a sum of truthful charges
+    // cannot pass the admission before the count has refused, and the fourth
+    // job is held back by the count and not by the memory. The fact under
+    // test is the figure, and the figure is what is asserted.
+    assert!(
+        said.contains("1 job running there holds 512 MiB of memory and 3 GiB of tmpfs"),
+        "the hub that came back must count the inherited job's own ceiling off the record: \
+         {said}"
+    );
+    // And a second job, which this machine does have room for: 512 MiB of its
+    // 1.5 GiB admission is held, so another 512 MiB charge fits and is
+    // claimed. Submitted here because the last assertions of this test are
+    // about every job getting its room back when the inherited one ends.
+    let beside_it = herd
+        .submit_reserving(Some(1024), None, "printf 'ran beside it\\n'")
         .await;
-    herd.wait_until("the new hub has judged the memory one", || {
-        herd.waiting_for(&too_much_memory).contains("memory")
+    herd.wait_until("the new hub has judged the second one", || {
+        !herd.record(&beside_it)["attempts"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
     })
     .await;
-    let said = herd.waiting_for(&too_much_memory);
-    assert!(
-        said.contains("512 MiB free of its 1.5 GiB memory admission, 1 GiB needed"),
-        "the inherited job's 1 GiB of declared memory must still be held: {said}"
-    );
     // Both sentences above are only worth anything while the attempt whose
     // reservation they count is still out there, so that is asserted rather
     // than assumed: if it had ended there would be room, and the hub would
@@ -477,7 +498,7 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     // When the inherited job ends, both get their room back — nothing was
     // pinned by the restart.
     let_it_finish(&release);
-    for job in [&holding, &would_not_fit, &too_much_memory] {
+    for job in [&holding, &would_not_fit, &beside_it] {
         let job = job.clone();
         herd.wait_until(&format!("{job} is over"), || {
             state_of(&herd, &job) == "finished"
@@ -485,7 +506,7 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
         .await;
     }
     assert!(herd.log(&would_not_fit).contains("should wait"));
-    assert!(herd.log(&too_much_memory).contains("should wait too"));
+    assert!(herd.log(&beside_it).contains("ran beside it"));
 }
 
 /// E-32: the load figure reaches the hub, lands on the line explaining every
@@ -511,6 +532,12 @@ async fn the_load_is_on_the_placement_line_and_stops_nothing() {
         why.contains("recorded and not a gate (E-32)"),
         "E-32 asks for the figure to be recorded: {why}"
     );
-    assert!(why.contains("admitted 1 GiB of memory"), "{why}");
+    // 1 GiB of memory with 512 MiB of tmpfs earns 1 689 MiB of ceiling — the
+    // tmpfs is inside it and the 10% margin is on top — and this lender caps
+    // every job at 512 MiB, so 512 MiB is what this job will be held to and
+    // what it costs the machine (ORCH-312). The tmpfs reservation is charged
+    // against the tmpfs capacity as it always was, which is a different
+    // budget and not a double charge.
+    assert!(why.contains("admitted 512 MiB of memory"), "{why}");
     assert!(why.contains("reserved 512 MiB in tmpfs"), "{why}");
 }
