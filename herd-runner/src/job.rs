@@ -1215,13 +1215,26 @@ impl Attempt {
         // The step that decided the verdict says so in the job's **own** log,
         // naming itself and the figure, because that log is what a reader
         // reads first and until now the cap never reached it from here.
+        //
+        // **Except the log cap, which is the one of the four that cannot
+        // afford it.** That cap is a promise about how many bytes reach the
+        // requester, and a step it stopped has had its own bytes cut at
+        // exactly that figure — so a line about the cap is the bytes that
+        // break it. Measured on this very change: 1220 bytes against a 1 024
+        // cap and 65733 against 65536, the difference being this line's own
+        // length both times (`herd-runner/tests/confinement.rs:923` and
+        // `:466`). The log cap keeps saying what it is in the record's
+        // `StepRun.ended` and in the attempt's outcome, where it costs the
+        // requester's log nothing.
         if let Some(capped) = &capped {
-            say_in_the_log(
-                session,
-                job_id,
-                attempt,
-                &the_cap_that_stopped_this_step(stage, capped),
-            );
+            if capped.cap != Cap::Log {
+                say_in_the_log(
+                    session,
+                    job_id,
+                    attempt,
+                    &the_cap_that_stopped_this_step(stage, capped),
+                );
+            }
         }
 
         // Ahead of everything else read off this step: a workspace the runner
@@ -2543,14 +2556,8 @@ mod tests {
             2,
             "two kills, two lines, each naming its own step: {log}"
         );
-        assert!(
-            named[0].contains(&capped_line("run")),
-            "{log}"
-        );
-        assert!(
-            named[1].contains(&capped_line("down")),
-            "{log}"
-        );
+        assert!(named[0].contains(&capped_line("run")), "{log}");
+        assert!(named[1].contains(&capped_line("down")), "{log}");
         // And the takedown still says what a failed takedown means, as the
         // step's own ending and never in the job's sentence (D108).
         assert!(
@@ -2586,6 +2593,47 @@ mod tests {
         assert!(
             !said.contains("not a figure this job declared"),
             "a declared figure can be exactly what bounded it: {said}"
+        );
+    }
+
+    /// The log cap is the one of the four whose step does **not** name itself
+    /// in the job's log, and not one byte of it may.
+    ///
+    /// The cap is a promise about how many bytes reach the requester, and a
+    /// step it stopped has had its own bytes cut at exactly that figure. A
+    /// line about the cap would therefore be the bytes that break it, which
+    /// is what two of the suite's own tests measured when this change first
+    /// wrote one: 1220 bytes against a 1 024 cap, 65733 against 65536.
+    #[test]
+    fn a_log_capped_step_adds_no_bytes_to_the_log_it_just_cut() {
+        let mut caps = Confinement::with_data_root("/nowhere");
+        caps.log_cap = 1024;
+        let job_id = JobId::new("j0000000070");
+        let (session, _cancel) = a_session(&job_id);
+        let mut ran = Attempt::default();
+        let mut cut = watched(exited(0));
+        cut.cap = Some(Cap::Log);
+
+        ran.step_ended(
+            &a_step(Step::Run),
+            at(),
+            cut,
+            false,
+            &caps,
+            &session,
+            &job_id,
+            1,
+        );
+
+        assert_eq!(
+            ran.cap.as_ref().map(|capped| capped.cap),
+            Some(Cap::Log),
+            "the verdict is still the cap, said where it costs nothing"
+        );
+        assert_eq!(
+            session.held_output_of(&job_id, 1),
+            String::new(),
+            "and the log the cap is a promise about gains nothing at all"
         );
     }
 }

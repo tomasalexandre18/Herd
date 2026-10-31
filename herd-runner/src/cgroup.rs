@@ -2469,9 +2469,7 @@ mod tests {
     /// against the one line it wants.
     #[test]
     fn memory_events_is_read_as_a_process_count_and_an_event_count() {
-        let found = oom_kills_in(
-            "low 0\nhigh 0\nmax 41\noom 1\noom_kill 8\noom_group_kill 1\n",
-        );
+        let found = oom_kills_in("low 0\nhigh 0\nmax 41\noom 1\noom_kill 8\noom_group_kill 1\n");
         assert_eq!(
             found,
             OomKills {

@@ -1,10 +1,12 @@
 # oom-step-attribution — handoff 2026-10-31
 
-- **Item:** ORCH-NEXT (three rows, in this branch's `board.md`; the
+- **Item:** ORCH-NEXT (four rows, in this branch's `board.md`; the
   merger allocates their numbers)
 - **Agent:** herd-step
-- **Branch / commit:** `oom-step-attribution` / `714176f1`, based on
-  origin/main `d32c87a7876b91c55ca5caa8284ba5fa1357adc7`
+- **Branch / commit:** `oom-step-attribution` / its tip — the sha the
+  gate names is in the agent's report, because this file is the last
+  change before the gate runs — based on origin/main
+  `d32c87a7876b91c55ca5caa8284ba5fa1357adc7`
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -155,6 +157,11 @@ had no dead pointer to correct and stays at its 90 lines (**D276**).
   read the tail of `run`'s kill. Closing it needs either a second reading
   after a settle, which costs every capped step, or a figure only the
   consumer can report. Filed as its own row, state `open`.
+- **Whether a runner's own log lines belong inside the log cap** is not
+  decided here. This change stopped adding to the problem — it writes no
+  step-naming line under the log cap — and left the pre-existing paths
+  alone, because the answer changes what the log cap *means* rather than
+  which step a kill is charged to. Filed as a row.
 - **No test makes a real OOM kill.** This host has no delegated cgroup
   v2, so a fixture that needed the kernel to kill something in a job
   cgroup could not run here at all. See *Gates*: no skip was added, and
@@ -183,17 +190,55 @@ committed is not merely about a different tree, it does not happen at
 all. **A refusal is not a red gate and is not a pass either** — it is no
 verdict, and it is reported as none.
 
+**The second attempt was RED, and the red was mine.** Job
+**`j0000000177`** on `adcc4df8`, `./scripts/gate.sh` bare and whole
+through Herd. Two steps failed and both were this change's own:
+
+```text
+gate: RED sha=adcc4df8c7de8f0f98e46b1cf9058c2e4665315f failed=4:cargo-fmt,6:test-suite skips=under-load(flood-fifty=9.26>8,flood-two-fifty=9.26>8)
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+`cargo fmt` wanted two of the new assertions on one line each.
+`./scripts/test.sh` was the one that mattered:
+
+```text
+test a_job_that_breaches_the_log_cap_and_exits_at_once_names_the_cap ... FAILED
+test a_job_flooding_its_log_is_stopped_at_the_log_cap ... FAILED
+1220 bytes reached the requester with a cap of 1024
+65733 bytes reached the requester with a cap of 65536
+test result: FAILED. 40 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**The suite was right and the fix was wrong**, so the fix moved and no
+test and no expectation was edited. The step-naming line is now **not**
+written for the log cap, with the reason in the code: that cap is a
+promise about how many bytes reach the requester, a step it stopped has
+had its own bytes cut at exactly that figure, and a line about the cap is
+the bytes that break it — 196 and 197 bytes, this line's own length both
+times. `a_log_capped_step_adds_no_bytes_to_the_log_it_just_cut` now
+asserts it, so the exception is a test and not a comment. What the two
+failures revealed about the pre-existing code is *Risks and findings* 7.
+
+The rest of that run was green and is evidence: `cargo build`, `cargo
+clippy --workspace --all-targets -- -D warnings` (27 s, ok), and step 7
+**the skip list matched the expectation exactly** — 14 observed, the
+twelve at rest plus `flood-fifty` and `flood-two-fifty` excused by name
+on their own readings of 9.26 against their own ceiling of 8, which is
+the under-load list and the mechanism working (**D187**) — with the
+`#[ignore]` census **38** and matching, every one carrying a reason.
+
 **Quoted here, from the runs made before this commit:**
 `./scripts/check-docs.sh`, run locally — no toolchain, so it needs no
-Herd job — twice: once on the code commit and once after the three
-`board.md` rows were added.
+Herd job — four times, green each time, most recently after this file
+and the third `board.md` row.
 
 ```text
 docs ok
 ```
 
-**The four Rust gates were NOT run before this commit.** They are the
-run named below, on the committed tree, and nothing else covers them.
+**The four Rust gates have not been green on this tree yet.** They are
+the run named below, and nothing else covers them.
 
 **The last run, named and not quoted.** `./scripts/gate.sh`, bare and
 whole, submitted to the local hub `ws://127.0.0.1:8791` with
@@ -369,10 +414,30 @@ The brief lists the complete set of log writers as `say_in_the_log` at
 five: the call added in `step_ended` is the fifth, and it is the only one
 that fires for a step that was capped and not for a step that failed.
 
+### 7. The runner's own log lines are not counted against the log cap
+
+Found by the red gate, and **it pre-dates this change**. The log cap is
+accounted in `log_bytes`, which only `stream_output` increments: every
+line `say_in_the_log` writes is bytes the requester receives **beyond**
+the figure the cap promised. For a step the log cap stopped, the job's
+own bytes are already at exactly the cap, so any runner line after it
+breaks the promise by its own length.
+
+This change made that reachable and the suite caught it at once, which
+is why the step-naming line is not written for the log cap. **The
+pre-existing paths are still there and nothing tests them**: a declared
+job whose `run` breaches the log cap and whose `down` then fails writes
+`say_the_takedown_did_not_come_off`'s line into a log that is already
+full, and `say_the_job_never_started`'s line does the same. Those lines
+are small and the breach is small, which is exactly why nobody has seen
+it. Filed as a row, not fixed here: deciding whether a runner's own lines
+belong inside the cap or outside it is a change to what the log cap
+*means*, not an attribution fix.
+
 ### 6. The workspace walk was kept clear of
 
 No test added here touches a directory the runner's workspace walk could
-be asked to list, sets a mode, or runs a real job: all fourteen new tests
+be asked to list, sets a mode, or runs a real job: all fifteen new tests
 are pure arithmetic over the two counters, the parse of a text fixture,
 or `Attempt::step_ended` against an unattached `Session` with no
 workspace at all. The 200 ms `set_permissions(mode | 0o700)` loop is
@@ -443,6 +508,16 @@ step's own (D108). A step's line no longer borrows
 `herd_proto::cap_exceeded_reason`, which is the **job's** sentence and
 stays exactly as it is for the attempt's outcome and the record.
 
+**With one exception, and the suite is what found it.** The log cap
+writes no such line. That cap is a promise about how many bytes reach
+the requester, a step it stopped has had its own bytes cut at exactly
+that figure, and a line about the cap is the bytes that break it —
+measured at 1220 against a 1 024 cap and 65733 against 65536, this
+line's own length both times. The log cap keeps saying what it is in the
+record and in the outcome, where it costs the requester's log nothing.
+Whether a runner's own lines belong inside the log cap at all is a
+separate question, now a board row.
+
 **What is not decided here.** No exit code moves: **rc 124 stays one
 code for all four caps** (Alexa, 2026-10-30), because the consumer's
 scripts are a live contract now that they run 1.0.0. No cap, default or
@@ -457,22 +532,21 @@ not a decision.
 
 **Evidence.** `herd-runner/src/job.rs` `OomWatermark`,
 `the_cap_that_stopped_this_step`; `herd-runner/src/cgroup.rs`
-`OomKills`, `oom_kills_in`; fourteen tests, of which
+`OomKills`, `oom_kills_in`; fifteen tests, of which
 `one_oom_kill_is_charged_to_one_step` replays the consumer's own two
 readings and asserts the **old** rule true on them in the same test;
 `history/2026-10-31-oom-step-attribution.md`.
 ```
 
-**For `docs/orchestration/board.md`** — three rows, **already applied on
-this branch** in commit `714176f1`, reproduced here verbatim so the
-merged board can be checked line by line. Two in *Owed*, after
-ORCH-307; one in *Open*, after ORCH-303. The highest id on `main` is
-**ORCH-311**.
+**For `docs/orchestration/board.md`** — four rows, **already applied on
+this branch**, reproduced here verbatim so the merged board can be
+checked line by line. Two in *Owed*, after ORCH-307; two in *Open*,
+after ORCH-303. The highest id on `main` is **ORCH-311**.
 
 In *Owed*:
 
 ```markdown
-| ORCH-NEXT | **One OOM kill was charged to two steps, and the job's log named only the wrong one.** The first consumer's j0000000069 and j0000000460 each reported `run` stopped at the memory cap **and** `down` stopped at the memory cap seconds later, against exactly one kernel OOM event per job and no kernel OOM line at all during `down`. Not a baseline nobody advanced: `herd-runner/src/job.rs` did refresh it per step. `oom_kill` counts **processes** — one per task as the kernel walks a `memory.oom.group` kill — and the runner is woken by the first of those deaths, so its reading was mid-burst and the rest of the same kill landed in `down`'s delta. Compounding it, a cap verdict overrode `down`'s own exit code, so a takedown that had succeeded was recorded with no code and announced as *"the down step the runner stopped this job at its memory cap of 8589934592 bytes, so this job's workspace may be left on this host"* — two claims in one clause, about a figure that is the runner-wide `--job-memory-max` and never the 1792 MiB the job declared | the first consumer's records and kernel log, reported 2026-10-31; brief to `oom-step-attribution` | herd-step (done), herd-merger (integration) | done | **Done on branch `oom-step-attribution`.** A step is judged on `oom_group_kill` where the kernel publishes it (one increment per event, before the first task is signalled) and a step that exited 0 is never said to have been capped, since `memory.oom.group = 1` leaves a killed shell no code to report; a non-zero code keeps its cap and the baseline is a high-water mark. The capped step now writes one line in the job's own log naming itself and naming the figure as this runner's own ceiling. **No exit code moved** — rc 124 stays one code for all four caps — and `herd-proto` is untouched. Fourteen new tests, eleven of them in `job.rs`, over the consumer's own readings | — | `herd-runner/src/job.rs` `OomWatermark`, `the_cap_that_stopped_this_step`; `herd-runner/src/cgroup.rs` `OomKills`, `oom_kills_in`; `history/2026-10-31-oom-step-attribution.md` |
+| ORCH-NEXT | **One OOM kill was charged to two steps, and the job's log named only the wrong one.** The first consumer's j0000000069 and j0000000460 each reported `run` stopped at the memory cap **and** `down` stopped at the memory cap seconds later, against exactly one kernel OOM event per job and no kernel OOM line at all during `down`. Not a baseline nobody advanced: `herd-runner/src/job.rs` did refresh it per step. `oom_kill` counts **processes** — one per task as the kernel walks a `memory.oom.group` kill — and the runner is woken by the first of those deaths, so its reading was mid-burst and the rest of the same kill landed in `down`'s delta. Compounding it, a cap verdict overrode `down`'s own exit code, so a takedown that had succeeded was recorded with no code and announced as *"the down step the runner stopped this job at its memory cap of 8589934592 bytes, so this job's workspace may be left on this host"* — two claims in one clause, about a figure that is the runner-wide `--job-memory-max` and never the 1792 MiB the job declared | the first consumer's records and kernel log, reported 2026-10-31; brief to `oom-step-attribution` | herd-step (done), herd-merger (integration) | done | **Done on branch `oom-step-attribution`.** A step is judged on `oom_group_kill` where the kernel publishes it (one increment per event, before the first task is signalled) and a step that exited 0 is never said to have been capped, since `memory.oom.group = 1` leaves a killed shell no code to report; a non-zero code keeps its cap and the baseline is a high-water mark. The capped step now writes one line in the job's own log naming itself and naming the figure as this runner's own ceiling. **No exit code moved** — rc 124 stays one code for all four caps — and `herd-proto` is untouched. Fifteen new tests, twelve of them in `job.rs`, over the consumer's own readings | — | `herd-runner/src/job.rs` `OomWatermark`, `the_cap_that_stopped_this_step`; `herd-runner/src/cgroup.rs` `OomKills`, `oom_kills_in`; `history/2026-10-31-oom-step-attribution.md` |
 | ORCH-NEXT | **The memory ceiling a reader needs is never announced, and the runner cannot say which counter it judged a kill on.** Two halves of one gap, both left by `oom-step-attribution` and neither inside it. (1) `run` is the one step with an announce (`herd-runner/src/step.rs:245`, `run_cap.said`) and it carries the **time** figures only, so the memory ceiling reaches a job's log for the first time when something has already been stopped by it — which is why the first consumer read 8589934592 bytes as a figure their 1792 MiB job had asked for. (2) The runner now prefers `oom_group_kill` and falls back to `oom_kill`, and **says in no log and no report which of the two it used**, so nobody outside the kernel can tell whether a given host has the settled counter at all — and invariant 9 forbids going to look (**D161**) | `oom-step-attribution`, 2026-10-31, *Risks and findings* 1 and 2; the announce is the other half of the same reader's problem and the startup report is outside that task's paths | herd-step | owed | One clause in `run_cap.said` naming the runner's own memory ceiling beside the time figure, and one clause in the runner's startup report saying whether a probe cgroup's `memory.events` publishes `oom_group_kill`. Both are `.rs`, so both owe all four Rust gates plus `check-docs.sh` through one bare `./scripts/gate.sh` | — | `herd-runner/src/step.rs:387`-`:420` `run_cap`; `herd-runner/src/cgroup.rs` `oom_kills_in`; `history/2026-10-31-oom-step-attribution.md` |
 ```
 
@@ -480,6 +554,7 @@ In *Open*:
 
 ```markdown
 | ORCH-NEXT | **On a kernel with no `oom_group_kill` the mid-burst race is closed by one clause only, and that clause needs the step to have exited 0.** `OomWatermark::killed_in_this_step` (`herd-runner/src/job.rs`) judges a step on `oom_group_kill` where the kernel publishes it — one increment per event, raised before the first task is signalled — and on the cumulative per-process `oom_kill` where it does not. In that fallback a `down` that ends **without an exit code**, for any reason at all, can still read the tail of `run`'s own kill as its own, because the baseline was taken mid-burst. The field is Linux 5.17 and later, and this project cannot read the first consumer's kernel version (invariant 9, **D161**), so **which of the two guards carried j0000000069 is not known** | `oom-step-attribution`, 2026-10-31, *Risks and findings* 3; stated rather than closed, because closing it needs either a second reading after a settle or a figure only the consumer can report | herd-step | open | Decide between (a) one re-read of `memory.events` after a bounded settle when a step ended with no code and only `processes` moved, which costs every capped step a few ms, and (b) asking the first consumer to report whether `oom_group_kill` appears in a job cgroup's `memory.events` on their fleet. **(b) first:** a few ms is cheap, but it is a change to every capped step's path and it may be guarding a branch nobody runs | a report from the first consumer, for (b) | `herd-runner/src/job.rs` `OomWatermark`; `herd-runner/src/cgroup.rs` `OomKills`; `history/2026-10-31-oom-step-attribution.md` |
+| ORCH-NEXT | **The runner's own log lines are not counted against the log cap, so a line written after a log-capped step breaks the figure the requester was promised.** The cap is accounted in `log_bytes`, which only `stream_output` increments (`herd-runner/src/job.rs`); every line `say_in_the_log` writes is bytes the requester receives **beyond** it. A step the log cap stopped has had its own bytes cut at exactly the cap, so any runner line after it over-runs by its own length. **Measured, because `oom-step-attribution` made it reachable and the suite caught it in one run:** 1220 bytes against a 1 024 cap and 65733 against 65536, in `a_job_that_breaches_the_log_cap_and_exits_at_once_names_the_cap` and `a_job_flooding_its_log_is_stopped_at_the_log_cap`. That branch answered it by not writing its new line under the log cap. **The pre-existing paths remain and nothing tests them:** a declared job whose `run` breaches the log cap and whose `down` then fails writes `say_the_takedown_did_not_come_off`'s line into a log that is already full, and `say_the_job_never_started`'s does the same | `oom-step-attribution`, 2026-10-31, *Risks and findings* 7, found by its own red gate `j0000000177` | herd-step | open | Decide what the log cap means first, because the fix follows from it: either (a) the runner's own lines are **inside** the cap, which means counting them in `log_bytes` and cutting them too — a runner that cannot explain why it stopped a job — or (b) they are **outside** it by design, which means the cap is a bound on the *job's* output and the promise should say so wherever it is stated, including `--job-log-cap`'s own `--help`. **(b) is the recommendation:** a runner must always be able to say why it stopped a job, and four short sentences past a 64 MiB ceiling is not what the cap exists to prevent. Then one test per pre-existing path | — | `herd-runner/src/job.rs` `say_in_the_log`, `stream_output`, `say_the_takedown_did_not_come_off`, `say_the_job_never_started`; `herd-runner/tests/confinement.rs:466` and `:923`; `history/2026-10-31-oom-step-attribution.md` |
 ```
 
 ## Decisions needed
