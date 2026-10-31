@@ -185,3 +185,29 @@ pub fn source_files() -> Vec<(PathBuf, String)> {
     }
     found
 }
+
+/// The sentence a refusal for this runner's **own running sum** really
+/// carries, built the way `Session::take_job` builds it.
+///
+/// Here rather than in the test that reads it because
+/// `crate::NotTaken` is the runner's own business and stays so: a hub-side
+/// test asserting that the three sentences about room on a machine cannot be
+/// mistaken for one another (`herd-hub/tests/announced_job_ceiling.rs`) has
+/// to read the sentence as it is built and not a copy of its words, and a
+/// copy is what it would have if this returned anything but the real one.
+///
+/// The figures are the ones `two_declared_jobs_fit_where_one_seat_held_one`
+/// uses — a host lending 8 GiB, keeping 1 GiB, capping a job at 7 GiB — so
+/// the sentence under test is a sentence a real machine of that size really
+/// says.
+pub fn a_refusal_for_the_memory_sum() -> String {
+    let host = herd_proto::HostSize::new(Some(8192), Some(8)).with_floor(Some(1024));
+    let ceiling = crate::confine::jobs_at_once(&host, 7168 << 20);
+    crate::NotTaken::PastItsMemorySum {
+        running: 1,
+        held_mib: 1870,
+        grant_mib: 6600,
+        admissible_mib: 7168,
+    }
+    .sentence(&ceiling)
+}

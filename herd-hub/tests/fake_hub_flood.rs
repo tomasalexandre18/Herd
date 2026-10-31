@@ -249,6 +249,7 @@ async fn assign(socket: &mut Socket, how_many: usize) {
             timeout_s: Some(TIMEOUT_SECONDS),
             packs_in: Vec::new(),
             packs_out: std::collections::BTreeMap::new(),
+            need: None,
         };
         socket
             .send(Message::text(to_frame(&frame).expect("encodes")))

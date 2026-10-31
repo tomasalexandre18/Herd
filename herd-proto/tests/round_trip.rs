@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
     Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, Declaration, Executor,
-    FactReason, FromHub, HostSize, JobId, JobMetrics, JobOutcome, LabelSet, LogStream,
+    FactReason, FromHub, HostSize, JobId, JobMetrics, JobNeed, JobOutcome, LabelSet, LogStream,
     OfferedCapability, Pressure, Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch,
     SwitchPersistence, ToHub, PROTOCOL_VERSION,
 };
@@ -475,6 +475,7 @@ fn every_message_from_the_hub_round_trips() {
         timeout_s: None,
         packs_in: Vec::new(),
         packs_out: std::collections::BTreeMap::new(),
+        need: None,
     });
     // The same assignment for a declared command: the four hooks, the commit,
     // the arguments and the cap the declaration asked for (E-11, D108).
@@ -486,6 +487,7 @@ fn every_message_from_the_hub_round_trips() {
         timeout_s: Some(7200),
         packs_in: Vec::new(),
         packs_out: std::collections::BTreeMap::new(),
+        need: None,
     });
     for step in every_step() {
         round_trip_to_hub(ToHub::StepFinished {
@@ -1982,6 +1984,7 @@ fn the_pack_fields_are_absent_when_silent_and_decode_when_they_were_never_there(
         timeout_s: None,
         packs_in: Vec::new(),
         packs_out: BTreeMap::new(),
+        need: None,
     })
     .expect("encodes");
     assert!(
@@ -2185,6 +2188,7 @@ fn the_pack_fields_carry_what_they_are_given() {
         timeout_s: None,
         packs_in: Vec::new(),
         packs_out: leaves,
+        need: None,
     };
     let wire = to_frame(&assignment).expect("encodes");
     assert_eq!(from_frame::<FromHub>(&wire).expect("decodes"), assignment);
@@ -2266,5 +2270,115 @@ fn an_end_nobody_asked_about_is_absent_from_the_wire_and_decodes_as_not_asked() 
     assert!(
         !announce_end,
         "no field is no asking, never an asking nobody made"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The figure an assignment now carries, and why it moved no version
+// ---------------------------------------------------------------------------
+
+/// What the hub costed a job at reaches the runner, is **absent** when there
+/// is nothing to say, and is **ignored** by a runner built before it existed.
+///
+/// All three halves, because this is the field invariant 2 now depends on and
+/// each half is a different promise. The figure has to be on the wire to be
+/// worth anything. Absent has to stay absent, or a `herdctl submit -- true`
+/// would start carrying `"need":null` and the byte-pinned frames above would
+/// stop being true. And an older runner has to go on working: the first
+/// consumer migrated to v1.0.0 and must be able to move its hub without
+/// moving every runner in the same hour, which is only true if serde drops
+/// the key it has no field for.
+///
+/// The precedent, asserted the same way a few tests above, is `Hello`'s
+/// `jobs_at_once`. The reasoning is `PROTOCOL_VERSION`'s own doc comment: *a
+/// new `#[serde(default)]` field on an existing variant, when its absence
+/// means exactly what its default says* is the first of the three shapes it
+/// lists as additive (D124, D128). Absence here means "this job was costed at
+/// nothing", which is what a runner that has never heard of the field already
+/// does: it uses `--job-memory-max`.
+#[test]
+fn what_a_job_was_costed_at_rides_the_assignment_and_an_older_runner_ignores_it() {
+    let costed = FromHub::AssignJob {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        command: vec!["true".to_owned()],
+        declaration: None,
+        timeout_s: None,
+        packs_in: Vec::new(),
+        packs_out: BTreeMap::new(),
+        need: Some(JobNeed {
+            memory_mib: 4096,
+            tmpfs_mib: 4096,
+        }),
+    };
+    let wire = to_frame(&costed).expect("encodes");
+    assert!(
+        wire.contains(r#""memory_mib":4096"#) && wire.contains(r#""tmpfs_mib":4096"#),
+        "both figures have to be on the wire: the runner writes one kernel ceiling out of \
+         the two of them: {wire}"
+    );
+    assert_eq!(
+        from_frame::<FromHub>(&wire).expect("decodes"),
+        costed,
+        "and they have to come back as they went"
+    );
+
+    // ---- Absent when the hub costed the job at nothing, which is a real
+    // class of job and not a gap: `herdctl submit -- true`.
+    let uncosted = to_frame(&FromHub::AssignJob {
+        job_id: JobId::new("j2"),
+        attempt: 1,
+        command: vec!["true".to_owned()],
+        declaration: None,
+        timeout_s: None,
+        packs_in: Vec::new(),
+        packs_out: BTreeMap::new(),
+        need: None,
+    })
+    .expect("encodes");
+    assert!(
+        !uncosted.contains("need") && !uncosted.contains("memory_mib"),
+        "a job nobody costed says nothing about a figure, rather than saying null or nought: \
+         {uncosted}"
+    );
+
+    // ---- Today's hub → a runner compiled before the field.
+    //
+    /// The assignment an older runner compiled against: every field it knew
+    /// and not the one it did not. Serde ignores a key it has no field for,
+    /// which is the whole of why this change is additive — and the assertion
+    /// above, that `memory_mib` really is in `wire`, is what stops this from
+    /// being a test that would pass against an empty frame.
+    #[derive(serde::Deserialize)]
+    struct AssignmentAsAnOlderRunnerReadsIt {
+        job_id: JobId,
+        attempt: u32,
+        command: Vec<String>,
+        #[serde(default)]
+        declaration: Option<Declaration>,
+        #[serde(default)]
+        timeout_s: Option<u64>,
+    }
+    let older: AssignmentAsAnOlderRunnerReadsIt = serde_json::from_str(&wire)
+        .expect("a runner built before this field reads an assignment that carries it");
+    assert_eq!(older.job_id, JobId::new("j1"));
+    assert_eq!(older.attempt, 1);
+    assert_eq!(older.command, vec!["true".to_owned()]);
+    assert_eq!(older.declaration, None);
+    assert_eq!(older.timeout_s, None);
+
+    // ---- And a hub built before the field → today's runner: no key means
+    // "costed at nothing", which is the ceiling that runner was already
+    // using.
+    let before = r#"{"type":"assign_job","job_id":"j3","attempt":1,"command":["true"]}"#;
+    let FromHub::AssignJob { need, .. } =
+        from_frame::<FromHub>(before).expect("an older assignment decodes")
+    else {
+        panic!("that is an assignment");
+    };
+    assert_eq!(
+        need, None,
+        "an older hub's assignment has to decode, and its silence has to mean what it has \
+         always meant"
     );
 }
