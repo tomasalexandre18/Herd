@@ -110,6 +110,29 @@ herd/build/shmem-charge`). Its verbatim verdict, its job id and its
 receipt path are in the agent's report, not in this file: a second
 commit to carry them would need a third gate run.
 
+**The amendment after that green run is prose only, and the Rust gates
+were NOT re-run.** It corrects finding 10, which was false, and extends
+one board row; `git diff --name-only` against the gated tree lists
+`docs/` and nothing else — no `.rs`, no script, no manifest. So the four
+Rust gates cannot be affected by it: the gated sha `eb09e0a` already
+carries the identical `herd-runner/tests/confinement.rs` and
+`scripts/expected-skips/local.txt`, green at steps 0-8. What was re-run
+is what the change can break:
+
+```
+docs ok
+check-orchestration: 324 passed, 0 failed
+```
+
+Worth recording, because it nearly cost a wrong conclusion: the first
+attempt at that board row put two literal `|` characters inside a
+markdown cell, which silently turned a 10-field row into 12, and the
+over-long line it introduced made **14** of `check-orchestration`'s own
+fixture assertions fail at once — every one of them downstream of a
+single 81-column line, because that script runs `check-docs.sh` against
+a copy of this tree. A count of failures pointed nowhere; the one line
+did.
+
 **Skips:** this host has no delegated cgroup v2, so the new assertion
 **joins the standing family and is printed as skipped, never as passed**
 (D27, invariant 5). The list goes from twelve names to **thirteen**:
@@ -190,14 +213,41 @@ bench's own line read `8.15>8`. Neither is this task's.
    `docs/orchestration/gotchas/a-delegated-scope-blinds-the-preflight.md`
    requires; both probe and recipe carry it.
 
-10. **`./scripts/bench-preflight.sh` exits 0 even when it prints
-    `REFUSED, do not start the heavy phase.`** Measured three times on
-    2026-10-31: refused on load 14.27, 10.22 and 11.97, exit code `0`
-    each time. The brief calls it "a gate, not advice", and it is one by
-    its words only — an agent or a script that tested `$?` would sail
-    straight through a refusal. This task read the verdict line instead
-    and waited until it said `ok, safe to start.` **Nothing was set or
-    exported**, `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` least of all.
+10. **`./scripts/bench-preflight.sh` is a working gate: it exits `1` on
+    REFUSED. The danger is in the caller, not the script.** This entry
+    said the opposite until it was corrected on 2026-10-31, and the
+    correction is kept here with its cause because the true version is
+    worth more than silence.
+    - **The script.** `scripts/bench-preflight.sh:395`-`:396` is
+      `printf 'bench-preflight: REFUSED, do not start the heavy
+      phase.\n' >&2` then `exit 1`. Measured directly, output to files
+      and the status read on its own: `DIRECT EXIT=1` at load 13.40,
+      with the refusal on stderr.
+    - **The trap.** `$?` after a pipeline is the **last** command's
+      status, so a caller that pipes the preflight reads `tail`'s `0`
+      and sails straight through the refusal. Measured at the same
+      instant as the line above: `PIPE EXIT=0`. Proved on a known-bad
+      fixture too — `sh -c 'exit 1' | tail -1` gives `0`, and
+      `set -o pipefail` gives `1`.
+    - **How the false version was reached**, since the method is the
+      lesson: the three refusals read at loads 14.27, 10.22 and 11.97
+      were all taken through `| tail` or `| grep`, so the script's own
+      status was never read; and the one *direct* reading that returned
+      `0` was taken at an instant when the load had already fallen to
+      about 5 and the script was **clearing**, not refusing. A true
+      observation — exit `0` — was carried under a false qualifier,
+      *"even when it prints REFUSED"*. The verdict and the status have
+      to be read from **one** invocation, which is what the two
+      measurements above do.
+    - **The script must not be changed.** It is correct, and rewriting
+      a working guard on a bad measurement is how a safety mechanism
+      gets broken. What is owed is a line for callers, and the row
+      for it already exists: **ORCH-229** — this is its fourth
+      instance, and the first by a pipeline.
+
+    This task never set or exported
+    `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB`, and waited for
+    `ok, safe to start.` before each heavy phase.
 
 ## Drafted for `herd-merger`
 
@@ -276,12 +326,21 @@ more (ORCH-312).
 
 ### The `board.md` rows, in full
 
-Both were added to `docs/orchestration/board.md` on this branch, under
-*Owed*, after `ORCH-311`. Their text is there verbatim; `ORCH-312` is
-the per-job ceiling design with this measurement as its input, and
-`ORCH-313` is the two counted sentences in `docs/status.md` and
-`docs/coverage.md` that this brief fenced and that are each now false by
-one number.
+Two rows were **added** to `docs/orchestration/board.md` on this branch,
+under *Owed*, after `ORCH-311`, and one existing row was **extended**.
+All three are in the file verbatim, which is what the merger reads.
+
+- `ORCH-312` — the per-job ceiling design, with this measurement as its
+  input.
+- `ORCH-313` — the two counted sentences in `docs/status.md` and
+  `docs/coverage.md` that this brief fenced and that are each now false
+  by one number.
+- `ORCH-229`, **extended, not duplicated** — the existing row about
+  callers that do not act on the preflight's exit status. This task is
+  its fourth instance and the first by a pipeline, and the first in
+  which the misreading was reported as a defect of the script. No
+  `ORCH-314` was opened: the board is one list, and a second row on the
+  same class would fragment it.
 
 ## Decisions needed
 
