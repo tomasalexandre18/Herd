@@ -64,8 +64,8 @@ says which path it took (**D223**, **D240**).
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**);
 a `--help` figure, an `EBUSY` and a controller are each read, never guessed
-(**D245**, **D259**, **D265**); **skips per host** (D27): **12** runtime,
-**14** loaded, **38** ignored, the twelve needing a delegated scope with its
+(**D245**, **D259**, **D265**); **skips per host** (D27): **13** runtime,
+**15** loaded, **38** ignored, the thirteen needing a delegated scope with its
 own `MemoryMax` (**D260**). **Three are narrower than their names:** the stop
 is **0.212 s**, idle only (**D264**), `bytes_written` is a workspace's
 apparent size, sampled (**D263**), and **a green suite proves less than its

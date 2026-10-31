@@ -760,8 +760,14 @@ through one filter, `out_there`, because two copies of that test would be
 two answers to one question.
 
 Admission weighs what jobs **declared**, never what they use: a job
-admitted a second ago has allocated nothing, and M4's kernel cap is what
-makes the declaration the honest unit (D87).
+admitted a second ago has allocated nothing (D87). The runner's kernel
+cap does not enforce that declaration. `herd-runner/src/cgroup.rs:660`,
+the only `memory.max` write in the product, writes one runner-wide
+`--job-memory-max` into every job's cgroup, identically for every job,
+and no frame carries the declared need to the runner at all:
+`FromHub::AssignJob` has no requirements field. The cap bounds what a
+job is **permitted**; the declaration is what the hub reserves against
+and places on (D88); the two are not the same figure.
 
 ```mermaid
 flowchart TB

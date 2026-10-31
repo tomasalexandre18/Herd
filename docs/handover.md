@@ -427,8 +427,13 @@ bounded.** Two changes, one decision inside them.
   Recommendation: the runner's own `--job-memory-max`, carried on
   `Hello` as a `#[serde(default)]` field of a runner-only frame (no
   protocol move under `architecture.md` §3.3's rule), because the cap a
-  job runs under is the only honest cost of a job that declares none,
-  and M4's kernel cap is what makes it true (D87). Absent the field — an
+  job runs under is the only honest cost of a job that declares none.
+  What makes that so is that the cap is runner-wide:
+  `herd-runner/src/cgroup.rs:660` writes the same `--job-memory-max`
+  into every job's cgroup, so it is the one memory figure the hub can
+  know applies to a job it cannot cost. It is **not** D87's honesty
+  claim, which reads the cap as enforcing the job's own declaration; no
+  frame carries that declaration to the runner. Absent the field — an
   older runner — the reservation is the hub's `--reading-memory` figure,
   printed at startup. The figure is the owner's to set.
 - `--readings-per-runner`, default **1**: a second reading waits, with

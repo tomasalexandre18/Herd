@@ -14653,3 +14653,295 @@ State cells rather than carried forward: 36 `merged`, 5 `part`, 1
 `planned`, 1 `waived`, 1 `withdrawn` = 44, over 55 rows. It agrees with
 what `deploy/release-notes/1.0.0.md:376` published. Had E-16 moved, the
 headline would read 37 and 4.
+
+## 2026-10-31 — D281 The kernel enforces the runner's cap, not the job's
+
+**Context.** D87 chose that admission costs what a job **declared** and
+never a measurement. That choice stands. Its warrant does not.
+`docs/decisions.md:1924`-`:1926` reads *"The declaration is honest
+because M4's cap already stops a job that exceeds it: a job over its
+figure is killed, not tolerated, so the figure is a ceiling the kernel
+enforces and not a guess."* That sentence is false, and it was the
+warrant copied into three other files.
+
+**What the code does.** `herd-runner/src/cgroup.rs:660` is the only
+`memory.max` write in the product. It writes `limits.memory_max` inside
+`JobCgroup::create` (`cgroup.rs:644`), and that `limits` is one
+`JobLimits` built once at startup from `--job-memory-max`:
+`main.rs:525`-`:530` → `confine.rs:180` `job_limits()` →
+`confine.rs:430` `Ceiling::detect` → `cgroup.rs:603` `open_for_job`,
+which hands the same `limits` to every job it opens. There is no per-job
+branch. **The kernel enforces the runner-wide cap, identically for every
+job, and never the job's declared figure.**
+
+**And it could not do otherwise today, because no frame carries that
+figure.** `FromHub::AssignJob` (`herd-proto/src/lib.rs:2375`) carries
+job id, attempt, command, `declaration`, `timeout_s`, `packs_in` and
+`packs_out`. `Declaration` (`herd-proto/src/declaration.rs:235`) is
+command + commit + args + executor. `Requirements`
+(`declaration.rs:516`), which holds `memory_mib`, is written onto the
+record and read by the hub's own matching; it never reaches the runner,
+and `requirements` appears nowhere in `herd-runner/src/`. The hub says
+so itself at `herd-hub/src/server.rs:1642`: *"the runner's arithmetic
+also uses the cap it puts on every job, which no frame carries"*.
+
+**Choice. The cap bounds what a job is *permitted*; the declaration is
+what the hub reserves against and places on. Two figures, and this
+project says so wherever it says either.** The phrasing is the runner's
+own, already in the tree at `herd-runner/src/confine.rs:203`-`:212`:
+*"one figure for every job and not a per-job negotiation"*, and *"the
+cap is what a job is permitted, not what it takes"*.
+
+**What the declaration is actually for — four uses, hub-side, none of
+them enforcement.** Admission arithmetic (`herd-hub/src/job.rs:1690`
+`memory_need_mib`; `matcher.rs:758`-`:834` the room check, `:1565` the
+reservation, `:1585`-`:1600` the *"admitted X, Y free of Z after it"*
+sentence); **placement** (D88 — a need larger than the machine has in
+all is "not here ever", so the figure decides whether a job waits or
+sticks); the job record and its explanations (E-15, E-36); and
+`status.rs`.
+
+**The consequence, plainly.** A job that honestly declares 1.7 GiB runs
+today with the runner-wide kernel ceiling and nothing else. So
+**nothing in Herd has ever measured whether real jobs stay inside their
+declarations**: the declared figure never reaches the only process that
+could compare it with what the job took. Admission's arithmetic is
+sound and its inputs are unaudited.
+
+**What this does not change.** D87's choice, untouched, and right for
+the reason D87 gives: a job admitted a second ago has allocated
+nothing, so a hub costing real usage admits a second job beside it and
+both then grow. D148 keeps D87's text where it is; this stands beside
+it.
+
+**Corrected in the same pass**, each as a reading of the code with the
+line that decides it: `docs/coverage.md:216` (E-29's note, **State cell
+unmoved**, tally re-derived at 36 / 5 / 0 / 1 / 2 = 44 over 55),
+`docs/architecture.md:762`-`:770`, and `docs/handover.md:425`-`:435`,
+where the recommendation survives and only its reason changes. Two
+`.rs` doc comments still carry the false warrant and were outside a
+prose-only task: `herd-hub/src/job.rs:880` and
+`herd-hub/src/matcher.rs:479`.
+
+**Why it went stale, and why this one cost more than a wrong sentence.**
+**D278**'s shape exactly — a sourced sentence false because the thing it
+cites moved. This is its clearest instance, because the sentence was the
+**warrant** for a design the consumer is now asking us to change. Three
+of the project's own texts already said the true thing
+(`herd-runner/src/confine.rs:203`, `docs/decisions.md:8923`,
+`docs/remediation/09-runner-self-limits.md:190`) and nobody had read
+them against D87. A claim about enforcement is worth checking against
+the line that writes the knob, and there is exactly one.
+
+## 2026-10-31 — D282 A requester sees what its job took, and rc 124 says
+which cap
+
+**Context.** Herd measured two things and showed the requester neither.
+`JobMetrics::peak_memory_bytes` has been read from the job cgroup's
+`memory.peak` since M4 and kept in every job's record, and `herdctl`
+printed it nowhere: a requester that wanted to know what its build held
+had to go and read the record. And `rc 124` is one code for all four
+caps by design, with the cap only in the outcome — so nobody could learn
+from the exit whether it was time, memory, log or disk. The first
+consumer hit the sharper half of that on 2026-10-30: it read a memory
+cap of `8589934592 bytes` against a job that had declared 1.7 GiB, and
+took the figure for its own declaration. It is not. There is exactly one
+`memory.max` write in the product and the number it writes is built once
+at the runner's start from `--job-memory-max`; a requester's
+`--memory-mib` is a placement requirement (E-29) and never a ceiling.
+
+**Choice.** Alexa, 2026-10-31, two decisions taken together. A requester
+must be able to see what its job actually took. And **`rc 124` stays one
+code for all four caps**, with the reason made legible instead of being
+split into per-cap codes. So `herdctl` says both in words, on stderr and
+in the verdict document's `said`: the peak, with its unit and the
+direction of its error, and which cap stopped the job at what figure
+with the job's id — the memory figure named as the runner's own ceiling
+for every job it accepts and not as the job's declaration. **No exit
+code moves and no protocol field moves**: `VERDICT_FORMAT_VERSION` stays
+1 and the figure was already in the document under `metrics`, so what
+was added is the reading and the sentence, not a second copy of the
+number.
+
+Three things the peak figure has to carry wherever it is read, because a
+figure quoted without them is a figure somebody tightens a declaration
+on. **Its direction of error**: `memory.peak` is a whole-job high-water
+mark over every executor step and counts page cache and shared memory,
+so it reads **high** — a peak above a declared figure is conclusive that
+the job over-ran it, a peak below it is conclusive that it did not, and
+a peak just above it is conclusive of neither. **Absent, never zero**
+(D23): a figure nobody could take prints *not measured* and carries no
+digit, because a small number is what the broken case looks like — about
+3.2 MB for a job that compiled an entire workspace (ORCH-268), measured
+again twice on 2026-10-31 by this change's own gate jobs. **And it goes
+out alone**: `FromHub::JobFinished` carries no requirement of the job,
+so the declaration a peak would have to be read against is not there,
+and the line says what it is instead of implying a comparison nobody
+made.
+
+**Alternative rejected.** Splitting 124 into four codes, one per cap.
+Refused: the four caps are one event — the machine said no, so the job
+has no verdict of its own — and a requester branching on four numbers
+would be branching on which resource ran out rather than on whether it
+has an answer at all, which is the distinction D20 exists to protect.
+Also rejected: adding a second copy of `peak_memory_bytes` as a field of
+its own on the verdict document, which is a frozen public format where
+two copies of one figure is a reader's ambiguity; and printing a zero or
+the largest figure the runner happened to see in place of an absence,
+which is ORCH-268's defect rather than a stopgap for it.
+
+## 2026-10-31 — D283 A job's tmpfs bytes are charged to its own
+memory ceiling, so E-29 and E-31 are not independent
+
+**Context.** Herd admits `memory_mib` (E-29) and `tmpfs_mib` (E-31)
+separately, as two independent quantities. Alexa decided per-job
+ceilings would follow **measurement**; this is one of the two
+measurements. Nothing in the tree covered it: `shm` and `tmpfs` matched
+no file in `herd-runner/tests/`.
+
+**Measured on 2026-10-31, on `servernixos`, three arms under one 64 MiB
+ceiling with `memory.swap.max = 0` — the runner's own job-cgroup shape
+(`herd-runner/src/cgroup.rs`). Same tool, same quantity, three kinds of
+memory:**
+
+| arm | 192 MiB of | cgroup `shmem` | `oom_kill` | `dd` | verdict |
+|---|---|---|---|---|---|
+| anonymous (known-bad fixture) | anon | 0 | 1 | 137 | killed |
+| **tmpfs, `/dev/shm`** | shmem | **62988288** | **1** | 137 | **killed** |
+| ext4 (negative control) | page cache | 0 | 0 | 0 | survived, all 192 MiB |
+
+**Decision: a tmpfs byte a job writes is charged to that job's own
+`memory.max`, and the two admitted quantities are not independent.** The
+deciding line is `shmem 62988288` read out of the writing cgroup's own
+`memory.stat`, with `memory.peak` at exactly the 67108864 ceiling and the
+file stopped at 62988288 of the 201326592 bytes asked for. The negative
+control is what makes it a result: it hit the same ceiling 170 times
+(`max 170`) and was never killed, because page cache is reclaimable
+while shmem under `swap.max = 0` is not. The difference is
+reclaimability, not size.
+
+**What follows for a per-job ceiling.** It must be a function of
+`memory_mib` **+ `tmpfs_mib`** + margin. A ceiling of `memory_mib +
+margin` would OOM-kill, on its first day, every job that reserves tmpfs
+and fills it.
+
+**Necessary and not sufficient.** The consumer's `leash-stick-update`
+declared 1792 MiB and reserved 2.5 GiB of tmpfs, and used 4.031 GiB anon
+and 3.930 GiB shmem — **2.30×** and **1.57×**. A ceiling correctly
+computed as `memory_mib + tmpfs_mib + margin` would still have killed
+it. Counting tmpfs is the formula's half; the declarations are the
+consumer's, and they know it.
+
+**Two proofs, not one twice.** The consumer's memcg OOM report for
+j0000000069 (`usage 8388608kB, limit 8388608kB … shmem 4219834368`,
+with the killed `qemu`'s own `shmem-rss` at **0** — the charge is at the
+cgroup, not the process) is on `/mnt/ssd_980/chatons/ram`, a mount
+**outside** Herd's `--host-tmpfs` path, so it proves the kernel's rule
+and not Herd's bookkeeping; they said so themselves. The arms above are
+on `DEFAULT_TMPFS_PATH`, the mount E-31 measures. Their figures are
+their report about their own machine (invariant 9, D161).
+
+**Written into the tree as a test, with a three-way verdict**:
+`a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling`
+(`herd-runner/tests/confinement.rs`) — *charged*, *not charged* (a named
+`panic!`), or *the premise did not hold*. Four ways the premise can fail
+each get a skip of their own rather than a pass: no tmpfs to write in; no
+delegated cgroup v2, where `RLIMIT_AS` bounds one process and a file
+write never trips it, so the job would survive for the wrong reason; a
+ceiling that does not kill the same quantity of anonymous memory, checked
+on every run as a known-bad fixture so that a surviving subject is only
+read once the detector has fired; and a job that never wrote a byte. This
+host has no delegation, so the assertion skips here and the expectation
+list goes from twelve names to **thirteen**.
+
+**Not decided here.** No admission arithmetic, cap or default moved, and
+which cgroup is charged when two cgroups share one tmpfs file was not
+measured — the arms show the *writer's* cgroup is charged, and nothing
+more (ORCH-312).
+
+## 2026-10-31 — D284 A kill is charged to the step it happened in, on
+the counter that settles first
+
+**The defect, from the first consumer's own records and kernel log.**
+Job j0000000069 reported `run` *"stopped at its memory cap of
+8589934592 bytes"* after 218 217 ms and `down` the **same sentence**
+after 5 097 ms, state `stopped_by_cap memory`. j0000000460 has the
+identical shape. Their kernel log holds **one** OOM event per job, at
+the very end of `run` — j69 at 04:54:44.391340, `run` ending
+04:54:44.395, `down` starting 04:54:44.397 — and **no kernel OOM line
+at all** during either `down`. One kill, two steps blamed.
+
+**It was not a baseline nobody advanced.** `herd-runner/src/job.rs`
+refreshed `since` once per executed step. The fault is in *when* a
+counter settles: `memory.events`' `oom_kill` counts **processes**, and
+with `memory.oom.group = 1` on the job cgroup one event takes the whole
+job tree while the kernel raises the counter once per task. The runner
+is woken by the first of those deaths, so its reading was taken about
+3.7 ms into a burst of about 4 ms over eight processes. It was partial,
+and the rest of the same kill became `down`'s delta.
+
+**Decided.** A step's out-of-memory verdict is read from
+`oom_group_kill` wherever the kernel publishes it (Linux 5.17 and
+later): that field counts **events**, one increment, raised before the
+first task is signalled, so it is settled by the time any death can be
+observed, and it is the counter that matches the flag this runner sets
+itself. Where the field is absent it is read as **absence, never as
+zero**, and the per-process counter is used.
+
+**And a second clause, which holds on every kernel.** A step that
+exited 0 is never said to have been capped: with `memory.oom.group = 1`
+a shell the kernel killed has no code to report at all. A **non-zero**
+code keeps its cap — a job whose own process was killed while its shell
+reported 137 *was* stopped by the ceiling. This also ends a compounding
+defect of the same path: a cap verdict was replacing a step's exit code
+with `None`, so a `down` that had done its work was recorded with no
+code and announced as *"the down step the runner stopped this job at its
+memory cap of 8589934592 bytes, so this job's workspace may be left on
+this host"* — a takedown failure that had not happened.
+
+**The baseline is a high-water mark.** An unreadable `memory.events`
+reads as zero, and a baseline one unreadable step had lowered would
+charge the next step with every kill the job ever had.
+
+**And the step says which step it was, in the job's own log.** The step
+whose verdict is a cap writes one line naming itself, its cap and the
+figure — and naming the figure for what it is: *"this runner's own
+ceiling, the figure it holds every job it takes to, and not a figure
+this job declared"*. The three attempt-wide caps are the runner's own,
+built once at startup from one runner-wide `--job-memory-max`
+(`herd-runner/src/cgroup.rs:707` is the only `memory.max` write in the
+product). Their job declared **1792 MiB** and the sentence said
+**8589934592 bytes**; the clause is there because that has been misread
+twice. The time cap keeps its own grammar, because its figure **is** the
+step's own (D108). A step's line no longer borrows
+`herd_proto::cap_exceeded_reason`, which is the **job's** sentence and
+stays exactly as it is for the attempt's outcome and the record.
+
+**With one exception, and the suite is what found it.** The log cap
+writes no such line. That cap is a promise about how many bytes reach
+the requester, a step it stopped has had its own bytes cut at exactly
+that figure, and a line about the cap is the bytes that break it —
+measured at 1220 against a 1 024 cap and 65733 against 65536, this
+line's own length both times. The log cap keeps saying what it is in the
+record and in the outcome, where it costs the requester's log nothing.
+Whether a runner's own lines belong inside the log cap at all is a
+separate question, now a board row.
+
+**What is not decided here.** No exit code moves: **rc 124 stays one
+code for all four caps** (Alexa, 2026-10-30), because the consumer's
+scripts are a live contract now that they run 1.0.0. No cap, default or
+admission figure moves. `herd-proto` is untouched. On a kernel with no
+`oom_group_kill` the second clause is the only guard and it needs the
+step to have exited 0, and **which of the two clauses carried
+j0000000069 is not known**: the field is 5.17-and-later and this project
+reads nothing of the consumer's machines (invariant 9, **D161**), while
+their `down`'s real exit code is unreadable from their record precisely
+because of the defect this entry closes. That residual is a board row,
+not a decision.
+
+**Evidence.** `herd-runner/src/job.rs` `OomWatermark`,
+`the_cap_that_stopped_this_step`; `herd-runner/src/cgroup.rs`
+`OomKills`, `oom_kills_in`; fifteen tests, of which
+`one_oom_kill_is_charged_to_one_step` replays the consumer's own two
+readings and asserts the **old** rule true on them in the same test;
+`history/2026-10-31-oom-step-attribution.md`.
