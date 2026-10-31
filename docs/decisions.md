@@ -15372,3 +15372,91 @@ and it is a row of its own rather than a second change in this one.
 Deliberately not in this decision: an event recorded where a short
 collection is given up on (a record-format addition, its own row and its
 own entry), and anything about the requeue storm.
+
+## 2026-10-31 — D292 A collection given up on says so on the record
+
+The hub's giving up on a streamed collection was said in three places and
+written down in none of them. It printed two lines on its own stdout, with
+real figures in them; it sent the requester two `JobNote`s; and the
+record's own manifest held every missing path with its length and digest
+against an emptier `files/` — so the loss was *derivable* and **nothing
+derived it**. No event, no counter, no reconciliation. Both durable
+witnesses were stdout, which is not a record, and the third was a client
+log.
+
+Measured on the first consumer's instance on 2026-10-31, v1.0.0: a job
+recorded `finished, exited 0` whose 17 output files and 42 MiB never
+arrived. D167 released the held verdict after `COLLECTION_SILENCE` naming
+every missing path, which is D167 working as specified; what no artefact
+of ours ever said is that it had happened. A nightly reading the record
+sees a green job. That gap — between a derivable loss and a derived one —
+is the difference between a green nightly and a silent 42 MiB.
+
+**So the derivation is performed once, where the hub gives up.**
+`say_the_collection_is_short` writes one `JobEventKind::CollectionShort`
+on the job's own history: files here of files owed, bytes here of bytes
+owed, the runner, and the same sentence the requester was given.
+`OutputsRemoved` is the model in shape, serde form and reasoning.
+
+**One event and not two.** Nothing is written where the verdict *starts*
+waiting. That is the ordinary path — every streamed collection is held
+while it crosses, almost all of them complete, and the crossing note is
+restated on the liveness cadence — so a line there would be written for
+the common case and made redundant by the next one. The give-up is rare,
+final, and the one fact a reader cannot otherwise recover.
+
+**Counts and not paths**, which is `OutputsRemoved`'s own ruling and for
+its reason: the paths are in `outputs.files` in the same job directory,
+with lengths and digests, and the 657-file collection D167 was measured
+on would have put 657 paths into one line of a file whose value is one
+greppable line per thing that happened. A reader joins two places; what
+the counts buy is knowing *whether* to join, which is the derivation that
+was missing.
+
+**Written once ever** per job, off the history itself rather than off a
+new record field, so this is one event kind and not two format changes.
+The give-up is reached when a verdict is first held and found hopeless,
+again from the held-verdict loop after `COLLECTION_SILENCE`, and again
+from every late `herdctl wait --outputs-to` on that job for ever after.
+A line per reader would be a history that grows with its readers.
+
+**`RECORD_VERSION` does not move, and this entry is where that is
+decided.** A bump is a compatibility statement needing Alexa's approval
+and an operator instruction, and what it costs is the operator's **whole
+state root**: every queued job and every uncollected verdict stops being
+readable to a rolled-back hub. The check it gates is on `job.json`, not on
+event lines. Against that, the line costs a rolled-back hub nothing in
+normal operation — `events.jsonl` has **no reader inside the product**;
+`herd-hub`, `herd-runner` and `herdctl` only ever append to it. The
+letter of `RECORD_VERSION`'s own rule speaks of `#[serde(default)]`
+*fields* and not of variants, and this is the first event kind added
+since that number reached 2, so the ruling is stated rather than assumed:
+**an event kind is additive because a line's absence has always meant the
+thing did not happen**, which is exactly true of every record written
+before today.
+
+What it does cost is named, not softened. `JobEventKind` is
+`#[serde(tag = "event")]` with **no `#[serde(other)]` arm**, so a reader
+that decodes lines into the older type fails on this one — and
+`JobStore::job_events` fails the *whole call* for that job, naming the
+line. There is no compatibility to preserve (the consumer resets at
+v1.0.0), so this is not a question for anyone; it is a thing to tell the
+first consumer, who parses `events.jsonl` themselves. Whether their
+parser ignores the kind or errors on it is a property of their parser.
+
+**It is the first event append with no record write beside it**, and D103
+binds every other one to the record write it accompanies. There is nothing
+here to bind it to, and that is the point rather than an omission: the
+line records a fact *about* a record that was already durable — the
+terminal state and the manifest were written long before the give-up — so
+no order between two writes is at stake. The D103 ordering oracle drives
+it as step 18, event-only, as it already drives the two log-gap appenders;
+it refused the appender until it was driven, which is the mechanism
+working on the day a writer was added.
+
+Hub only. No frame changed, no `PROTOCOL_VERSION` move, and `herdctl`'s
+verdict and its named absences are byte for byte what they were.
+
+Deliberately not in this decision: anything about the requeue storm or
+about the rate at which the hub re-offers a job, and the healthy-link
+rewind — each has its own row.

@@ -273,6 +273,16 @@ impl JobStore for TracingStore {
             self.inner.note_outputs_fetched(id)
         })
     }
+    fn note_collection_short(
+        &self,
+        id: &JobId,
+        got: &herd_hub::CollectionShortfall,
+        why: &str,
+    ) -> StoreResult<bool> {
+        self.around("note_collection_short", || {
+            self.inner.note_collection_short(id, got, why)
+        })
+    }
     fn sweep_outputs(&self) -> StoreResult<Sweep> {
         self.around("sweep_outputs", || self.inner.sweep_outputs())
     }

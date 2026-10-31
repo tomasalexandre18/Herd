@@ -71,7 +71,8 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::capability::RunnerCapacity;
 use crate::job::{
-    HowItEnded, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp,
+    CollectionShortfall, HowItEnded, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise,
+    Submission, Timestamp,
 };
 use crate::matcher::{self, Placement, Seat, Stickiness};
 use crate::notify::{Deliveries, Event, Notifier, Sink as EventSink};
@@ -7693,22 +7694,47 @@ enum TheCollection {
     /// gone, or nothing has landed for [`COLLECTION_SILENCE`]. Carries what
     /// is missing and why, because the requester is about to be told the job
     /// is over with a collection that is short.
-    StoppedShort(String),
+    ///
+    /// Carries the figures as well as the sentence, because this is the one
+    /// branch that is also written to the record (D167,
+    /// [`crate::job::JobEventKind::CollectionShort`]) — and a second read of
+    /// the disk to recover numbers this value already holds is how a note
+    /// and an event come to say two different things.
+    StoppedShort {
+        why: String,
+        got: CollectionShortfall,
+    },
 }
 
-/// How far a collection that is still crossing has got, in the figures a
-/// requester needs: files here of files promised, bytes here of bytes
-/// promised, and which machine is sending them.
-fn how_far_the_collection_got(record: &JobRecord, owed: &crate::job::CollectionOwed) -> String {
-    let promised: u64 = record.outputs.files.iter().map(|file| file.bytes).sum();
-    let here: u64 = owed.held.iter().map(|file| file.bytes).sum();
+/// How far a collection has got, in the figures a requester needs: files
+/// here of files promised, bytes here of bytes promised, and which machine
+/// is sending them.
+fn how_far_the_collection_got(
+    record: &JobRecord,
+    owed: &crate::job::CollectionOwed,
+) -> CollectionShortfall {
+    CollectionShortfall {
+        files_here: owed.held.len() as u64,
+        files_owed: record.outputs.files.len() as u64,
+        bytes_here: owed.held.iter().map(|file| file.bytes).sum(),
+        bytes_owed: record.outputs.files.iter().map(|file| file.bytes).sum(),
+        runner: owed.runner.clone(),
+    }
+}
+
+/// The same figures in the words a requester reads.
+///
+/// One wording for the note, the hub's own lines and the `why` the record
+/// keeps, so that the sentence the first consumer pasted to us is the
+/// sentence a reader of `events.jsonl` finds beside the numbers.
+fn how_far_it_got_in_words(got: &CollectionShortfall) -> String {
     format!(
         "{} of {} output file(s) and {} of {} have reached this hub from {}",
-        owed.held.len(),
-        record.outputs.files.len(),
-        herd_proto::show_bytes(here),
-        herd_proto::show_bytes(promised),
-        owed.runner,
+        got.files_here,
+        got.files_owed,
+        herd_proto::show_bytes(got.bytes_here),
+        herd_proto::show_bytes(got.bytes_owed),
+        got.runner,
     )
 }
 
@@ -7750,19 +7776,27 @@ fn where_the_collection_stands(
     // hour later on a collection whose runner never came back — at once,
     // rather than after half a minute of nothing.
     if state.outbox_of(&owed.runner).is_none() {
-        return TheCollection::StoppedShort(format!(
-            "{got}, and {} is not connected to this hub",
-            owed.runner
-        ));
+        return TheCollection::StoppedShort {
+            why: format!(
+                "{}, and {} is not connected to this hub",
+                how_far_it_got_in_words(&got),
+                owed.runner
+            ),
+            got,
+        };
     }
     // And the second: a runner that is here and sending nothing.
     if silent_for.is_some_and(|silent| silent >= state.policy.collection_silence) {
-        return TheCollection::StoppedShort(format!(
-            "{got}, and no byte of it has landed for {:?}",
-            state.policy.collection_silence
-        ));
+        return TheCollection::StoppedShort {
+            why: format!(
+                "{}, and no byte of it has landed for {:?}",
+                how_far_it_got_in_words(&got),
+                state.policy.collection_silence
+            ),
+            got,
+        };
     }
-    TheCollection::Crossing(got)
+    TheCollection::Crossing(how_far_it_got_in_words(&got))
 }
 
 /// Hand a job's verdict to everybody waiting for it, and stop following it.
@@ -7866,8 +7900,8 @@ fn tell_or_hold_the_verdict(
     }
     match where_the_collection_stands(state, job_id, None) {
         TheCollection::Whole => tell_them_how_it_ended(state, job_id, outcome, metrics),
-        TheCollection::StoppedShort(why) => {
-            say_the_collection_is_short(state, job_id, &why);
+        TheCollection::StoppedShort { why, got } => {
+            say_the_collection_is_short(state, job_id, &why, &got);
             tell_them_how_it_ended(state, job_id, outcome, metrics);
         }
         TheCollection::Crossing(got) => {
@@ -7907,7 +7941,32 @@ fn say_the_collection_is_crossing(state: &State, job_id: &JobId, got: &str) {
 /// off the manifest, and `herdctl` exits non-zero rather than 0 on a
 /// collection it was asked for and did not get. What must never happen is the
 /// third thing — a `wait` that hangs with nothing said (D167).
-fn say_the_collection_is_short(state: &State, job_id: &JobId, why: &str) {
+///
+/// **And it is written down, which is what was missing.** Everything else
+/// here is said to somebody who has to be listening: the line below goes to
+/// the hub's own stderr, which is not a record, and the note goes to a
+/// requester whose log the first consumer had already purged by the time
+/// they asked us what had happened. Their record said `finished, exited 0`
+/// against an empty `files/` and a seventeen-file manifest — the loss was
+/// *derivable* from it and nothing derived it. So the first thing this
+/// function does is put the derivation on the job's own history, once, where
+/// a reader finds it a week later beside the paths it is about
+/// ([`crate::job::JobEventKind::CollectionShort`]).
+fn say_the_collection_is_short(
+    state: &State,
+    job_id: &JobId,
+    why: &str,
+    got: &CollectionShortfall,
+) {
+    // A record that will not take the line is said out loud and does not
+    // stop the verdict: the requester is owed its answer either way, and the
+    // one outcome worse than a short collection is a wait with nothing said.
+    if let Err(error) = state.store.note_collection_short(job_id, got, why) {
+        eprintln!(
+            "herd-hub: {job_id}'s collection did not finish arriving and its record will \
+             not say so: {error}"
+        );
+    }
     eprintln!("herd-hub: {job_id}'s collection did not finish arriving: {why}");
     let note = format!(
         "this job's files did not all arrive: {why}. Its verdict follows now, and every \
@@ -7961,11 +8020,11 @@ fn look_at_a_held_verdict(
     }
     match where_the_collection_stands(state, job_id, Some(silent_for)) {
         TheCollection::Whole => the_collection_is_whole(state, job_id),
-        TheCollection::StoppedShort(why) => {
+        TheCollection::StoppedShort { why, got } => {
             let Some((outcome, metrics)) = state.take_the_held_verdict(job_id) else {
                 return;
             };
-            say_the_collection_is_short(state, job_id, &why);
+            say_the_collection_is_short(state, job_id, &why, &got);
             tell_them_how_it_ended(state, job_id, &outcome, &metrics);
         }
         // Restated on the liveness cadence and not on every tick, for the
@@ -9837,8 +9896,8 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId, wants_files: boo
                     say_the_collection_is_crossing(state, &job_id, &got);
                 }
                 stands => {
-                    if let TheCollection::StoppedShort(why) = &stands {
-                        say_the_collection_is_short(state, &job_id, why);
+                    if let TheCollection::StoppedShort { why, got } = &stands {
+                        say_the_collection_is_short(state, &job_id, why, got);
                     }
                     // And the files it left, off the same record. This is
                     // what makes the whole mechanism work for a requester
@@ -10602,6 +10661,14 @@ mod tests {
         }
         fn note_outputs_fetched(&self, id: &JobId) -> StoreResult<()> {
             self.inner.note_outputs_fetched(id)
+        }
+        fn note_collection_short(
+            &self,
+            id: &JobId,
+            got: &CollectionShortfall,
+            why: &str,
+        ) -> StoreResult<bool> {
+            self.inner.note_collection_short(id, got, why)
         }
         fn sweep_outputs(&self) -> StoreResult<crate::job::Sweep> {
             self.inner.sweep_outputs()

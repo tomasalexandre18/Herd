@@ -565,7 +565,22 @@ A waiting job is still `queued`: waiting is not being refused (D38), so
 the reason lives in `waiting_for` beside the state and is cleared the
 moment the job leaves the queue. `events.jsonl` keeps the history — one
 line per `Transition`, `AttemptStarted`, `AttemptEnded`, `LogGap`,
-`Joined`, `PriorityRaised`, `Waiting` and `OutputsRemoved`.
+`Joined`, `PriorityRaised`, `Waiting`, `OutputsRemoved` and
+`CollectionShort`.
+
+`CollectionShort` is the one of those that is written **once ever** per
+job rather than once per occurrence, and the reason is the shape of its
+trigger: the hub reaches the give-up when a verdict is first held and
+found hopeless, again from the held-verdict loop after
+`COLLECTION_SILENCE`, and again from every late `herdctl wait
+--outputs-to` on that job for ever after. It carries counts and not
+paths — files here of files owed, bytes here of bytes owed, the runner
+and the sentence — because the paths are in `outputs.files` in the same
+job directory, and the counts are what tells a reader whether that
+manifest is worth joining at all. That join is the derivation nothing
+performed before it existed: a record reading `finished, exited 0`
+against an empty `files/` and a seventeen-file manifest *was* a loss of
+17 files, and the only two durable witnesses were the hub's own stdout.
 
 ### 4.2 The two go-counts, which must never spend each other
 
