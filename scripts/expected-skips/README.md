@@ -25,6 +25,48 @@ than that. They are evidence, not prose.
 | `ci.txt` | what `ubuntu-latest` skipped on green run 40564336703, for comparison. The gate does not read it on this host; `HERD_GATE_EXPECTED` can point at it on a host shaped like that one. |
 
 
+## A total is not written down (ORCH-070, 2026-10-31, extending D187)
+
+**A skip or ignore total is not written down. Where prose needs to point
+at one, it names the file that holds the list. Where a figure is
+genuinely a measurement, it carries its host, its date and its run or
+sha, and is labelled as that run's measurement rather than as a current
+total.**
+
+Adopted after the absence of this rule cost three landings in a row.
+Batch 31 added one name to `local.txt` and silently falsified every
+sentence that had been carrying a total. Batch 33 corrected one of those
+sentences from *twelve* to *thirteen* in the very batch that was
+sweeping counts out of the prose, so the correction was true for a day.
+And `scripts/report-skips.sh` carried *"a runner that reports 15 skips
+when green"*, where the false part was the **qualifier**: that 15 came
+from run 40439537929, a red run that printed *"AT LEAST 15"* because it
+had not finished (D179), while CI's green list is `ci.txt`.
+
+D187 made the **gate** read the list and never the count. This is the
+same rule for **prose**, which no gate reads: a sentence with a total in
+it is a hand-maintained figure, the next name on a list falsifies it,
+and nothing goes red when that happens.
+
+The two halves, as this directory already practises them:
+
+- **Point at the file.** `local.txt`, `local-under-load.txt`,
+  `ignored.txt` and `ci.txt` hold the names. A reader who wants a number
+  counts the file they were sent to, and is then counting today's list
+  rather than the day the sentence was written.
+- **Label a measurement as one.** `local-under-load.txt`'s header keeps
+  its **14** because that is what one blessed run, on one named host, on
+  one date, with its sha, printed — and it says so in those terms, then
+  adds that what `local.txt` holds at rest *"is local.txt's business and
+  is not restated here"*. That is the worked example; copy its shape.
+
+Where it stops. `docs/status.md` is *state*, so a current total there is
+what that file is for, and `docs/coverage.md` carries headline figures by
+design; neither is swept by this rule. Nothing enforces it mechanically
+either — `check-docs.sh` cannot tell a total from any other number — so
+it is a rule for whoever writes the next sentence, and the sentence it
+replaces is usually shorter without the figure.
+
 ## Two kinds of skip, two lists, never merged (ORCH-202)
 
 An assertion can go unmade for two different reasons, and a reader who

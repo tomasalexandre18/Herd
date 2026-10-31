@@ -779,8 +779,29 @@ EOS
   rm -f "$tmp/gate-expected-load"
 }
 # gate_run <extra env...> -- <gate args...>
+#
+# The host's own load must not decide a case here, and until 2026-10-31 it
+# did. gate.sh reads /proc/loadavg unless HERD_GATE_LOADAVG points
+# elsewhere (its `loadavg=` seam, which exists so that "the host was busy"
+# is a case a test can run) and refuses outright above
+# HERD_GATE_LOAD_MAX, default 24. The `env -i` below rebuilds the child's
+# environment from a fixed list that did not carry that variable, so every
+# case which does not supply its own read the real host. Measured on this
+# host: 334 passed / 1 failed at load1 1.66, and 297 passed / 45 failed at
+# load1 24.45 with all 45 reading `gate: REFUSED ... above the ceiling
+# 24` -- a fact about the host, printed as a defect in the tree, on a
+# machine the consumer's production shares. So the default is a quiet
+# file, rewritten on every call because the stub suite above writes to
+# $HERD_GATE_LOADAVG when a case asks it to. The 15 of these 40 call sites
+# that drive the load cases still supply their own value: `env` applies
+# assignments left to right and "$@" comes last, so theirs wins. What is
+# NOT the fix: HERD_GATE_LOAD_MAX in the environment. Raising a gate's own
+# ceiling to get past it is the move workflow.md's *Failure* forbids,
+# wearing a different hat (ORCH-336).
 gate_run() {
+  printf '0.00 0.00 0.00 1/1 1\n' > "$tmp/gate-loadavg-quiet"
   env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+    HERD_GATE_LOADAVG="$tmp/gate-loadavg-quiet" \
     HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
     HERD_GATE_EXPECTED="$tmp/gate-expected" \
     HERD_GATE_EXPECTED_UNDER_LOAD="$tmp/gate-expected-load" \
@@ -2023,6 +2044,433 @@ if grep -qE '^[[:space:]]*exec[[:space:]]*<[[:space:]]*/dev/null' \
 else
   ok "pre-push keeps the stdin git hands it: the ref list is its input"
 fi
+
+echo "== a landing records its predecessor's post-push run (ORCH-333)"
+# The gap this closes. A landing cannot record its own `ci.yml` run: the
+# push that starts it comes after the tree is frozen, so the committed
+# record says "none yet -- this push starts it" and the NEXT landing is
+# the only place that run can be written down (templates/landing.md,
+# *The two copies are not identical*). Nothing mechanical held that
+# chain, and it broke: batch 33's merger found TWO runs owed rather than
+# one, because batch 32's record claimed batch 31's run was recorded in
+# `board.md` -- the sentence is still there, "Batch 31's own run is
+# recorded at this landing in `board.md`" -- and it was not. Three
+# prohibitions in this project are held by machinery; this one was held
+# by memory alone, which is the definition of a control that is not one.
+#
+# ONE LABELLED FIELD, and why the first shape of this check lasted one
+# landing (ORCH-335, 2026-10-31). That shape asked whether some
+# PARAGRAPH of the record mentioned the predecessor's batch alongside
+# eight digits and a verdict word. Applied to a document class whose
+# whole job is to discuss runs and verdicts, a co-occurrence search had
+# three false passes, and `herd-reviewer` measured each by extracting
+# this file's own awk and running it:
+#   - a markdown table. A table has no blank line and no bullet, so the
+#     whole table is ONE paragraph: a record laid out as
+#     `| batch 34 | -- | not read yet |` above
+#     `| batch 33 | 41228366473 | success |` was QUIET -- green on a
+#     record that says in so many words that the run was not read, which
+#     is the exact defect this check was built for;
+#   - `success` with no word boundary matches inside *successful*, and
+#     "any eight digits" matches a byte count. "Batch 34's landing was
+#     successful and its gate's peak was 22649270272 bytes" was QUIET
+#     with no run id anywhere in the record;
+#   - the record that discusses this check in prose. A record quoting a
+#     case name -- *an explicit "no ci.yml run" is a statement, not an
+#     omission* -- was QUIET, and that is the likely next record, not a
+#     contrived one.
+# A control that goes green on its own target does not merely fail to
+# help: it ends the vigilance that was holding the rule, which is how
+# batch 32 happened. So the oracle is now ONE FIELD, the construction
+# check-docs.sh already uses on these same records for **Batch:**,
+# **Gate:**, **Skips:** and **CI run:** -- anchored at the start of a
+# line, placeholder-refused and shape-checked:
+#
+#     - **Previous run:** batch 33 - ci.yml 41228366473 - success
+#
+# A table row cannot satisfy that, nor a byte count in the prose, nor
+# the word *successfully*, nor a sentence about this check. The
+# separator is cosmetic; what is read is the batch, the id and the
+# verdict. The field may wrap over as many lines as it needs and may
+# carry a nested sub-bullet under it -- the idiomatic "claim, then the
+# figure beneath it" was a false RED under the paragraph rule and is
+# accepted here. What ends the field is a line that is not indented, or
+# a blank line.
+#
+# The floor date. The field is required of landings dated on or after
+# $lr_from and of no record written before it. Batch 34's record was
+# written on 2026-10-31 under the paragraph rule and is not rewritable
+# once landed, and a check that reddens a record for not using a field
+# that did not exist when it was written is a retroactive rule.
+# check-docs.sh's `landing_from` has the same shape for the same reason
+# and has already been moved once. Until a landing is dated on or after
+# the floor, the real-tree case below prints a SKIP carrying that
+# reason, and a skip is not a pass (D27).
+#
+# What it CANNOT do, and nobody should read it as doing. This script has
+# no network and no toolchain. It cannot ask GitHub whether run
+# 41222040363 exists, whether its head sha is the one named, or whether
+# it passed -- and it never tries. A merger who invents both figures
+# passes this case. So it is a check that somebody WENT AND LOOKED AND
+# WROTE DOWN WHAT THEY SAW, not a verification that what they wrote is
+# true. The verdict's truth is a human's reading of `gh run view`, and
+# `workflow.md` (*What a landing is*) is where it stays. What the field
+# buys over the paragraph is not truth: it is that the claim cannot be
+# assembled out of two unrelated sentences, and cannot be made by
+# accident by a record that is merely discussing runs.
+#
+# Cost: one awk pass over one file per case and no check-docs.sh run, so
+# this section adds nothing to the 38 whole-corpus runs this file is
+# otherwise paid for.
+
+# One width for the run id, written once. check-docs.sh owns it, because
+# that is where the record's own **CI run:** field is already checked,
+# and this section reads the number out of that file rather than keeping
+# a second copy: the two gates asserted 6 digits there and 8 here for
+# the same figure (ORCH-335). Real ids are 11 digits (41228366473).
+lr_run_digits=$(sed -n 's/^run_digits=\([0-9][0-9]*\)$/\1/p' \
+  "$root/scripts/check-docs.sh" | head -1)
+case "$lr_run_digits" in
+  [1-9] | 1[0-9] | 20)
+    ok "landing: the run-id width is read from check-docs.sh ($lr_run_digits digits)" ;;
+  *)
+    bad "landing: the run-id width is read from check-docs.sh" \
+      "    scripts/check-docs.sh has no \`run_digits=<n>\` line to read, so the
+    two gates would go back to asserting two widths for one figure"
+    lr_run_digits=8 ;;
+esac
+
+# The first landing that must carry the field. See *The floor date*
+# above before moving it.
+lr_from=2026-11-01
+
+# lr_prev_run <dir> [floor]: prints nothing when the newest landing
+# record in <dir> carries its predecessor's run in the one labelled
+# field that may hold it; prints `skip: <reason>` when there is nothing
+# it can ask about; prints the complaint otherwise. Fewer than two
+# landing records is nothing to check -- the first landing has no
+# predecessor.
+lr_prev_run() {
+  lr_floor=${2:-$lr_from}
+  lr_list=""
+  for lr_f in "$1"/*-merge-*.md; do
+    [ -f "$lr_f" ] || continue
+    lr_b=${lr_f##*/}
+    lr_tag=${lr_b#*-merge-}
+    lr_list="$lr_list${lr_b%%-merge-*} ${lr_tag%.md} $lr_f
+"
+  done
+  # Date first, then the batch tag by version order, so that
+  # batch-26-regate sorts before batch-27 and batch-9 before batch-27.
+  lr_sorted=$(printf '%s' "$lr_list" | LC_ALL=C sort -k1,1 -k2,2V)
+  [ "$(printf '%s' "$lr_sorted" | grep -c .)" -ge 2 ] || return 0
+  lr_new=$(printf '%s\n' "$lr_sorted" | tail -1 | cut -d' ' -f3)
+  lr_newb=${lr_new##*/}
+  lr_prevtag=$(printf '%s\n' "$lr_sorted" | tail -2 | head -1 | cut -d' ' -f2)
+  lr_num=$(printf '%s' "$lr_prevtag" | tr -dc '0-9')
+  if [ "${lr_newb%%-merge-*}" \< "$lr_floor" ]; then
+    printf 'skip: %s predates the **Previous run:** field, required of landings dated %s or later\n' \
+      "$lr_newb" "$lr_floor"
+    return 0
+  fi
+  # 23 of the 58 landing records are not named `-merge-batch-<n>.md`:
+  # `-merge-83-84` would yield "batch 8384" and `-merge-c0` has no
+  # digits at all. Nothing enforces the name, and enforcing it here
+  # would redden a legitimate hotfix or release landing for its
+  # filename. So a predecessor that is not named for a batch is a
+  # printed skip carrying its reason (D27's shape) and never a failure:
+  # there is no batch number to ask about, and that is a fact about the
+  # name, not a defect in the record.
+  if [ -z "$lr_num" ]; then
+    printf 'skip: the previous landing (%s) is not named for a batch, so there is no batch number to ask for in %s\n' \
+      "$lr_prevtag" "$lr_newb"
+    return 0
+  fi
+  LC_ALL=C awk -v num="$lr_num" -v f="$lr_newb" -v d="$lr_run_digits" '
+    BEGIN {
+      n = d + 0
+      for (i = 0; i < n; i++) dg = dg "[0-9]"
+      # Not preceded by a digit or a letter, so a run id is a token and
+      # not the tail of a longer word.
+      id = "(^|[^0-9a-z])" dg
+      # GitHub own conclusions plus `failed`, each needing a boundary:
+      # `success` inside *successful* was one of the three false passes.
+      vb = "(^|[^a-z])(success|failure|failed|cancelled|canceled|timed[ _-]out|skipped|neutral|stale|action_required)([^a-z]|$)"
+    }
+    function close_field() {
+      if (fld == "") return
+      nfld++
+      if (fld ~ ("batch[ _.-]*" num "([^0-9]|$)")) {
+        named = 1
+        if (fld ~ /</) hollow = "it still holds a <placeholder>"
+        else if (fld ~ /no ci\.yml run/) ok = 1
+        else if (fld !~ /ci\.yml/) hollow = "it does not name ci.yml"
+        else if (fld !~ id) hollow = "it carries no run id of " d "+ digits"
+        else if (fld !~ vb) hollow = "it carries no verdict word for that run"
+        else ok = 1
+      }
+      fld = ""
+    }
+    /^[-*][[:space:]]+\*\*Previous run:\*\*/ { close_field(); fld = tolower($0); next }
+    fld != "" && /^[[:space:]][[:space:]]+[^[:space:]]/ { fld = fld " " tolower($0); next }
+    { close_field() }
+    END {
+      close_field()
+      if (nfld > 1) {
+        printf "%s: %d \"- **Previous run:**\" fields, so no one of them is the record claim about batch %s\n", f, nfld, num
+        exit 0
+      }
+      if (ok) exit 0
+      if (nfld == 0)
+        printf "%s: no \"- **Previous run:**\" field names batch %s, whose post-push ci.yml run this is the only record that can carry (templates/landing.md, *CI run*)\n", f, num
+      else if (!named)
+        printf "%s: its \"- **Previous run:**\" field does not name batch %s, the landing before it\n", f, num
+      else
+        printf "%s: its \"- **Previous run:**\" field names batch %s, but %s\n", f, num, hollow
+    }
+  ' "$lr_new"
+}
+
+lr_case() { # <name> <dir> <quiet|fires|skips> [floor]
+  lr_out=$(lr_prev_run "$2" "${4:-$lr_from}")
+  if [ "$3" = skips ]; then
+    case "$lr_out" in
+      "skip: "*) ok "$1" ;;
+      *) bad "$1" "    wanted a printed skip with its reason, got:
+$(printf '%s\n' "${lr_out:-nothing at all}" | sed 's/^/    /')" ;;
+    esac
+    return
+  fi
+  case "$lr_out" in
+    "skip: "*) skipped "$1" "${lr_out#skip: }"; return ;;
+  esac
+  if [ "$3" = quiet ]; then
+    if [ -z "$lr_out" ]; then ok "$1"
+    else bad "$1" "$(printf '%s\n' "$lr_out" | sed 's/^/    /')"; fi
+  else
+    if [ -n "$lr_out" ]; then ok "$1"
+    else bad "$1" "    the detector said nothing, so its silence proves nothing"; fi
+  fi
+}
+
+# Synthetic landings, two names and nothing else, the way the collation
+# probe above is synthetic: the shapes are what is under test, and a
+# fixture built out of the real list would make this case move whenever
+# the real list does. Dated after $lr_from so that every case below
+# exercises the live configuration and not the floor.
+lr=$tmp/landings
+lr_fixture() { # <dir> <content of the newest record's CI run section>
+  mkdir -p "$1"
+  printf '## CI run\n\nnothing\n' > "$1/2026-11-10-merge-batch-41.md"
+  printf '## CI run\n\n%b\n' "$2" > "$1/2026-11-11-merge-batch-42.md"
+}
+lr_fixture "$lr/good" \
+  '- **Previous run:** batch 41 · `ci.yml` 99887766554 · success'
+lr_case "landing: the field with the predecessor's run id and verdict is enough" \
+  "$lr/good" quiet
+# The shape the retired oracle accepted, and the reason this change is a
+# strengthening rather than a loosening: an id and a verdict beside the
+# batch number in ordinary prose, with no field, is now refused. Every
+# input the old shape refused is still refused; this is one it passed.
+lr_fixture "$lr/paragraph" \
+  'batch 41  ci.yml 99887766554  main 0ac1dd2  success  7m12s'
+lr_case "landing: the run in a paragraph, with no field, is no longer enough" \
+  "$lr/paragraph" fires
+lr_fixture "$lr/silent" \
+  'None yet -- this push starts it.'
+lr_case "landing: a record that never names its predecessor is refused" \
+  "$lr/silent" fires
+lr_fixture "$lr/claimed" \
+  "Batch 41's own run is recorded at this landing in \x60board.md\x60."
+lr_case "landing: naming the predecessor in prose with no field is refused" \
+  "$lr/claimed" fires
+lr_fixture "$lr/noid" \
+  '- **Previous run:** batch 41 · recorded in the board · success'
+lr_case "landing: the field with no run id in it is refused" \
+  "$lr/noid" fires
+lr_fixture "$lr/noverdict" \
+  '- **Previous run:** batch 41 · `ci.yml` 99887766554 -- recorded, not waited on'
+lr_case "landing: a run id with no verdict for it is refused" \
+  "$lr/noverdict" fires
+lr_fixture "$lr/ownrun" \
+  '- **Previous run:** batch 42 · `ci.yml` 99887766554 · success
+
+Batch 41 landed the day before, and its own run is not named here.'
+lr_case "landing: a run id for its OWN run does not answer for the previous one" \
+  "$lr/ownrun" fires
+lr_fixture "$lr/placeholder" \
+  '- **Previous run:** batch 41 · `ci.yml` <id> · <verdict>'
+lr_case "landing: the field left on the template placeholder is refused" \
+  "$lr/placeholder" fires
+# The wrapped form, which is how batches 29 to 31 wrote the figure:
+# three lines of one bullet, the figure split across them.
+lr_fixture "$lr/wrapped" \
+  "- **Previous run:** batch 41's own run, \x60ci.yml\x60 **99887766554**,
+  read back by id with \x60gh run view\x60 and \x60completed\x60/\x60success\x60 --
+  not waited on at the time, read at the next session start."
+lr_case "landing: the field wrapped across three lines is accepted" \
+  "$lr/wrapped" quiet
+# And the nested sub-bullet, which the paragraph rule refused: the claim
+# on the field line, the figure beneath it.
+lr_fixture "$lr/nested" \
+  "- **Previous run:** batch 41's own run
+  - \x60ci.yml\x60 99887766554 on \x60main\x60, concluded \x60success\x60"
+lr_case "landing: a nested sub-bullet under the field is part of it" \
+  "$lr/nested" quiet
+# And the bound on both: a different bullet does not answer for it.
+lr_fixture "$lr/otherbullet" \
+  "- Batch 41's own run is recorded in \x60board.md\x60 at this landing.
+- An unrelated bullet: \x60ci.yml\x60 **99887766554**, \x60success\x60."
+lr_case "landing: a run id in a different bullet does not answer for it" \
+  "$lr/otherbullet" fires
+lr_fixture "$lr/twofields" \
+  '- **Previous run:** batch 41 · `ci.yml` 99887766554 · success
+- **Previous run:** batch 41 · not read yet'
+lr_case "landing: two **Previous run:** fields are refused, not resolved" \
+  "$lr/twofields" fires
+lr_fixture "$lr/noran" \
+  '- **Previous run:** batch 41 · no ci.yml run -- the push did not start one'
+lr_case "landing: an explicit \"no ci.yml run\" is a statement, not an omission" \
+  "$lr/noran" quiet
+# The three shapes the retired oracle passed, each now a case rather
+# than a line in a review. Measured QUIET under the paragraph rule.
+lr_fixture "$lr/table" \
+  '| landing | run | verdict |
+| --- | --- | --- |
+| batch 42 | -- | not read yet |
+| batch 41 | 99887766554 | success |'
+lr_case "landing: a table whose predecessor row says it was not read is refused" \
+  "$lr/table" fires
+lr_fixture "$lr/successful" \
+  "- **CI run:** none yet -- this push starts it.
+
+Batch 41's landing was successful and its gate's peak was
+22649270272 bytes over 480 s, measured on the merged tree."
+lr_case "landing: \"successful\" and a byte count are not a run id and a verdict" \
+  "$lr/successful" fires
+lr_fixture "$lr/quoting" \
+  '- **CI run:** none yet -- this push starts it.
+
+The guard landed at batch 41: its case *landing: an explicit
+"no ci.yml run" is a statement, not an omission* is the one that
+accepts a push that started none.'
+lr_case "landing: a record that merely quotes this case is refused" \
+  "$lr/quoting" fires
+# A fenced block is not the field. Batch 33 wrote both owed runs inside
+# a ```text fence, which is the most faithful provenance there is -- and
+# it is now the handoff's verbatim evidence, not the record's claim.
+# templates/landing.md says so in writing: the field is a bullet.
+lr_fixture "$lr/fenced" \
+  "The predecessor's run, read back by id:
+
+\x60\x60\x60text
+batch 41  ci.yml 99887766554  main 0ac1dd2  success  9m04s
+\x60\x60\x60
+
+Read back with \x60gh run view\x60, head sha and conclusion checked."
+lr_case "landing: a fenced block is evidence, not the labelled field" \
+  "$lr/fenced" fires
+mkdir -p "$lr/first" && printf '## CI run\n\nnothing\n' \
+  > "$lr/first/2026-11-11-merge-batch-42.md"
+lr_case "landing: the first landing has no predecessor and is not refused" \
+  "$lr/first" quiet
+# The floor, both sides of it. A record written before the field existed
+# is skipped with its reason; a record dated ON the floor is checked.
+mkdir -p "$lr/before" \
+  && printf '## CI run\n\nnothing\n' > "$lr/before/2026-10-30-merge-batch-41.md" \
+  && printf '## CI run\n\nnothing\n' > "$lr/before/2026-10-31-merge-batch-42.md"
+lr_case "landing: a record predating the field is skipped, not refused" \
+  "$lr/before" skips
+mkdir -p "$lr/onfloor" \
+  && printf '## CI run\n\nnothing\n' > "$lr/onfloor/2026-10-31-merge-batch-41.md" \
+  && printf '## CI run\n\nnothing\n' > "$lr/onfloor/2026-11-01-merge-batch-42.md"
+lr_case "landing: a record dated on the floor itself is checked" \
+  "$lr/onfloor" fires
+# A predecessor not named for a batch: a skip with its reason, never a
+# failure for a filename.
+mkdir -p "$lr/unnamed" \
+  && printf '## CI run\n\nnothing\n' > "$lr/unnamed/2026-11-10-merge-method.md" \
+  && printf '## CI run\n\nnothing\n' > "$lr/unnamed/2026-11-11-merge-batch-42.md"
+lr_case "landing: a predecessor not named for a batch is skipped, not refused" \
+  "$lr/unnamed" skips
+
+# And the known-bad input that is not synthetic: the record that broke
+# the chain. Pinned to the two files actually under test, batch 31 and
+# batch 32, and never "every record with batch 33 removed" -- which is
+# what this case did until 2026-10-31 and which went quiet the moment a
+# batch-34 record existed: the newest remaining was then batch 34, the
+# detector was asked about batch 32 rather than batch 31, and the case
+# failed with `nothing at all` for a reason that had nothing to do with
+# any record. The rule it broke is the one stated above lr_fixture, and
+# the code here has to keep that comment true.
+lr_r32=$lr/real32
+mkdir -p "$lr_r32"
+cp "$root"/docs/orchestration/history/*-merge-batch-31.md \
+   "$root"/docs/orchestration/history/*-merge-batch-32.md "$lr_r32/" 2>/dev/null
+# This file runs `set -uo pipefail` and not `-e`. A glob that stopped
+# matching would leave a one-record fixture, lr_prev_run would return
+# early on "fewer than two", and the case below would report `nothing at
+# all` -- the same uninformative message this pinning exists to retire.
+# So count first, and name what is there when the count is wrong.
+lr_n=$(ls -1 "$lr_r32" | grep -c .)
+if [ "$lr_n" = 2 ]; then
+  ok "landing: the known-bad fixture holds exactly the two records under test"
+else
+  bad "landing: the known-bad fixture holds exactly the two records under test" \
+    "    wanted the batch-31 and batch-32 records, got $lr_n file(s):
+$(ls -1 "$lr_r32" | sed 's/^/      /')"
+fi
+# The floor is overridden here, and only here: these two records predate
+# the field, so under the live floor this case could only ever skip --
+# and a detector never shown firing on its own target is not a detector.
+lr_out=$(lr_prev_run "$lr_r32" 2026-10-01)
+case "$lr_out" in
+  *"names batch 31"*)
+    ok "landing: fires on the real record that broke the chain (batch 32)" ;;
+  *) bad "landing: it must fire on batch 32's record, for that reason" \
+       "$(printf '%s\n' "${lr_out:-nothing at all}" | sed 's/^/    /')" ;;
+esac
+# Drift, which convention alone does not close. `workflow.md` forbids
+# rewriting a landed record and `scripts/githooks/pre-push` refuses a
+# push that would -- but that hook protects `main`'s COMMIT history
+# (its ref-list loop), not a later edit to a record FILE, and 13 merge
+# records already have more than one commit touching them, one of them
+# nine. A prose sweep could turn the known-bad input above good, and the
+# cheapest route back to green would then be editing this fixture, which
+# *Failure* forbids. So the shape is frozen here verbatim and run as its
+# own case, and the fixture's faithfulness to the real record is a case
+# too: when they diverge, the failure says which of the two moved.
+lr_b32_claim="Batch 31's own run is recorded at this landing in \`board.md\`."
+lr_b32_real=$root/docs/orchestration/history/2026-10-31-merge-batch-32.md
+lr_why=""
+[ -f "$lr_b32_real" ] || lr_why="${lr_b32_real##*/} is no longer under history/"
+# Whitespace-normalised, because the sentence wraps mid-phrase in the
+# record ("... at this landing in" / "`board.md`.") and where it wraps is
+# not what is being frozen. This is the same view the detector takes of a
+# field that wraps: the lines joined, then read.
+if [ -z "$lr_why" ] &&
+   ! tr -s '[:space:]' ' ' < "$lr_b32_real" | grep -qF -- "$lr_b32_claim"; then
+  lr_why="the sentence frozen in this script is no longer in that record"
+fi
+if [ -z "$lr_why" ] &&
+   grep -qE -- '^[-*][[:space:]]+\*\*Previous run:\*\*' "$lr_b32_real"; then
+  lr_why="that record has acquired a **Previous run:** field, so it is no longer the known-bad input"
+fi
+if [ -z "$lr_why" ]; then
+  ok "landing: the frozen known-bad shape is still what batch 32's record says"
+else
+  bad "landing: the frozen known-bad shape is still what batch 32's record says" \
+    "    $lr_why"
+fi
+mkdir -p "$lr/frozen32"
+printf '## CI run\n\nnothing\n' > "$lr/frozen32/2026-11-10-merge-batch-31.md"
+printf '## CI run\n\n- **CI run:** none yet -- this push starts it. %s\n' \
+  "$lr_b32_claim" > "$lr/frozen32/2026-11-11-merge-batch-32.md"
+lr_case "landing: fires on the frozen shape, under the live floor" \
+  "$lr/frozen32" fires
+lr_case "landing: the real tree's newest landing record carries it" \
+  "$root/docs/orchestration/history" quiet
+rm -rf "${lr:?}"
 echo
 if [ "$skips" -eq 0 ]; then
   echo "check-orchestration: $pass passed, $fail failed"

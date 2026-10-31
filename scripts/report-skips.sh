@@ -17,13 +17,13 @@
 # This step runs with `if: always()`, so it also runs after a *red* suite —
 # and a red suite's output is not a complete list of skips. PR #86's failing
 # `check` job printed "nothing was skipped" from a run whose later test
-# binaries never started, on a runner that reports 15 skips when green. So
-# the output is first read for the marker scripts/test.sh prints last:
-# a plain `test suite: PASSED` means the whole suite finished and the list
-# below it is the whole list; anything else — `test suite: FAILED`, the
-# marker's narrowed form, or no marker at all because the job was cancelled
-# or never got that far — means the list is a floor at best. Then nothing is
-# claimed that was not observed (D27).
+# binaries never started, on a runner with a skip list of its own
+# (`scripts/expected-skips/ci.txt`). So the output is first read for the
+# marker scripts/test.sh prints last: a plain `test suite: PASSED` means the
+# whole suite finished and the list below it is the whole list; anything
+# else — `test suite: FAILED`, the marker's narrowed form, or no marker at
+# all because the job was cancelled or never got that far — means the list
+# is a floor at best. Then nothing is claimed that was not observed (D27).
 #
 # This script never fails the job: the suite's own step owns that verdict.
 
