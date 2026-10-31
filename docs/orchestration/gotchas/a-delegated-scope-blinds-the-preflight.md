@@ -1,7 +1,8 @@
 # A delegated user scope blinds the preflight's cgroup check
 
 - **Date:** 2026-10-30, measured while probing what it would take to make
-  the twelve cgroup-delegation assertions on this workstation.
+  this workstation's cgroup-delegation assertions —
+  `scripts/expected-skips/local.txt` names them.
 - **Observed:** inside an uncapped `systemd-run --user --scope -p
   Delegate=yes`, every level the preflight walks reads no ceiling.
   `user.slice`, `user-1002.slice`, `user@1002.service`, `app.slice` and
@@ -18,7 +19,7 @@
   outside `chatons.slice`, so it escapes the one ceiling that bounds
   everything else this project does on this host — and the check that
   would have noticed is the check the scope silenced. **The method that
-  unlocks twelve assertions disables check 4.** In the finder's words,
+  unlocks those assertions disables check 4.** In the finder's words,
   kept because the sentence is the lesson: *"on this host, 'nothing
   encloses me' now means 'I am in a user scope', not 'I am on a bare
   machine'."*
