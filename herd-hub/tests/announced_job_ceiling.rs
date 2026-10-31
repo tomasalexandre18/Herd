@@ -644,7 +644,9 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
 // The link that drops while the machine is full.
 // ---------------------------------------------------------------------------
 
-/// How long the link is down in the test that stays in this suite.
+/// How long the link is down in
+/// [`a_job_refused_past_the_bound_ends_and_names_it`], which is the only
+/// test left in this file that names a duration for it.
 ///
 /// Longer than [`LOST_AFTER_HERE`], because the whole sequence begins with
 /// the hub's watchdog firing. Alexa's condition names **60 s**, which is the
@@ -654,6 +656,11 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
 /// minute per run would be a suite nobody runs. The 60 s shape was run by
 /// hand once and its output is in the pull request; what is kept here is the
 /// mechanism, not the clock.
+///
+/// [`no_job_is_lost_to_an_outage`] used to take this figure too, and
+/// **waits for the watchdog instead** since ORCH-321: a duration long
+/// enough for the watchdog on a quiet host is not long enough on a busy
+/// one, and the hub says when it has given up.
 const THE_OUTAGE: Duration = Duration::from_secs(4);
 
 /// The hub's silence threshold for this test, and the cadence its runner
@@ -661,18 +668,6 @@ const THE_OUTAGE: Duration = Duration::from_secs(4);
 /// anything tighter is refused at the handshake, and rightly.
 const LOST_AFTER_HERE: Duration = Duration::from_secs(3);
 const HEALTH_EVERY_HERE: Duration = Duration::from_secs(1);
-
-/// How long each job runs. Long enough to still be running when the link
-/// comes back — which is the whole premise, since the defect is the runner
-/// holding jobs the hub has already written off — and short enough that the
-/// run is seconds.
-///
-/// Used by [`no_job_is_lost_to_an_outage`] alone, whose oracle is "no job
-/// dead, no job without a verdict" and reads the same whichever refusal the
-/// redial produces. The test that *does* depend on which refusal it was
-/// holds its jobs open instead and has no figure here to get wrong
-/// (ORCH-119).
-const SLEEP_ACROSS_THE_OUTAGE: u64 = 6;
 
 /// How long this one test may take. Its own figure rather than [`PATIENCE`]:
 /// an outage, a watchdog, a redial and a whole second go at every job do not
@@ -842,6 +837,22 @@ fn pump(from: std::sync::Arc<std::net::TcpStream>, to: std::sync::Arc<std::net::
 /// many attempts it cost — a job requeued by a watchdog has genuinely lost an
 /// attempt to a runner that went away, which is E-21 working — only that the
 /// work came back with an answer.
+///
+/// **Not one of those five steps is timed any more** (ORCH-321). Step 1 is
+/// waited for on the runner's own word, step 3 on the hub's, step 5 on the
+/// refusal appearing in the record, and the jobs of step 2 are held open and
+/// released when the test chooses. What the first version did instead was
+/// pick durations long enough for each step on a quiet host — a 4 s outage
+/// and 6 s jobs — and the two then had to outlast a watchdog, a redial and a
+/// dispatch pass whose length the host decides. Measured on the development
+/// workstation: green alone at a one-minute load of 16, and **red inside a
+/// full suite at 9.49**, where the originals' sleep ran out while the hub was
+/// still waiting on a starved runner to answer a second attempt — the hub
+/// then wrote that attempt off as gone from a machine that was plainly there,
+/// which spent the job's last go and ended it `lost`. The product had done
+/// nothing wrong and the test said it had. A test that waits for a state it
+/// can name cannot make that mistake; a test that waits for a number can.
+///
 /// A hub whose watchdog a test can outlast, a runner holding [`CEILING`],
 /// and a link between them the test can cut.
 ///
@@ -908,8 +919,6 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
         AnOutage {
             lost_after: LOST_AFTER_HERE,
             health_every: HEALTH_EVERY_HERE,
-            how_long: THE_OUTAGE,
-            job_sleep: SLEEP_ACROSS_THE_OUTAGE,
             patience: PATIENCE_ACROSS_AN_OUTAGE,
         },
     )
@@ -920,18 +929,21 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
 /// Alexa's condition of merge in its own words: a 60 s silence threshold and
 /// an outage longer than it.
 ///
-/// `#[ignore]`, and found by `cargo test -- --ignored`. **What it costs:**
-/// **171 s of wall clock, measured on this workstation**, nearly all of it
-/// waiting — a 65 s outage, a 60 s watchdog threshold, and jobs that have to
-/// still be running when the link comes back, so they sleep 90 s. It is not in
-/// the default suite because a suite with three minutes of sleep in it is a
-/// suite nobody runs, and because it proves nothing the test above does not:
-/// both drive the same watchdog, the same refusal and the same oracle, and
-/// the only difference is `--lost-after` (`herd_hub::LOST_AFTER`, a setting
-/// since the hub had one). What it does buy is the figures themselves, which
-/// is why it stays in the file rather than in a pull request body.
+/// `#[ignore]`, and found by `cargo test -- --ignored`. **What it costs:** a
+/// little over the deployed **60 s** threshold, which is what it is here to
+/// spend — the outage lasts until the hub's own watchdog has written every
+/// attempt off, and at `herd_hub::LOST_AFTER` that is a minute. It cost
+/// **171 s** before ORCH-321, when the link was down for a chosen 65 s and
+/// the jobs slept a chosen 90 s on top of it; neither figure is chosen any
+/// more. It is not in the default suite because a suite with a minute of
+/// waiting in it is a suite nobody runs, and because it proves nothing the
+/// test above does not: both drive the same watchdog, the same refusal and
+/// the same oracle, and the only difference is `--lost-after`
+/// (`herd_hub::LOST_AFTER`, a setting since the hub had one). What it does
+/// buy is the figures themselves, which is why it stays in the file rather
+/// than in a pull request body.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "171 s of wall clock, measured: the deployed 60 s threshold, a 65 s outage and 90 s jobs"]
+#[ignore = "a minute and more of wall clock: the deployed 60 s threshold, waited out once"]
 async fn a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds() {
     no_job_is_lost_to_an_outage(
         "link-cut-at-the-ceiling-for-real",
@@ -939,25 +951,29 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_
             // The deployed figure, read off the hub rather than retyped.
             lost_after: herd_hub::LOST_AFTER,
             health_every: herd_proto::HEALTH_EVERY,
-            how_long: herd_hub::LOST_AFTER + Duration::from_secs(5),
-            job_sleep: 90,
             patience: Duration::from_secs(300),
         },
     )
     .await;
 }
 
-/// What a run of the test below is: how long the link is down, how long the
-/// hub waits before it gives up on an attempt, and how long the jobs run.
+/// What a run of the test below is: the hub's silence threshold, the cadence
+/// its runner reports at, and how long the whole thing may take.
 ///
-/// A struct rather than five arguments, because every one of them is a
+/// A struct rather than three arguments, because every one of them is a
 /// duration and a caller that swapped two would get a test that passed for
 /// the wrong reason.
+///
+/// **It used to carry two more, and they were the defect** (ORCH-321): how
+/// long to keep the link down, and how long each job should sleep. Both were
+/// durations chosen to outlast a sequence — a watchdog, a redial, a dispatch
+/// pass — whose length is decided by whatever else the host is doing, so on
+/// a busy host they stopped outlasting it and the test accused the product.
+/// Neither is a figure any more: the outage ends when the **hub** says it has
+/// given up, and the jobs end when the **test** says so.
 struct AnOutage {
     lost_after: Duration,
     health_every: Duration,
-    how_long: Duration,
-    job_sleep: u64,
     patience: Duration,
 }
 
@@ -983,19 +999,30 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
     let state_dir = harness.state_dir().to_owned();
     // Exactly as many jobs as the machine holds: the premise is a runner **at
     // its ceiling**, not one with a queue behind it. Each command distinct,
-    // because two submissions of one command are one job (E-05).
+    // because two submissions of one command are one job (E-05) — which
+    // [`a_job_that_holds_its_place`] gives for free, since each job waits on
+    // a path of its own.
+    //
+    // **Held open, not slept through** (ORCH-321, and ORCH-119 for the test
+    // below). The premise is a machine *still holding its originals* when the
+    // hub hands it their second attempts. A `sleep` made that premise a
+    // duration, and the duration had to outlast an outage, a watchdog, a
+    // redial and a dispatch pass — a sequence whose length the host decides.
+    // Measured: green alone at a one-minute load of 16, red inside a full
+    // suite at 9.49, because the originals' `sleep 6` expired while the
+    // hub's watchdog was still deciding about a second attempt the starved
+    // runner had not answered. Nothing here runs for a chosen number of
+    // seconds any more.
+    let holding_pen = DataRootDir::new(&format!("{label}-holds"));
+    let mut releases = Vec::new();
     let mut submitted = Vec::new();
     for n in 0..CEILING {
+        let (release, command) = a_job_that_holds_its_place(&holding_pen, n);
+        releases.push(release);
         submitted.push(
-            support::submit_job(
-                &requester,
-                support::shell(&format!(
-                    "echo across the outage {n}; sleep {}",
-                    outage.job_sleep
-                )),
-            )
-            .await
-            .expect("the hub accepts the submission"),
+            support::submit_job(&requester, command)
+                .await
+                .expect("the hub accepts the submission"),
         );
     }
 
@@ -1027,28 +1054,95 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // ---- The outage.
-    println!(
-        "cutting the link for {:?}, with the runner at its ceiling of {CEILING}",
-        outage.how_long
-    );
+    // ---- The outage, which lasts exactly as long as the hub needs and not
+    // a chosen second longer (ORCH-321).
+    //
+    // The whole sequence begins with the watchdog, so what this test needs
+    // is the **hub's own word** that it has given up on every attempt out on
+    // that machine — not a duration picked to be longer than the watchdog
+    // usually takes. The two are not the same thing on a busy host: the old
+    // shape slept [`THE_OUTAGE`] and then asserted the write-off, which made
+    // a true statement about a quiet machine into a bet about a loaded one.
+    // Waiting for the state instead is both exact and faster, and the
+    // assertion it replaces is now this loop's exit condition — nothing is
+    // asserted less.
+    println!("cutting the link, with the runner at its ceiling of {CEILING}");
     link.cut();
-    tokio::time::sleep(outage.how_long).await;
-    // The hub must really have given up on them, or this test cut a link and
-    // measured nothing: the whole sequence begins with the watchdog.
-    let written_off = submitted
-        .iter()
-        .filter(|id| !matches!(harness.state_of(id), herd_hub::JobState::Running))
-        .count();
-    assert_eq!(
-        written_off, CEILING,
-        "after {:?} with no link and a silence threshold of {:?}, the hub's watchdog has to \
-         have written off every attempt out on that machine; {written_off} of {CEILING} were. \
-         Without that this test never reaches the defect it is named for",
-        outage.how_long, outage.lost_after
+    let cut_at = Instant::now();
+    let deadline = cut_at + outage.patience;
+    loop {
+        let written_off = submitted
+            .iter()
+            .filter(|id| !matches!(harness.state_of(id), herd_hub::JobState::Running))
+            .count();
+        if written_off == CEILING {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "with no link and a silence threshold of {:?}, the hub's watchdog has to have \
+             written off every attempt out on that machine; {written_off} of {CEILING} were, \
+             after {:?}. Without that this test never reaches the defect it is named for",
+            outage.lost_after,
+            cut_at.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    println!(
+        "the hub wrote off all {CEILING} attempts {:?} after the cut, at a threshold of {:?}",
+        cut_at.elapsed(),
+        outage.lost_after
     );
     link.restore();
-    println!("the link is back; the runner is still running its {CEILING} original job(s)");
+    println!("the link is back; the runner is still holding its {CEILING} original job(s)");
+
+    // **The premise, detected and not assumed** (ORCH-321). The defect this
+    // test exists for is the *cost* of the hand-back that comes next: the hub
+    // dispatches to the machine a job has just come off, on the hello and
+    // before it has read a frame from it, the machine is still holding the
+    // originals, and it refuses. Before D182 each of those refusals spent one
+    // of that job's two goes — the second and last — and every job ended
+    // `lost` on a fleet that was working perfectly.
+    //
+    // So the hand-back is waited for rather than hoped for. Releasing the
+    // held jobs any earlier would free a slot before the hello, the hub would
+    // simply place the second attempt, and the test would go green **having
+    // never reached what it is named for** — the one failure mode worse than
+    // the flake it replaces.
+    let deadline = Instant::now() + outage.patience;
+    loop {
+        let handed_back = submitted
+            .iter()
+            .filter(|id| attempts_of(&state_dir, id) >= 2)
+            .count();
+        let refused: usize = submitted
+            .iter()
+            .map(|id| ceiling_refusals(&state_dir, id).len())
+            .sum();
+        if handed_back == CEILING && refused > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hub has to hand every job back to the machine that is still holding it, and \
+             that machine has to refuse for the ceiling it announced: {handed_back} of \
+             {CEILING} were handed back and {refused} refusal(s) carry the runner's own \
+             sentence"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    println!("every job was handed back to the machine still holding it, and it refused");
+
+    // Every job has met the hand-back, so the processes holding the place may
+    // go. E-21 has usually ended them already — the hub answers a frame about
+    // a written-off attempt with `StaleAttempt` and the runner ends that
+    // attempt rather than finishing it — so this releases what the runner has
+    // often stopped, and leaves nothing of this test behind on the day that
+    // changes. It is also what lets the **second** attempt run to a verdict,
+    // which is the whole of the oracle below.
+    for release in &releases {
+        let_the_held_job_finish(release);
+    }
 
     // ---- Alexa's oracle, and nothing else.
     let deadline = Instant::now() + outage.patience;
@@ -1073,15 +1167,32 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
         let record = record_of(&state_dir, id);
         let outcome = &record["state"]["outcome"];
         if outcome["type"] != "exited" || outcome["code"] != 0 {
-            dead.push(format!("{id}: {outcome}"));
+            // **Every ending of every attempt, beside the verdict** — so that
+            // a reader of a red run is told *which* thing spent the job's
+            // goes rather than being handed the accusation this message used
+            // to make unconditionally (ORCH-321). A refusal carrying
+            // [`THE_RUNNERS_CEILING_SENTENCE`] that cost the job a go is the
+            // defect this test is named for; a write-off by the hub's own
+            // watchdog is not, and the two are told apart here by the
+            // sentence each one carries and by nothing else.
+            let endings: Vec<String> = events_of(&state_dir, id)
+                .into_iter()
+                .filter(|event| event["event"] == "attempt_ended")
+                .filter_map(|event| event["reason"].as_str().map(str::to_owned))
+                .collect();
+            dead.push(format!(
+                "{id}: {outcome} — every attempt_ended: {endings:?}"
+            ));
         }
     }
     assert!(
         dead.is_empty(),
         "0 job dead and 0 job without a verdict is the condition this change merges under, and \
-         {} of {CEILING} came back without one: {dead:?}. Every one of these was a runnable job \
-         on a healthy machine; what killed it was a link blip and a refusal that spent its last \
-         go",
+         {} of {CEILING} came back without one: {dead:?}. Each of these was a runnable job on a \
+         healthy machine. Read the endings above before blaming the product: a refusal carrying \
+         the runner's own ceiling sentence that spent the job's last go is this test's defect; \
+         an ending written by the hub's watchdog is the hub deciding a silence, and a silence \
+         long enough to decide is this host",
         dead.len()
     );
     println!("every one of the {CEILING} jobs came back with its own verdict");
@@ -1094,11 +1205,15 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
 
 /// A job that holds its place on the runner until the test lets it go.
 ///
-/// For the test below, whose premise is a machine **still holding** its
-/// originals at the instant the hub hands it a second attempt of them. A
-/// `sleep` cannot keep that premise: it makes the premise a duration, and
-/// whether the duration outlasts an outage, a watchdog, a redial and a
-/// dispatch pass is then decided by whatever else the host is doing.
+/// For every test in this file whose premise is a machine **still holding**
+/// its originals at the instant the hub hands it a second attempt of them:
+/// the bound test below since ORCH-119, and [`no_job_is_lost_to_an_outage`]
+/// — so both outage tests — since ORCH-321, which is the same fixture bug
+/// found a second time from the other end, as a flake instead of as a wrong
+/// refusal. A `sleep` cannot keep that premise: it makes the premise a
+/// duration, and whether the duration outlasts an outage, a watchdog, a
+/// redial and a dispatch pass is then decided by whatever else the host is
+/// doing.
 /// `admission.rs` argues the same thing for a reservation that has to still
 /// be held while something else is judged against it, and holds it the same
 /// way.
@@ -1300,7 +1415,7 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
     //   It carries a sentence of its own and not the ceiling's.
     //
     // Which of the two this outage produces is decided by the clock and
-    // nothing else: the jobs sleep [`SLEEP_ACROSS_THE_OUTAGE`] and their
+    // nothing else: the jobs slept 6 s then and their
     // second attempts arrive about [`THE_OUTAGE`] plus a redial later, so a
     // host busy enough to let one of the two originals finish first turns
     // the one refusal into the other. Measured on this workstation of 12

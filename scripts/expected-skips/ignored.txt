@@ -33,7 +33,7 @@
 # Order is byte order: every sort feeding a hash or a comparison in gate.sh
 # runs under LC_ALL=C, because collation is part of a hash (ORCH-202).
 HERD-IGNORED: a_collection_owed_is_not_an_open_job: a bench; run it on purpose
-HERD-IGNORED: a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds: 171 s of wall clock, measured: the deployed 60 s threshold, a 65 s outage and 90 s jobs
+HERD-IGNORED: a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds: a minute and more of wall clock: the deployed 60 s threshold, waited out once
 HERD-IGNORED: a_record_renamed_with_no_event_appended_is_permitted_and_silent: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_record_this_hub_cannot_read_quarantines_one_job_and_the_hub_starts: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_temporary_in_files_is_held_output_for_ever: ORCH-080's enumeration; run with --ignored

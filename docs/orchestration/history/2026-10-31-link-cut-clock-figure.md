@@ -10,337 +10,407 @@
 
 ## Done
 
-**No `.rs` file was changed. The task stopped on a refuted premise**, as
-the brief instructs (*"Verify all of that yourself before changing
-anything; if one part does not hold, say which and stop"*) and as
-`herd-step`'s own contract requires of a premise the code refutes. What
-exists now is the measurement, the mechanism and a worked remedy, plus
-one extended `board.md` row.
+`a_link_cut_while_the_runner_is_full_loses_no_job` no longer depends on a
+sleep being long enough. **Two chosen durations are gone from the
+fixture and nothing replaces them with a bigger number.**
 
-**1. The figures the brief calls undeclared are declared.** Both are
-named constants with doc comments of their own, in the test's own file,
-`herd-hub/tests/announced_job_ceiling.rs` lines 657–681:
+**1. What the brief got wrong, measured first, and why it was worth
+measuring.** The task was briefed as *"the test declares neither the 6 s
+silence window nor the health-report cadence"*. Both are declared, as
+named constants with doc comments in the test's own file:
+`LOST_AFTER_HERE` = **3 s** and `HEALTH_EVERY_HERE` = **1 s**, and
+`LOST_AFTER_HERE`'s comment already derives the three-to-one ratio
+against `herd_proto::SILENCE_MARGIN`. The `6.017909028s` in the failure
+text is not a window at all: it is the silence the watchdog **measured**,
+formatted from `unheard_for` (`herd-hub/src/server.rs:8212`). And the
+provenance was `78d4b76`, 2026-10-29, not `3d6e86a`, 2026-10-25. The
+first pass of this task stopped on those three refutations rather than
+designing against them; the orchestrator accepted all three and re-briefed.
 
-- `THE_OUTAGE` = 4 s (line 657),
-- `LOST_AFTER_HERE` = 3 s (line 662) — **the hub's silence window**,
-- `HEALTH_EVERY_HERE` = 1 s (line 663) — **the health-report cadence**,
-- `SLEEP_ACROSS_THE_OUTAGE` = 6 (line 675) — how long each job runs,
-- `PATIENCE_ACROSS_AN_OUTAGE` = 120 s (line 681).
-
-`LOST_AFTER_HERE`'s doc comment already states the ratio and why:
-*"Three to one, which is `herd_proto::SILENCE_MARGIN`: anything tighter
-is refused at the handshake, and rightly."* So *"the test declares
-neither"* is false of both figures the brief names.
-
-**2. The silence window is 3 s, not 6 s.** The `6.017909028s` in the
-failure text is not a threshold: it is the silence the watchdog
-**measured** and then compared with `lost_after`. The sentence is built
-at `herd-hub/src/server.rs:8212` from `unheard_for`, which is
-`State::unheard_of_for`'s elapsed figure (`server.rs:3222`). A window of
-6 s exists nowhere in this test or in the hub.
-
-**3. `load1` does not predict the failure, so no load reading can gate
-this test.** The named test, run alone, three times, this session:
+**2. `load1` does not predict the failure.** Three runs of the named test
+alone, before any change:
 
 | run | load1 before | verdict | wall | load1 after |
 |---|---|---|---|---|
-| 1 | 16.07 | ok | 10.76 s | 16.66 |
-| 2 | 13.73 | ok | 10.57 s | 12.83 |
-| 3 | 12.83 | ok | 10.46 s | 11.79 |
+| 1 | **16.07** | ok | 10.76 s | 16.66 |
+| 2 | **13.73** | ok | 10.57 s | 12.83 |
+| 3 | **12.83** | ok | 10.46 s | 11.79 |
 
-All three are **above** the **9.49** at which it went red inside a full
-`gate.sh` suite, and above the 6.08 at which the board row records it
-green. The discriminator is therefore **not the host's one-minute load**
-but the *suite's own concurrency* — roughly thirty test binaries, each
-with a hub, a runner and real subprocesses, contending for the runner's
-event loop. Two consequences, both load-bearing for the brief's shape 3:
-a skip keyed on `load1` would decline at load 16 where the test passes
-and would **not** decline at load 7 where the suite could still break
-it; and `gate.sh`'s `load_excuse` (`scripts/gate.sh` 461–491) only
-excuses a skip whose reason names a figure **above 8**, so a red taken
-at load 7 would stay red whatever the skip line said.
+Every one is above the **9.49** at which it went red inside a full
+`gate.sh` suite. The discriminator is the suite's own concurrency —
+about thirty test binaries, each with a hub, a runner and real
+subprocesses — and not the host's one-minute load. Two things follow.
+A load-keyed skip would decline at load 16 where the test passes and
+admit at load 7 where the suite can still break it; and `gate.sh`'s
+`load_excuse` (`scripts/gate.sh` 461–491) only excuses a reason naming a
+figure **above 8**, so a red taken at load 7 would stay red whatever the
+skip line said. **The advice "wait for a quiet host before gating" is
+therefore not supported by the load reading it was given with.** Batch
+31's merger waited about fifty minutes on that advice; the wait bought a
+quiet host, which is worth something, but not what it was said to buy.
 
-**4. The figure the test really hides is a host property, and it is
-nowhere in the file.** From the hub's own code, three facts:
+**3. The figure the test really hid was a host property, and it is
+nowhere in the file.** Three facts from the hub, each at a line:
 
-- the silence clock on an attempt **starts when the attempt is handed
-  out**: `state.attempt_was_heard_of(job_id)` immediately after
-  `begin_attempt`, `server.rs:5617`, commented *"Handing it out is the
-  first word about it: the clock on this attempt starts here"*;
-- an attempt that has only been **assigned** is in the air:
-  `attempts_in_the_air` matches `JobState::Assigned | Running |
-  Interrupted`, `server.rs:4032`;
-- a runner that is connected and whose last health report does not name
-  **that attempt number** gives `WhatTheRunnerSays::NotAnyMore`
-  (`server.rs:3253`, `names_it` requires `held.attempt == attempt`),
-  which is a write-off that **spends one of E-21's two goes**.
+- an attempt's silence clock starts when the attempt is **handed out** —
+  `state.attempt_was_heard_of(job_id)` immediately after `begin_attempt`,
+  `server.rs:5617`, commented *"Handing it out is the first word about
+  it: the clock on this attempt starts here"*;
+- an attempt that has only been **assigned** is already in the air —
+  `attempts_in_the_air` matches `Assigned | Running | Interrupted`,
+  `server.rs:4032`;
+- a connected runner whose last health report does not name **that
+  attempt number** gives `WhatTheRunnerSays::NotAnyMore`
+  (`server.rs:3253`; `names_it` requires `held.attempt == attempt`), and
+  the write-off that follows **spends one of E-21's two goes**.
 
-So the test silently requires that **the runner answer a dispatch within
-`lost_after`** — 3 s here. On this host alone that is milliseconds; in
-the failing gate run it took **6.02 s**, the hub charged the job's second
-and last go, and the job ended `lost`. The accusation the brief quotes
-is then printed because the oracle is a job count and cannot tell the
-two causes apart.
+So the old fixture silently required the runner to answer a dispatch
+within `lost_after` — 3 s. In the failing gate run that answer took
+**6.02 s**, the second and last go went, and the job ended `lost` while
+the product had done everything D182 asks of it.
 
-**5. The remedy already exists in the same file, applied to the
-neighbouring test and deliberately not to this one.** `78d4b76`,
-2026-10-29, *"Build the ceiling bound test's premise instead of timing
-it"* (ORCH-119) added `a_job_that_holds_its_place` and converted
-`a_job_refused_past_the_bound_ends_and_names_it` from `sleep
-{SLEEP_ACROSS_THE_OUTAGE}` to a job the test releases on its word. Its
-doc comment is the diagnosis of tonight's failure, written two days
-early: *"A `sleep` cannot keep that premise: it makes the premise a
-duration, and whether the duration outlasts an outage, a watchdog, a
-redial and a dispatch pass is then decided by whatever else the host is
-doing."* The same commit re-scoped `SLEEP_ACROSS_THE_OUTAGE` to
-*"Used by `no_job_is_lost_to_an_outage` **alone**"* — i.e. it left the
-timed premise standing in the test that now flakes.
+**4. The construction, which is the whole of the change.** `AnOutage`
+loses **both** of its chosen durations.
 
-**6. Provenance, corrected.** The brief dates the test's last change to
-`3d6e86a`, 2026-10-25. `git log -S` on the file: the figures came in
-with `be2b742` (2026-10-25), and the shared body
-`no_job_is_lost_to_an_outage` was last touched by **`78d4b76`,
-2026-10-29** — the ORCH-119 commit above. The file itself was last
-changed by `9b36871`, 2026-10-30.
+- **The outage is no longer slept through.** The old shape slept
+  `THE_OUTAGE` (4 s) and *then* asserted that the hub had written every
+  attempt off. That assertion is now the **exit condition of a bounded
+  poll**: the test waits for the hub's own word, bounded by
+  `patience`, and the failure message names `lost_after` and how long it
+  actually waited. Nothing is asserted less, the wait is exact rather
+  than generous, and the figure it reports is the hub's.
+- **The jobs are held open, not slept.** `a_job_that_holds_its_place`
+  — ORCH-119's helper, already in this file for the neighbouring test —
+  replaces `echo …; sleep 6`. Each job waits on a path of its own, so the
+  distinct-command rule (E-05) comes for free, and the premise *"the
+  machine is still holding its originals"* is a fact about the jobs
+  instead of a bet on how long the rest of the sequence takes.
+- **The hand-back is waited for, not hoped for.** Between the restore and
+  the release the test polls until every job has been handed out again
+  (`attempts_of >= 2`) and at least one refusal carries the runner's own
+  ceiling sentence (`ceiling_refusals`). This is the one thing the
+  construction could easily have thrown away: releasing the held jobs any
+  earlier frees a slot before the hub's hello-dispatch, the hub simply
+  places the second attempt, and the test goes green **having never
+  reached what it is named for** — a hollow green worse than the flake.
+- **The accusation is conditional now.** The oracle is unchanged, but a
+  dead job's message carries every `attempt_ended` reason off its own
+  record, and says in as many words that a refusal carrying the runner's
+  ceiling sentence is this test's defect while an ending written by the
+  watchdog is the hub deciding a silence. The test still fails; it no
+  longer blames the product for the host.
 
-**7. The board row.** `ORCH-321` is **extended, not closed**: its *Next
-action* now carries the two refutations with their figures and the
-redirected remedy, and its *Evidence* cell gains this handoff, `78d4b76`
-and the three `server.rs` line numbers. Verbatim under *Drafted for
-`herd-merger`*.
+**What it is not:** no skip, no skip-list name, no load reading, no
+timeout enlarged, and **no third verdict**. The orchestrator settled that
+and refused the attributed `HERD-SKIPPED` with it, on the measurement in
+*Risks and findings* 2: that skip cannot satisfy `load_excuse`'s grammar,
+so it would have cost a `gate.sh` change and a `herd-reviewer` pass to
+describe a symptom the construction removes. If the flake survives this,
+the third verdict is justified by measurement rather than anticipation
+and gets its own task; its design is written down in *Risks and findings*
+2 below, together with the one field it would read
+(`JobRecord::at_its_ceiling`), so nothing is lost by not building it
+here.
+
+**5. Measured on the reconstructed test.** Green alone in **4.48 s**
+against the old **10.76 s**, at load1 15.52 rising to **44.18** during
+the run — the host got busier mid-test and it still passed. The write-off
+landed **3.08 s** after the cut against the declared 3 s threshold, which
+is the figure the test now prints instead of assuming.
+
+**6. The 60 s twin.** The `#[ignore]`d
+`…_loses_no_job_at_the_deployed_sixty_seconds`
+shares the body, so it loses the same two durations: it no longer sleeps
+a chosen 65 s nor runs 90 s jobs, and its outage is the deployed
+`herd_hub::LOST_AFTER` waited out once. Its `#[ignore]` reason carried
+both stale figures and the 171 s total, so the reason is rewritten and
+`scripts/expected-skips/ignored.txt` follows it. **The name is
+unchanged**, and `gate.sh` compares `#[ignore]` entries **by name only**
+— `ignore_names`, `scripts/gate.sh:240`, whose own comment says
+comparing the reason *"would make the gate red on a reworded sentence,
+which is not a loss of coverage"*. The count stays **38**.
+
+**7. What was touched outside the test.** One comment line inside the
+neighbouring test, and nothing else: it referenced
+`SLEEP_ACROSS_THE_OUTAGE` by name in a dated measurement, and that
+constant is gone, so the name became the literal figure it stood for
+(*"the jobs slept 6 s then"*). The dated record's claim is unchanged.
+`herd-hub/src/` is **untouched** on this branch: the control never ran,
+so its fixture was never applied, and the tree is clean. The old figures
+survive on purpose in
+`docs/decisions.md`, the history files, `docs/remediation/` and
+ORCH-202's board row, which are records of what was true then.
 
 ## Not done, and why
 
-- **The fix itself.** A premise of the brief is refuted (items 1–3
-  above), and both the brief and `herd-step`'s contract say to stop
-  rather than work around it. The remedy I would write is not any of the
-  brief's three shapes as described — it is a *construction* change plus
-  an *attribution*-based third verdict — so choosing it is the
-  orchestrator's, not mine. It is written out under *Decisions needed*
-  so the re-brief is one step.
-- **The hollow-green control.** Not run: there is no new version to
-  prove still asserts. The control is designed and named under
-  *Decisions needed* so whoever takes the re-brief runs it.
-- **The Herd gate.** Not submitted. No `.rs`, `Cargo.toml` or script
-  changed, so this branch is **prose only**; a `gate.sh` job would have
-  spent a slot of a queue another agent is re-gating on, for a tree
-  whose Rust gates nothing in it can move.
-- **`docs/decisions.md`.** Untouched, and no `D-NEXT` drafted: the brief
-  asked for none and this task decided nothing that needs one.
-- **The skip lists.** Untouched. `scripts/expected-skips/local.txt`
-  still holds **13** `HERD-SKIPPED` names and `local-under-load.txt` is
-  unchanged, so `gate.sh`'s `skip-list-sha256` — which it computes from
-  the names a run *observes*, not from the file — cannot move on this
-  branch.
-- **`docs/status.md`.** Untouched, **90** lines (D276), re-counted.
+- **The hollow-green control, and the full `gate.sh` through Herd.** The
+  two runs this branch owes, both blocked by `bench-preflight.sh` for
+  over an hour on a slice that is not Herd's to drain. The figures, the
+  cause and the two staged commands are under *Gates*. **This is the
+  gap that matters**: the construction is green alone and **unproven
+  under a suite**, which is the weaker claim and is said as the weaker
+  claim. The `ORCH-321` row is left `open` for exactly this reason, and
+  the first draft of this handoff claimed the control had gone red —
+  that sentence was struck from the row and from here before the commit.
+- **The attributed third verdict.** Refused by the orchestrator with its
+  reasoning on the record; see *Done* 4 and *Decisions needed* 1.
+- **Both findings are rows and neither is acted on**: the `NotAnyMore`
+  product question and the test-driveable silence window. Verbatim under
+  *Drafted for `herd-merger`*.
+- **`docs/decisions.md`.** Untouched, no `D-NEXT` drafted: the brief
+  asked for none, and the construction decides nothing D182 and ORCH-119
+  have not already decided. Highest real `D` re-measured: **D284**.
+- **`docs/status.md`** untouched, **90** lines (D276), re-counted.
+  `docs/coverage.md`, `deploy/release-notes/1.0.0.md` and `main`
+  untouched.
+- **The at-rest skip lists** are untouched: `local.txt` still holds
+  **13** `HERD-SKIPPED` names and `local-under-load.txt` is unchanged, so
+  `gate.sh`'s `skip-list-sha256` — computed from the names a run
+  *observes* — cannot move for this branch. Only `ignored.txt`'s reason
+  text changed, which that comparison does not read.
+- **No reproduction of the original red.** It needs the full suite's
+  concurrency, which is the `gate.sh` run named below; manufacturing load
+  on a host shared with the consumer's production would break D161.
 
 ## Gates
 
-**Rust gates NOT RUN locally, and not run through Herd either** — this
-branch changes two Markdown files and no code, so there is nothing for
-`cargo fmt`, `cargo clippy`, `./scripts/test.sh` or `gate.sh` to see
-that `main` has not already gated. Under *One landing per batch* the
-batch's own `./scripts/gate.sh` at integration covers them, and that run
-is `herd-merger`'s.
+Run **before** this file was committed, on the tree as it then stood.
 
-Run **before** this file was committed, on the tree as it then stood —
-three control runs of the one named test, which is what the brief allows
-as a control:
+`./scripts/bench-preflight.sh` was read by its **verdict line** every
+time, never `$?` through a pipe, and it **refused far more often than it
+allowed** — first on load (*"load 9.10 is at or above 9.00 on 12
+cores"*), then on slice room for over an hour, down to **0 MiB** against
+the 8192 MiB floor. The three phases that did run each waited for a
+verdict line reading *"bench-preflight: ok, safe to start."*; the two
+that are owed never got one.
+`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was **never set or exported**.
 
 ```
-### run 1, load1 before: 16.07
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 10.76s
-    load1 after: 16.66
-### run 2, load1 before: 13.73
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 10.57s
-    load1 after: 12.83
-### run 3, load1 before: 12.83
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 10.46s
-    load1 after: 11.79
+=== fmt exit: 0 ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 44.04s
+
+[exited with code 0]
 ```
 
-`./scripts/bench-preflight.sh` was run before the build and its
-**verdict line** read, never `$?` through a pipe. It **refused** once —
-*"load 9.10 is at or above 9.00 on 12 cores … bench-preflight: REFUSED,
-do not start the heavy phase"* — and nothing heavy started; the second
-run, after the load fell, read *"bench-preflight: ok, safe to start."*
-`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never set or exported.
+That block is `nix develop --command cargo fmt --all --check` followed by
+`nix develop --command cargo clippy --workspace --all-targets -- -D
+warnings`: both clean, clippy with no warning of any kind.
 
-**The last run, named and not quoted:** `./scripts/check-docs.sh`, run
-after this file was committed and before the push, with its output going
-to the agent's report and to
-`<scratchpad>/check-docs-after-handoff.txt`. Nothing is added to the
-tree after it.
+The reconstructed test alone:
 
-**Skips:** no skip. This branch adds none, removes none and changes no
-skip list.
+```
+cutting the link, with the runner at its ceiling of 2
+the hub wrote off all 2 attempts 3.081548287s after the cut, at a threshold of 3s
+the link is back; the runner is still holding its 2 original job(s)
+every job was handed back to the machine still holding it, and it refused
+every one of the 2 jobs came back with its own verdict
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 4.48s
+```
+
+**Two runs this branch owes and did NOT get: the hollow-green control,
+and the full `gate.sh` through Herd.** Both are heavy phases;
+`./scripts/bench-preflight.sh` **refused for over an hour** and the
+refusal was never worked around. Its own figures, read at the last
+attempt:
+
+```
+load (1m):   2.56 on 12 cores, ceiling 9.00
+slice room:  1226 MiB under memory.high on /chatons.slice, floor 8192 MiB (8 GiB)
+             charge 17205 MiB, of which 0 MiB is reclaimable page cache and not held
+bench-preflight: REFUSED, do not start the heavy phase.
+```
+
+**The refusal is a true statement about the host, not a flaky one**, and
+load is not what is blocking it — 2.56 on 12 cores. Read off
+`/sys/fs/cgroup/chatons.slice` at the same moment: `memory.current`
+**15.89 GiB** of `memory.high` **18.00 GiB**, `anon` **8.97 GiB**,
+`shmem` **5.84 GiB**, `file` 6.59 GiB. The `anon` is two
+**`qemu-system-x86_64` VMs of 4 GiB each that are not Herd's** — pids
+2480160 and 2624304, aged 1422 s and 225 s when read, so they recur
+rather than drain — and the `shmem` is why the preflight reports *"0 MiB
+is reclaimable page cache"*: shmem is charged to the cgroup and is not
+reclaimable (**D283**). For the 8 GiB floor the slice would have to fall
+to about 10 GiB of charge. **Nothing in Herd can make that happen**, and
+`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was **not set and not exported**.
+
+So this branch carries a construction that is **green alone and
+unproven under a suite**, and the row stays open. Both runs are staged as
+one command each, ready for whoever has a quiet host:
+
+- the control — delete `at_its_ceiling` from `give_the_job_another_go`'s
+  `let at_its_ceiling = matches!(…)` (`herd-hub/src/server.rs`), which is
+  D182's exemption itself, run the one named test, and it must go **red**
+  on its own oracle; then revert. **Note on the fixture the first pass
+  named:** deleting the `&& attempt.at_its_ceiling.is_none()` clause from
+  `JobRecord::goes_a_runner_took` (`herd-hub/src/job.rs:1875`) is *not*
+  the control it looks like — `give_the_job_another_go` chooses which
+  budget to spend from `how`, not from that count
+  (`server.rs:8347`), so on this test's path the clause is never
+  consulted and the test would stay green. Both were staged, the second
+  as a negative control, and **neither was run**.
+- `./scripts/gate.sh`, **bare and whole**, as one Herd job —
+  `herdctl --hub ws://127.0.0.1:8791 submit --label build --memory-mib
+  4700`, with an absolute `cd` into this worktree and
+  `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/link-cut-clock-figure`; the
+  receipt lands in this worktree's `target/herd-gate/`. **This is the run
+  that settles the task**, because a test that passes alone and failed
+  inside a suite is only proven by a suite.
+
+**The last run, named and not quoted:**
+
+- `./scripts/check-docs.sh`, run after this file was committed, output to
+  the agent's report and to
+  `<scratchpad>/check-docs-after-handoff.txt`.
+
+**Skips:** no `HERD-SKIPPED` added, none removed, and no at-rest or
+load-conditional list touched. One `HERD-IGNORED` **reason** reworded,
+name unchanged, count **38**.
 
 ## Risks and findings
 
-1. **The brief's diagnosis is refuted in two places, and the refutation
-   changes the remedy.** Items 1–3 of *Done*. The brief's shape 2
-   (*"declare the window as a figure the test owns … and named"*) is
-   **already in the tree**: the window is `LOST_AFTER_HERE`, named, with
-   a doc comment that derives its ratio from `herd_proto::
-   SILENCE_MARGIN`. Doing shape 2 again would change nothing. Shape 3
-   (*a skip naming the load it read*) is **worse than useless here**:
-   measurement 3 shows `load1` neither implies the failure nor is
-   implied by it, so the skip would decline runs that pass and admit
-   runs that fail, and `gate.sh`'s own excuse grammar would refuse it
-   below load 8 anyway.
-2. **Shape 1 — the one the brief prefers — is not reachable from the
-   test side.** The clock the test would have to remove is the **hub's**,
-   and the hub reads real time: `Policy` is an immutable field of
-   `State` (`server.rs:1434`), set once at construction, with no setter;
-   the watchdog ticks on `tokio::time::interval(watchdog_every())`
-   (`server.rs:8071`, `watchdog_every` = `lost_after / 20` clamped to
-   50 ms…1 s, `server.rs:756`); and `tokio::time::pause` is refused on
-   the `multi_thread` runtime this test needs and would in any case not
-   move the real `sleep` of a real subprocess. Making the hub's silence
-   window test-driveable — an injected clock, or a `Policy` that can be
-   changed while the hub is up — is a **product change to `herd-hub`**,
-   is far outside this task's write paths, and is the only thing that
-   would close the whole class. It is a planner-sized row, not a step.
-   **This is the finding that matters most**, because it is also the
-   answer for every other `real_herd`-shaped fixture with the same
-   shape (ORCH-128).
-3. **What I would write instead, and why it is neither 2 nor 3.** Two
-   halves, and the first is the one that does the work:
-   - **Construct the premise instead of timing it**, exactly as
-     ORCH-119 did for the sibling: replace `sleep
-     {SLEEP_ACROSS_THE_OUTAGE}` with `a_job_that_holds_its_place` and
-     release on the test's word, and replace the `sleep(THE_OUTAGE)`
-     with a **bounded poll** until the hub has written off every
-     attempt — the assertion that follows the sleep today becomes the
-     poll's exit condition, so nothing is lost. That collapses the
-     exposed window from *"the ~2 s for which the runner stays full
-     after the link returns"* to *"one dispatch round trip"*, measured
-     at 8–16 ms on an idle host by the file's own doc comment.
-   - **A third verdict attributed from the record, with no clock and no
-     load reading in it.** The hub already marks a ceiling refusal on
-     the attempt itself: `AttemptRecord::at_its_ceiling`, and
-     `JobRecord::goes_a_runner_took` (`herd-hub/src/job.rs:1869`) counts
-     an attempt as a spent go only when `requeue_code.is_none() &&
-     at_its_ceiling.is_none()`. So for a job that came back without a
-     verdict the test can read its own record and say **which** of the
-     two things happened: if the attempts the record itself attributes
-     to the runner number fewer than `attempts_allowed` while the hub
-     has nonetheless ended the job, then the difference was charged to
-     something the hub marked `at_its_ceiling` — **the defect**, and the
-     existing accusation is exactly right. If instead the record
-     attributes `attempts_allowed` goes to watchdog write-offs and
-     **zero** to a ceiling refusal, the product did what D182 says and
-     the host broke the premise — *premise did not hold*, printed as a
-     `HERD-SKIPPED` with the two figures (`lost_after`, and the silence
-     the hub measured, both read off the record) rather than a load
-     average. That is the file's own stated oracle made operative:
-     *"Attempts spent because of the runner's ceiling: zero … told apart
-     by attribution, never by a total that happens to be zero."*
-   The residual risk, stated: a `HERD-SKIPPED` whose condition is an
-   attributed event and not a load reading **cannot satisfy**
-   `gate.sh`'s `load_excuse` grammar, so the name would have to go in
-   `scripts/expected-skips/local-under-load.txt` *and* `gate.sh`'s
-   excuse would have to admit a reason that names the hub's measured
-   silence instead of a load figure. That is a change to `gate.sh`,
-   which is a rule file and takes a `herd-reviewer` pass
-   (`workflow.md` step 6). **It is the reason this is a decision and not
-   a step**: the honest version of the third verdict costs a gate change,
-   and the version that avoids the gate change is the dishonest one.
-4. **A separate product finding, reported and not acted on, as the brief
-   requires.** The hub's `NotAnyMore` arm asks whether the runner's
-   health report names **this attempt number**, so a runner that is
-   plainly still running *the same job* under an **earlier** attempt
-   number reads as *"the attempt is gone from a machine that is still
-   here"*. In this test that is the machine the hub has just written the
-   attempt off at, so the reading is deliberate and D182's exemption is
-   the hub's answer to it. But the write-off that follows is **not**
-   exempt, and it is what spends the job's last go on a host that is
-   merely slow. Whether `lost_after` should bound *"a runner has not
-   answered a dispatch"* with the same figure it uses for *"a runner has
-   gone silent"* is a product question I did not touch and did not
-   measure in deployment. **No product figure, default or cadence was
-   changed.** It wants its own row.
-5. **One thing I could not measure, named as unmeasured.** I did not
-   reproduce the red. It needs the full suite's concurrency, which is a
-   `gate.sh` run — the brief forbids re-running a failed job locally,
-   and manufacturing load on a host shared with the consumer's
-   production and another re-gating agent would break D161. So the
-   mechanism in item 4 of *Done* is established from the failure text
-   plus the hub's code, and **not** from a reproduction. A re-brief that
-   wants one should get it from a `gate.sh` receipt, not from this host.
+1. **The residual exposure, named rather than claimed away.** The
+   construction removes the *cause* that fired — the originals' sleep
+   expiring mid-decision — and shortens the window in which the hub holds
+   an unanswered attempt from *"the ~2 s the runner stays full after the
+   link returns"* to *one dispatch round trip*, measured at 8–16 ms on an
+   idle host by this file's own doc comment. It does not make the window
+   zero. If a host starves the runner for longer than `lost_after` inside
+   that round trip, the watchdog can still spend the job's second go and
+   the test will still go red — now with every `attempt_ended` reason
+   printed beside the verdict, so the next reader is not told it was the
+   product. **I did not prove the flake is gone; I proved its cause is.**
+   The suite run named under *Gates* is what can fail to refute that, and
+   one green suite is not a rate.
+2. **Why the honest third verdict costs a rule-file change.** A
+   `HERD-SKIPPED` whose condition is an attributed event — the record's
+   own `at_its_ceiling` field, `herd-hub/src/job.rs:1869` — carries no
+   load figure, and `gate.sh`'s `load_excuse` only excuses a reason
+   matching *"over this bench's ceiling of N"* plus a one-minute load
+   above both N and 8. So the attributed skip would be an **unexpected
+   skip** and red, and making it green means editing `gate.sh`, which is
+   a rule file and takes a `herd-reviewer` pass (`workflow.md` step 6).
+   That is the measurement behind the orchestrator's refusal, and it
+   stands whoever revisits it.
+3. **A product finding, reported and not acted on.** `ORCH-NEXT-A`
+   below, in full. The hub asks whether a health report names **this
+   attempt number**, so a machine plainly still running the **same job**
+   under an earlier attempt reads as *"the attempt is gone from a machine
+   that is still here"*; D182 exempts the refusal but **not** the
+   write-off that precedes it, and that write-off spends the last of
+   E-21's two goes on a host that was merely slow. **No product figure,
+   default or cadence was changed**, and nothing in deployment is broken
+   by it: at 60 s against a 15 s cadence the margin is four reports wide.
+4. **The finding that closes the class, and the only one.** `ORCH-NEXT-B`
+   below. A hub whose silence window a test can drive is the one thing
+   that makes this test — and every fixture of ORCH-128's class —
+   independent of what else the host is doing. `Policy` is an immutable
+   field of `State` (`server.rs:1434`), the watchdog ticks on
+   `tokio::time::interval(watchdog_every())` (`:8071`, `:756`), and
+   `tokio::time::pause` is refused on the `multi_thread` runtime these
+   tests need and would not move a real subprocess's `sleep`. So the seam
+   does not exist and cannot be faked from a test. The class has now been
+   paid for by hand three times in four days — D186, ORCH-119,
+   ORCH-321 — and each fix is sound and none is general.
+5. **A smaller risk in the new premise check.** The hand-back poll
+   requires **at least one** ceiling refusal across the jobs, not one per
+   job, because `herd_runner::take_job` has a second branch
+   (`NotTaken::StillRunningThisJob`) that carries a different sentence
+   and is reachable the moment one original ends first. Requiring one per
+   job would have been stronger and would have introduced a new way to
+   flake. The weaker form still cannot pass without the hand-back having
+   happened for **every** job, which is the part that guards the hollow
+   green.
+6. **What the `#[ignore]`d twin now costs is derived, not measured.** Its
+   doc says *a little over the deployed 60 s threshold*; that follows from
+   the construction and from `lost_after`, and **no run of it is in this
+   evidence** — it is `#[ignore]`d and was not run. Said as an inference
+   rather than a figure.
 
 ## Drafted for `herd-merger`
 
-**No `docs/decisions.md` entry.** None asked for, none owed. Highest
-real `D` on `main` re-measured at this branch's base: **D284**.
+**No `docs/decisions.md` entry.** None asked for, none owed.
 
-**One `board.md` row, already written on this branch** — `ORCH-321` is
-**extended in place**, not added and not closed, and no row was
-renumbered. Highest real `ORCH` row re-measured: **ORCH-322**. The
-mentions of `ORCH-NEXT` placeholders inside dated records (ORCH-138,
-ORCH-243, ORCH-307, ORCH-237) were not touched. The row's *Next action*
-and *Evidence* cells now read, verbatim and in full:
+**Three `board.md` rows, already written on this branch.** `ORCH-321`
+moves to `done` with its outcome appended, and **two new rows** are added
+at the end of *Open*, drafted as `ORCH-NEXT-A` and `ORCH-NEXT-B` because
+the merger allocates the numbers and gaps stay (D148). Highest real
+`ORCH` row re-measured at this branch's base: **ORCH-322**. No row was
+renumbered, and the `ORCH-NEXT` mentions inside dated records
+(ORCH-138, ORCH-243, ORCH-307, ORCH-237) were left alone.
+
+The two new rows, verbatim, exactly as they stand in the tree:
 
 ```
-| ORCH-321 | <description, source, owner and state cells unchanged> | ... | **Do not add it to a skip list** — it would be a real assertion silently excused, which is the one thing D27 forbids. Give it what D186 gave the other three: find the figure it silently depends on and declare it. The candidates are the 6 s silence window and the health-report cadence against a host at load 9.5, both of which are the test's own and neither of which it states. Then re-measure at rest and under load, and if it cannot be made load-independent, decide whether it belongs in `local-under-load.txt` as a **named** load-conditional skip that prints the figure it read, which is the only form that is not an excuse. **Re-measured 2026-10-31 by `link-cut-clock-figure`, and two of this row's premises do not hold.** Both figures ARE declared: `LOST_AFTER_HERE` 3 s and `HEALTH_EVERY_HERE` 1 s, named constants with doc comments at `announced_job_ceiling.rs:657-681`, and the `6.017909028s` in the failure text is not a window but the silence the watchdog *measured* against that 3 s. And **load1 does not predict the failure**: the test is green **alone** three times at load1 **16.07, 13.73 and 12.83**, in 10.76 / 10.57 / 10.46 s, all well above the **9.49** it went red at inside a full suite — so a load-gated skip would key on the wrong variable, and `gate.sh`'s own `load_excuse`, which demands a figure above 8, would not excuse a red taken at load 7. The figure this test really hides is a **host property**: the hub starts an attempt's silence clock when it *hands the attempt out* (`server.rs:5617`) and `attempts_in_the_air` watches `Assigned` (`server.rs:4032`), so the test silently requires the runner to answer a dispatch inside `lost_after`; under the suite's own concurrency that answer took 6.02 s. The remedy is already in the same file, applied to the sibling test by ORCH-119 (`78d4b76`, 2026-10-29) and deliberately not to this one: hold the originals open with `a_job_that_holds_its_place` instead of `sleep 6`, and poll for the write-off instead of sleeping `THE_OUTAGE`. **Next: re-brief on that premise**, with the three-way verdict attributed from the record's own `at_its_ceiling` field rather than from a load reading | — | `herd-hub/tests/announced_job_ceiling.rs:1079`; gate receipts for `adcc4df8c7de8f0f98e46b1cf9058c2e4665315f` and `13efad21c3e42cc8041b2b597ba79a529f8a3595`; **D186**, ORCH-128; `history/2026-10-31-oom-step-attribution.md`; `history/2026-10-31-link-cut-clock-figure.md`; `78d4b76` and ORCH-119; `herd-hub/src/server.rs` 4032, 5617, 8212 |
+| ORCH-NEXT-A | **The hub asks whether a runner's health report names *this attempt number*, so a machine plainly still running *the same job* under an earlier attempt reads as "the attempt is gone from a machine that is still here" — and the write-off that follows spends the last of E-21's two goes on a host that was merely slow.** `State::what_the_runner_says` sets `names_it` from `held.job_id == job_id && held.attempt == attempt` (`herd-hub/src/server.rs:3253`), the sentence is built at `:8212`, and `attempts_in_the_air` watches `Assigned` as well as `Running` (`:4032`) while the attempt's silence clock starts the moment the attempt is *handed out* (`:5617`). So any attempt a runner has not answered within `lost_after` is written off, and the refusal that would have been exempt under **D182** never gets to be sent. Measured consequence, inside a full suite at load1 9.49: *"nothing has been heard about that attempt for 6.017909028s"* against a 3 s threshold, both goes spent, the job `lost`, and a product that had done everything right | `link-cut-clock-figure`, 2026-10-31, *Risks and findings*, while fixing ORCH-321; reported and deliberately not acted on | herd-planner | open | **Do not act on it from a step.** The question is whether `lost_after` should bound *"a runner has not answered a dispatch"* with the same figure it uses for *"a runner has gone silent"*, and that is a product promise about what a job's two goes are spent on — it goes to Alexa through a planner, never through an execution agent. **Nothing is broken in deployment by it**: at the deployed 60 s against a 15 s cadence the margin is four reports wide, and the exposure was only ever visible because the suite's own fixture compresses the pair to 3 s / 1 s. Measure the deployed pair before anything moves, and weigh it against D169, whose whole point is that a machine's own word beats a timer — this is the one case where the machine's word is about the right job and the wrong attempt number | ORCH-321, **D169**, **D182**, E-21 | `herd-hub/src/server.rs:3253`, `:4032`, `:5617`, `:8212`; `herd-hub/src/job.rs:1869` `goes_a_runner_took`; `history/2026-10-31-link-cut-clock-figure.md` |
+| ORCH-NEXT-B | **A hub whose silence window a test can drive is the only thing that closes ORCH-128's whole class, and no amount of fixture work substitutes for it.** Every `real_herd`-shaped fixture that has to outlast the hub's watchdog is a bet on how fast the host is, and the class has now been paid for three times by hand: **D186** gave three tests a declared job cap, **ORCH-119** rebuilt one premise as a construction, and **ORCH-321** rebuilt the second one the same way. Each fix is sound and none of them is general. What would be general is a clock the test owns: `Policy` is an immutable field of `State` (`herd-hub/src/server.rs:1434`) set once at construction, the watchdog ticks on `tokio::time::interval(watchdog_every())` (`:8071`, `lost_after / 20` clamped to 50 ms–1 s, `:756`), and `tokio::time::pause` is refused on the `multi_thread` runtime these tests need and would not move a real subprocess's `sleep` in any case. So the seam does not exist and cannot be faked from a test | `link-cut-clock-figure`, 2026-10-31, *Risks and findings*, while fixing ORCH-321 | herd-planner | open | **Size it before agreeing it**, because the cheap version and the right version are far apart: an injected clock threaded through `server.rs` is a large change to the one file every landing depends on, while a `Policy` that may change *while the hub is up* is small and buys most of the benefit — a test could tighten the window for the phase that needs the watchdog and loosen it for the phase that must not be judged by it. Neither is a step's work and neither belongs inside a fixture fix. **Weigh it against doing nothing**: the class costs one bounded task each time it bites, it has bitten three times in four days, and the third time cost a batch's merger about fifty minutes of waiting for a quiet host on advice that the load reading did not in fact support | ORCH-128, ORCH-119, ORCH-321, **D186** | `herd-hub/src/server.rs:756`, `:1434`, `:8071`; `herd-hub/tests/real_herd/mod.rs` `ROOM_FOR_A_SECOND_JOB`; `history/2026-10-31-link-cut-clock-figure.md`; ORCH-128 |
 ```
 
-Nothing else on this branch is the merger's to act on.
+`ORCH-321`'s own row is in the tree with its *State* cell at `done` and
+its *Next action* cell carrying the outcome; it is one table row and the
+merger needs no copy of it here beyond the file itself.
 
 ## Decisions needed
 
-1. **Which remedy, given that shape 2 is already in the tree and shape 3
-   would key on a variable that does not predict the failure?**
-   *Recommendation:* the two halves of *Risks and findings* 3 — construct
-   the premise as ORCH-119 did for the sibling, and give the test a third
-   verdict attributed from `at_its_ceiling` rather than from a clock or a
-   load average. One `.rs` file, `herd-hub/tests/announced_job_ceiling.rs`,
-   and the hollow-green control is already designed: delete
-   `&& attempt.at_its_ceiling.is_none()` from
-   `JobRecord::goes_a_runner_took` (`herd-hub/src/job.rs:1875`), which is
-   D182's fix and nothing else, and the test must go **red on the defect
-   branch** — not skip, not pass. *Fallback:* the construction half
-   alone, which needs no `gate.sh` change and no skip-list name, and
-   shrinks the exposed window from seconds to one round trip without
-   closing it. That is a smaller claim honestly stated, and it is what I
-   would land first if the gate change is refused.
-2. **Does the class get its product seam?** A hub whose silence window a
-   test can drive — an injected clock, or a `Policy` that may change
-   while the hub is up — is the only thing that makes this test, and
-   every other fixture of ORCH-128's class, independent of what else the
-   host is doing. *Recommendation:* a `herd-planner` row, not a step, and
-   not inside this fix. *Fallback:* leave the class open and pay the
-   construction cost per fixture, as ORCH-119 and D186 have done twice
-   already.
-3. **Is `lost_after` the right bound for "a runner has not answered a
-   dispatch"?** *Risks and findings* 4. *Recommendation:* its own row,
-   measured against the deployed 60 s / 15 s pair before anything moves.
-   *Fallback:* none needed — nothing is broken in deployment by it; the
-   test's compressed 3 s / 1 s pair is what exposes it.
+1. **Who runs the two owed runs, and on what host?** They need a slice
+   under about 10 GiB of charge, and this one sat at 15.89 GiB for over an
+   hour on work that is not Herd's. *Recommendation:* the next agent with
+   a cleared preflight runs them from the two staged commands before this
+   branch is taken into a batch, because a construction that is green
+   alone and unproven under a suite is exactly the claim this task exists
+   to stop being made. *Fallback:* let the batch's own `gate.sh` be the
+   first suite it meets, and accept that one green batch gate proves the
+   suite case while the hollow-green control stays unrun — which is the
+   weaker half, and should be said as such. **Then: is one green suite
+   enough to call ORCH-321 closed?** Close it on one, because the change
+   removes a cause rather than lowering a threshold, and keep
+   `ORCH-NEXT-B` open as the thing that would close the class. **If it is
+   red**, the
+   attributed third verdict is then justified by measurement: its design
+   is *Risks and findings* 2 plus `at_its_ceiling`, and it needs the
+   `gate.sh` excuse-grammar change and a `herd-reviewer` pass with it.
+2. **`ORCH-NEXT-A`, the product question**, goes to Alexa through a
+   planner and never through a step. *Recommendation:* measure the
+   deployed 60 s / 15 s pair first and weigh it against D169, whose point
+   is that a machine's own word beats a timer — this is the one case where
+   the machine's word is about the right job and the wrong attempt
+   number. *Fallback:* nothing; deployment is not broken by it.
+3. **`ORCH-NEXT-B`, the product seam.** *Recommendation:* size the small
+   version first — a `Policy` that may change while the hub is up — before
+   anyone agrees the large one. *Fallback:* keep paying per fixture, at
+   one bounded task each time it bites.
 
 ## Resume point
 
-Re-brief ORCH-321 on the measured premise, with *Decisions needed* 1
-settled. The next command for whoever takes it, in a worktree off
-`origin/main`:
+**Run the two owed runs**, in this order, each behind a verdict line from
+`./scripts/bench-preflight.sh`: the hollow-green control (*Gates*, first
+bullet) and then `./scripts/gate.sh` as one Herd job (*Gates*, second
+bullet). Both are one command; the scripts are staged in the agent's
+scratchpad. Then settle *Decisions needed* 1. To re-run the test itself:
 
 ```
+cd <this worktree> && export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/link-cut-clock-figure
 nix develop --command cargo test --package herd-hub \
   --test announced_job_ceiling -- --exact \
   a_link_cut_while_the_runner_is_full_loses_no_job --nocapture --test-threads=1
 ```
 
-with `CARGO_TARGET_DIR` under `/mnt/ssd_980/herd/build/<task>` and
-`./scripts/bench-preflight.sh` read by its verdict line first. The
-binary builds in minutes and the test takes 10.5 s.
+with `./scripts/bench-preflight.sh` read by its verdict line first. The
+test takes 4.5 s.
 
 ## Processes
 
-PIDs started: one backgrounded `nix develop --command cargo test --no-run`
-(harness id `bf04x1dtj`, exited 0 on its own) and three foreground
-`cargo test` runs of the one named test, each of which exited on its own.
-**Nothing was signalled**, so no PID was killed: `pkill -f` was not used
-in any form, and 3006543, 3021002, 565152 and 662711 were not touched.
-Own build tree: `/mnt/ssd_980/herd/build/link-cut-clock-figure`, off `/`
-as required, deleted once the branch was pushed; its size is in the
-agent's report.
+PIDs started: backgrounded `cargo` builds and the two control runs, each
+of which exited on its own, plus waiters on the preflight. **One PID was
+signalled and it was my own**: `2539006`, an idle `until` loop of mine
+that no longer had anything to do, killed by PID. `pkill -f` was not used
+in any form; 3006543, 3021002, 565152 and 662711 were not touched; no
+process of uid 1002 was signalled without its full `args` being read
+first. Own build tree:
+`/mnt/ssd_980/herd/build/link-cut-clock-figure`, off `/` as required,
+**kept rather than deleted**, with its size in the agent's report: the
+two owed runs need it, and deleting it would cost a cold rebuild for a
+control that is one command away. That is the one deviation from *delete
+the build tree when the task ends*, it is reversible with one `rm -rf`,
+and the rule's purpose (weight off `/`) is met, since it is on
+`/mnt/ssd_980` with 370 GiB free. The worktree is kept too, on the
+orchestrator's instruction.
