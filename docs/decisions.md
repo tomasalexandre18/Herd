@@ -15081,3 +15081,84 @@ entry. The **headline figures were never wrong** and are not restated
 here as if they had been: `coverage.md`'s delivery figure and scope
 figure both still derive from the cells above, and
 `deploy/release-notes/1.0.0.md` is unaffected.
+
+## 2026-10-31 — D287 The hub charges a reading, and the count stops
+being the bound
+
+ORCH-323, and the second half of D285. D285 ruled option **(b)** — a
+figureless requirement reading is charged `C_hub`, exactly as every
+other figureless job already is — and refused option (a), a frame field
+marking a reading, as protocol surface that buys nothing (b) does not.
+This is that ruling implemented. `PROTOCOL_VERSION` stays **3**: no
+frame, no field, no changed field meaning.
+
+**The charge.** `herd_hub::matcher::charged_against_the_room` lost its
+`a_reading` argument and its `None if a_reading => 0` arm. A job with no
+`JobNeed` is charged `C_hub = (lent − floor) ÷ jobs_at_once`, floored at
+`MINIMUM_CEILING_MIB`, whether the hub minted it as a reading or a
+requester submitted `herdctl submit -- true`. **Because the runner
+cannot tell them apart**: `reading_job` gives a reading no figure (D159,
+D169, deliberately — nought is not a figure), `job_ceiling` grants every
+job that arrives with no `JobNeed` the whole of `--job-memory-max`, and
+nothing on the frame says which jobs are readings. A hub charging one of
+the two less than the other charges a figure its runner does not honour.
+
+**The bound.** `admission` no longer holds `jobs_at_once` against
+`seat.reserved.jobs`. With one charge over one set on both sides,
+`Σ charged ≤ lent − floor` refuses exactly the sets
+`herd_runner::take_job` refuses, so a count beside it could only bite
+earlier than either side needs — `at_once × C_hub ≤ lent − floor`, so it
+bit first on every job held to less than the cap. **That is the packing
+D285 said this landing did not deliver**: 22 jobs declaring 1 GiB now
+fit on a seat admitting 25 GiB that announced two places, where two fit
+before and 23 GiB of what it lends went unused. A figureless queue still
+fills to exactly `at_once` jobs, because `at_once × C_hub = lent − floor`.
+
+**The count is kept in the two cases the sum cannot answer, and they are
+the runner's own two since D285** (`herd-runner/src/lib.rs`, its `match
+room.admissible_mib`):
+
+1. **a host that will not say how much memory it lends** — no sum on
+   either side, the hub charges a figureless job nothing because there is
+   no cap to charge it with (D23's rule), the runner announces
+   `JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY` = 1, and the count is the
+   whole of that machine's bound on both sides;
+2. **a machine that has told the hub it is holding more than the records
+   know of** (D182 §3) — a count of jobs, with nothing saying what each
+   was granted, so it cannot be added to a sum in mebibytes. Held
+   against the announced ceiling so the surplus waits instead of being
+   offered straight back to a full machine the moment it redials.
+
+Dropping either would be an over-placement of a kind already measured:
+the first is D181's refusal storm reached from the other side, the
+second is the outage D182 was written for. Each has a test of its own.
+
+**What a waiting job reads changed with it.** On a machine that stated
+its size the sentence is the memory one — *"N MiB free of its X memory
+admission and this job's ceiling would be Y"* — and
+`A_CEILING_THE_RUNNER_ANNOUNCED` is written only in the two cases above.
+`herd-hub/tests/announced_job_ceiling.rs` asserts both directions, and
+Alexa's own oracle there is unmoved: attempts spent for the runner's
+ceiling **0**, every other attempt unchanged, peak attempts out on the
+runner exactly the figure it announced.
+
+**`READINGS_AT_ONCE` stays 2 and no figure was invented for it.** It
+bounds how many readings one machine runs at once (D169) — their kind's
+own concurrency — and what room a reading takes is the charge's to say.
+
+**Its one cost, stated.** A reading stops being free of the memory
+admission: on the first consumer's own figures (20 GiB lent, a 6 GiB
+floor, 7 GiB a job, their report) `jobs_at_once` is 2 and `C_hub` is
+7168 MiB, so two jobs fill that machine and a reading behind them waits
+until one ends. Nothing is refused and no attempt is spent — a reading
+over the room waits, and waiting is never a failure (E-31). ORCH-331
+carries it, to report with no question attached.
+
+`herd-hub/tests/packed_by_declaration.rs` is still the proof, with
+`herd_runner::job_ceiling` as its oracle and its known-bad control still
+red. Its last test was
+`a_reading_is_charged_nothing_and_the_announced_count_is_what_bounds_it`,
+which said that if the count bound were ever dropped this is where it had
+to be answered; it is renamed, not deleted, and answers it. The
+consequence test lost its `admitted < at_once` term, which modelled a
+bound the hub no longer applies.

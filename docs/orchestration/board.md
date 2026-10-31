@@ -1523,3 +1523,81 @@ to touch (D161).
     merge message and the merger's report, and **its post-push run id is
     in the report alone**, because this item is committed before the
     gate runs (ORCH-121).
+
+28. **The hub charges a reading, and a skip total stops being a figure
+    anyone maintains** — batch 33, **two branches**, no tag: nothing here
+    is a release. In merge order:
+    **`orch-323-charge-a-reading`** (`7fbff6b`, ORCH-323, adding
+    **ORCH-331** and **ORCH-332**,
+    `history/2026-10-31-orch-323-charge-a-reading.md`), the substantive
+    one; then **`orch-313-skip-count-sweep`** (`0081c78`, ORCH-313,
+    adding the row allocated **ORCH-333**,
+    `history/2026-10-31-orch-313-skip-count-sweep.md`), prose and two
+    script comment blocks. Both were based on `9f76b54`, so nothing is
+    stacked.
+
+    **One conflict, in this file, adjacency and not content.** Both
+    branches appended at the end of *Open*, so git could not order them.
+    Resolved by keeping **all three** rows in merge order, no cell
+    rewritten and no row dropped; each is byte-identical to its branch's
+    own line apart from `ORCH-NEXT` becoming **ORCH-333**. **Both
+    branches claimed ORCH-331** — `orch-323` wrote it out, `orch-313`
+    wrote `ORCH-NEXT` and its handoff said *"ORCH-331 unless another
+    branch claims it"* — which is **ORCH-237**'s class, visible only
+    from outside both branches. The **two-way board check passed**: all
+    **7** lines the two branches wrote are verbatim in the merged file,
+    and the merged file's net change against `main` is **exactly** their
+    union. Outside this file the two file sets are **disjoint, verified
+    rather than assumed**, and `fmt` and `clippy -D warnings` were run on
+    the merged tree **before** the gate, which is what caught batch 32's
+    signature-change conflict and found none here.
+
+    **One decision, D287**, pasted verbatim from `orch-323`'s *Drafted
+    for `herd-merger`* with only `D-NEXT` replaced: the hub charges a
+    figureless job `C_hub = (lent − floor) ÷ jobs_at_once` whether it
+    minted that job as a reading or a requester submitted one, because
+    the runner grants both the whole cap and nothing on the frame says
+    which is which. **`PROTOCOL_VERSION` stays 3.** The count is
+    **deliberately kept** in the two cases a sum in mebibytes cannot
+    answer — a silent host, where `charged_ceiling_mib(None, None)` is 0
+    by design, and **D182 §3**, a count of jobs with nothing saying what
+    each was granted — each with its own test. That departs from the
+    brief, which said to drop the count outright, and it is **the
+    correct outcome and not a shortfall**: it is the condition under
+    which dropping it elsewhere is safe. Above **D286** and
+    **ORCH-332**, re-measured here as the highest on `main` **and** on
+    every unlanded branch: all **31** non-ancestor remote refs were read
+    at this integration and none holds a `D` above **286** or an `ORCH`
+    above **332**, so no gap was closed and **D143, D154 and D170
+    stay**.
+
+    **`docs/status.md` is at 90 lines and the merger added nothing to
+    it** (**D276**, zero slack): `orch-323` replaced one clause in
+    place — *"a reading weighs no memory (ORCH-126)"* became *"no frame
+    marks a reading (**D285**)"* — and nothing else in that file was
+    falsified by this batch, which was read for it rather than assumed.
+    Its skip figures do not move, because neither branch adds or removes
+    a skip: `local.txt` holds **13** names and
+    `local-under-load.txt` the **2**-name delta, 15 under load.
+
+    **A fourth hand-maintained skip total exists that ORCH-333 does not
+    name, and this batch is what created it.** `orch-323` corrected
+    `herd-runner/src/cgroup.rs:2532` from *"the twelve standing skips"*
+    to *"the thirteen standing skips"* in the same batch as `orch-313`
+    swept counts out of `scripts/` and `docs/`. It is **true today**,
+    and it is outside both ORCH-333's three named sentences and that
+    sweep's own detector, which reads `scripts/` and `docs/` only.
+    Reported here and **not edited**: it is one more member of
+    ORCH-333's class, for that row's owner to take or leave.
+
+    **Two post-push runs were owed and are recorded here, because batch
+    32 left no numbered item in this section** — a landing cannot record
+    its own, and batch 32's is the first that did not record its
+    predecessor's either, so the chain skipped one. Batch 31: `ci.yml`
+    run **41206929574** on `main` at `f473a88`,
+    `completed`/`success` in 8m48s. Batch 32: run **41222040363** at
+    `9f76b54`, `completed`/`success` in 10m49s. Batch 33's own gate job
+    id, verbatim verdict, skip list and gated sha are in the merge
+    message and the merger's report, and **its post-push run id is in
+    the report alone**, because this item is committed before the gate
+    runs (ORCH-121).
