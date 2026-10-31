@@ -172,12 +172,11 @@ had no dead pointer to correct and stays at its 90 lines (**D276**).
 **All four Rust gates plus `check-docs.sh`, through Herd as one bare
 `./scripts/gate.sh`** (`.rs` changed, so the full set is owed).
 
-**Four attempts, and the output of the one that counts cannot be
-here.** The first was submitted before this file was committed and
-`gate.sh` **refused** it, which is the right answer and is recorded rather than
-tidied away — job **`j0000000174`**, `"passed": false`,
-`"exit_code": 3`, `"cause": "exited"`, wall 55 ms, `bytes_written` 0,
-nothing compiled:
+**Three submissions, three verdicts, and no fourth run.** The first
+was submitted before this file was committed and `gate.sh` **refused**
+it, which is the right answer and is recorded rather than tidied
+away — job **`j0000000174`**, `"passed": false`, `"exit_code": 3`,
+`"cause": "exited"`, wall 55 ms, `bytes_written` 0, nothing compiled:
 
 ```text
 gate: REFUSED sha=714176f1a7e16b59cdf3168946461732d91067a6 reason=the working tree is not clean, so the gate would not be about 714176f1a7e16b59cdf3168946461732d91067a6
@@ -270,13 +269,25 @@ job's own log and to the receipt `gate.sh` writes under
 `target/herd-gate/<sha>.receipt` in this worktree, and **verbatim to
 this agent's report**. Nothing is added to the tree after it.
 
-**And its verdict is reported as it comes.** If the branch's own change
-is red again, it is red and the branch is not pushed. If the only red is
-*Risks and findings* 8's load-sensitive fixture, that is said in those
-words, with both runs' figures, and the merger judges the batch — a green
-gate for the landing is `herd-merger`'s own run on its own integration
-tip and never this branch's (`workflow.md`, *What a landing is*), so
-nothing here can be mistaken for one.
+**And it did not happen, on instruction.** A fourth submission was
+stopped by the orchestrator before it was made, so **this branch's tip
+is one commit past the last sha a gate ran on**. Said plainly rather
+than implied:
+
+- the last gate was `j0000000179` on **`13efad21`**, RED on one test
+  only, *Risks and findings* 8's, which is pre-existing, reaches none
+  of this change on this host and passes as a control;
+- the commits after it add **this file's** findings 8 and 9 and one
+  `board.md` row — docs, no `.rs`;
+- `cargo fmt --all --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings` were run **locally** on the tip, both
+  **exit 0** (clippy 21.41 s warm), and `./scripts/check-docs.sh` is
+  green on it. Those are seconds against six to eleven minutes of a
+  shared build slot, and they are what the two earlier gates died on.
+- **no receipt exists for this tip, and none is claimed.** It would not
+  be the landing's in any case: a green gate for a landing is
+  `herd-merger`'s own run on its own integration tip, per worktree and
+  never travelling (`workflow.md`, *What a landing is*).
 
 **`./scripts/bench-preflight.sh` ran first, every time, and its refusal
 was obeyed by waiting.** Green at load 6.27 of a 9.00 ceiling before any
@@ -437,6 +448,45 @@ a background process — finds it gone, and that is the promise the flag
 makes rather than a surprise. **Said plainly rather than left
 unstated**, as the brief asked.
 
+### 9. Two mechanisms can produce this, and this fix closes one
+
+It became measured on 2026-10-31, after this task's brief, that **a
+tmpfs byte a job writes is charged to that job's own `memory.max`**:
+`shmem 62988288` read from the writing cgroup's own `memory.stat` with
+`memory.peak` sitting exactly on the ceiling, against a page-cache
+control that reached the same ceiling 170 times and survived because
+page cache is reclaimable. Unreclaimable shmem therefore **persists
+from one step into the next inside the same job cgroup** — one cgroup
+per job, nothing reset between steps.
+
+So two different things could put a memory verdict on `down`:
+
+- **(a) one kill counted twice**, which is what this branch fixes and
+  what the consumer's kernel log proves for j0000000069 and
+  j0000000460: one OOM event, at the end of `run`, nothing during
+  `down`;
+- **(b) two real kills**, where `run`'s own tmpfs charge is still
+  against the ceiling when `down` starts, so `down` is genuinely
+  killed. The kernel log rules this out for **their** two jobs. It does
+  not rule it out in general.
+
+**This fix closes (a) and deliberately leaves (b) reported.** That is
+outcome 2 of the brief and it is tested twice: a second
+`oom_group_kill` event gives `down` its own verdict
+(`two_real_kills_are_both_reported`), and so does a second rise in the
+per-process counter on a kernel with no group counter
+(`two_real_kills_are_both_reported_without_the_group_counter`). A
+`down` the kernel really killed has no exit code, so the exit-0 clause
+does not suppress it either. **Which is the right division**: (b) is not
+a mis-attribution, it is a true second kill, and the thing a reader
+needs there is two lines that name their own steps — which is what
+outcome 3 now gives.
+
+What (b) does leave owed, and it is not this task's: a `down` that is
+killed because `run`'s shmem is still charged is a `down` stopped by
+somebody else's bytes, and nothing in the record says so. That belongs
+with whoever holds the tmpfs-charging finding, not here.
+
 ### 5. One premise of the brief that reads differently after measurement
 
 The brief lists the complete set of log writers as `say_in_the_log` at
@@ -490,6 +540,32 @@ the class ORCH-128 says will keep arriving.
 **Nothing was done to it here**: not a skip list, not an expectation,
 not a threshold. A row, so that the next branch it reddens is not the
 one that has to discover it.
+
+**Three measurements say it is the host and not this change**, and the
+third costs nothing:
+
+1. **A control**, named as one: that single test alone, locally, on this
+   tree, after `bench-preflight.sh` cleared at load1 **6.08** —
+   `test a_link_cut_while_the_runner_is_full_loses_no_job ... ok`,
+   `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8
+   filtered out; finished in 10.37s`, having printed the very sentence
+   whose absence the gate failed on: *"every one of the 2 jobs came back
+   with its own verdict"*. The whole suite was **not** re-run locally;
+   one named test is the exception.
+2. **An A/B inside this branch**: ok on `adcc4df8`, FAILED on
+   `13efad21`, with one `if`, two reformatted assertions and one unit
+   test between them.
+3. **The code cannot reach it on this host, and the test's own stderr
+   says why.** It prints *"memory ceiling: FALLING BACK to a
+   per-process address-space limit… cgroup v2 delegation is
+   unavailable"*, so `cgroup` is `None` for every job it runs. The only
+   input this change's attribution reads is then absent:
+   `OomKills::default()` every step, and `killed_in_this_step` returns
+   `false` — exactly what `oom_kills > since` returned when both sides
+   were 0. The one other new behaviour, the step-naming log line, is
+   written only for a step whose verdict **is** a cap, and every job in
+   that fixture ends `exited 0` or `lost`. On this host the change is a
+   no-op for it, by construction.
 
 ### 6. The workspace walk was kept clear of
 
@@ -630,9 +706,20 @@ and version numbers, never by anybody looking (invariant 9, **D161**).
 ## Resume point
 
 `herd-merger` takes this branch into the batch: allocate the `D-NEXT`
-entry's number, check the three `ORCH-NEXT` rows survived the board merge
+entry's number, check the five `ORCH-NEXT` rows survived the board merge
 verbatim, and gate the integration tip. Nothing in this task is left
 half-done.
+
+**One thing to know before that gate, so that it is not a surprise.**
+*Risks and findings* 8's fixture,
+`a_link_cut_while_the_runner_is_full_loses_no_job`, goes red on this
+host above a one-minute load of about 9 and is on no skip list. It is
+nothing to do with this branch — the control, the A/B and the code
+argument are all in that finding — but it can redden an integration run
+the same way it reddened this one. If it does, the answer is **not** a
+skip list: it is to re-measure at a lower load and to read the figure in
+its own failure text. `bench-preflight.sh`'s refusal is the cheapest
+warning there is, and it refused four times during this task.
 
 If the next task is the follow-up: the first *Owed* row's second half is
 the smaller one and the more useful — one clause in the runner's startup
@@ -641,18 +728,20 @@ the *Open* row's unknown into a measurement.
 
 ## Processes
 
-- **PIDs started and ended by this task:** one background shell, started
-  by this agent to wait on `./scripts/bench-preflight.sh` until it
-  cleared, and ended on its own when the preflight passed. Its pid is in
-  this agent's report. Nothing else was started and **nothing was
+- **PIDs started and ended by this task:** background shells of my
+  own, to wait on `./scripts/bench-preflight.sh` until it cleared, each
+  ending on its own when the preflight passed, and one stopped by its
+  own task id when the orchestrator said to stop. Their pids are in this
+  agent's report. Nothing else was started and **nothing was
   signalled**: no `kill`, no `pkill` in any form, nothing by name.
   `3006543`, `3021002`, `565152` and `662711` were never read, touched or
   signalled. `/sys/fs/cgroup` was read and never written; no cache was
   dropped.
 - **`./scripts/bench-preflight.sh` ran before every heavy phase** and its
-  refusal was obeyed by waiting, once at load 10.28 against a ceiling of
-  9.00. **`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never set or
-  exported.**
+  refusal was obeyed by waiting, four times — load 10.28, 9.29, 11.14 and
+  13.04 against a ceiling of 9.00 — and its **verdict line** was read
+  each time, never its exit status through a pipe.
+  **`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never set or exported.**
 - **Own build tree:** `CARGO_TARGET_DIR` was
   `/mnt/ssd_980/herd/build/oom-step-attribution`, distinct so that the
   hub's dedup key could not join this submission to another agent's, and
