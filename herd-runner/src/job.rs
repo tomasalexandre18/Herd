@@ -2388,6 +2388,12 @@ mod tests {
     /// against a job that declared 1792 MiB.
     const EIGHT_GIB: u64 = 8_589_934_592;
 
+    /// The line one capped step writes into the job's own log, as a reader
+    /// meets it.
+    fn capped_line(step: &str) -> String {
+        format!("the {step} step was stopped at this runner's own memory cap of {EIGHT_GIB} bytes")
+    }
+
     fn a_session(job_id: &JobId) -> (Session, CancelToken) {
         let session = Session::new();
         let cancel = session
@@ -2423,7 +2429,7 @@ mod tests {
 
         let log = session.held_output_of(&job_id, 1);
         assert!(
-            log.contains("the run step was stopped at this runner's own memory cap of 8589934592 bytes"),
+            log.contains(&capped_line("run")),
             "the step that was stopped names itself and its figure: {log}"
         );
         assert!(
@@ -2538,11 +2544,11 @@ mod tests {
             "two kills, two lines, each naming its own step: {log}"
         );
         assert!(
-            named[0].contains("the run step was stopped at this runner's own memory cap of 8589934592 bytes"),
+            named[0].contains(&capped_line("run")),
             "{log}"
         );
         assert!(
-            named[1].contains("the down step was stopped at this runner's own memory cap of 8589934592 bytes"),
+            named[1].contains(&capped_line("down")),
             "{log}"
         );
         // And the takedown still says what a failed takedown means, as the
