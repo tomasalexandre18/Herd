@@ -3151,6 +3151,33 @@ impl JobStore for JobDirStore {
         self.write_record(&record)
     }
 
+    fn note_collection_short(
+        &self,
+        id: &JobId,
+        got: &crate::job::CollectionShortfall,
+        why: &str,
+    ) -> Result<bool> {
+        // **The one-shot test, with no lock held**, because `job_events`
+        // takes the lock itself and this store's is not reentrant. Two
+        // callers racing between the read and the append would write the
+        // line twice, which is a duplicate on a history rather than a wrong
+        // figure; what the test is for is the unbounded case — a line per
+        // late `herdctl wait --outputs-to`, for ever — and that it prevents.
+        if self.job_events(id)?.is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event.what, crate::job::JobEventKind::CollectionShort { .. }))
+        }) {
+            return Ok(false);
+        }
+        let _live = self.lock()?;
+        if self.read_record(id)?.is_none() {
+            return Ok(false);
+        }
+        self.append_event(id, &JobEvent::collection_short(Timestamp::now(), got, why))?;
+        Ok(true)
+    }
+
     fn sweep_outputs(&self) -> Result<crate::job::Sweep> {
         {
             let mut live = self.lock()?;
