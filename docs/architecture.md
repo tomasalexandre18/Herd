@@ -1003,7 +1003,7 @@ flowchart TB
     BASE(["the runner's BASE cgroup: its own, from Delegate=yes,<br/>or --cgroup-root, which must CONTAIN this runner"])
     LEAF["herd-runner.leaf — the runner moves its OWN processes here,<br/>because cgroup v2 forbids a cgroup from holding processes<br/>once a controller is enabled for its children. Then it<br/>writes +memory into the base's cgroup.subtree_control"]
     CG["one cgroup per job: herd-job-TAG, beside the leaf"]
-    K1["memory.max — the kernel ceiling. THIS JOB'S OWN figure where the hub<br/>costed it (declared memory + declared tmpfs + 10% margin),<br/>--job-memory-max where it did not,<br/>default 2 GiB, REFUSED below 16 MiB"]
+    K1["memory.max — the kernel ceiling, and a declaration can only TIGHTEN it:<br/>min(declared memory + declared tmpfs + 10% margin, --job-memory-max)<br/>where the hub costed the job, --job-memory-max where it did not.<br/>Default 2 GiB, REFUSED below 16 MiB"]
     K2["memory.swap.max = 0"]
     K3["memory.oom.group = 1 — the job, and ONLY the job: the<br/>runner is in a sibling cgroup and so is every other job"]
     K4["cpu.weight — --job-cpu-weight"]

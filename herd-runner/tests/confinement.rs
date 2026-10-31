@@ -3593,31 +3593,38 @@ fn workspace_root() -> Option<PathBuf> {
     }
 }
 
-/// **A job runs under the ceiling it declared, not under the one figure its
+/// **A job is held to the ceiling it declared, not to the one figure its
 /// runner's owner lent every job** — on a real hub, a real runner and the real
 /// kernel (invariant 5).
 ///
 /// This is the defect, end to end. The hub has always read `memory_mib` off
-/// the record and admitted the job against it; the runner is the only thing
-/// in the product that writes a kernel memory ceiling, and until now the
-/// frame carried no figure at all, so a job admitted against 512 MiB of
-/// declared need ran under whatever `--job-memory-max` said. On the
-/// consumer's fleet that was an 8 GiB cap killing a job whose memory figure
-/// and tmpfs reservation came to exactly 8 GiB.
+/// the record and admitted the job against it; the runner is the only thing in
+/// the product that writes a kernel memory ceiling, and until now the frame
+/// carried no figure at all, so every job on a machine ran under whatever
+/// `--job-memory-max` said whatever it had declared.
+///
+/// **The direction asserted is downwards, and that is not a weaker test — it
+/// is the only direction there is.** `herd_runner::job_ceiling` bounds a
+/// declared ceiling above by `--job-memory-max`, because the hub does not
+/// know that figure and a declaration a *requester* sent must not raise the
+/// most any job may hold on somebody else's machine (invariant 2). So a
+/// declaration can only ever tighten, and tightening is what this proves: the
+/// machine lends 512 MiB a job, the job declares 48 MiB, and the 64 MiB
+/// string stops being affordable.
 ///
 /// **The pair is the assertion, and the second half is what makes it worth
-/// anything.** The same script, on the same runner, with the same allowance
-/// of real memory: declared, it survives; undeclared, the machine's 32 MiB
-/// stops it. A test with only the first half would pass on a runner whose own
-/// figure happened to be generous, which is to say it would pass against the
-/// defect.
+/// anything.** The same script, on the same runner, with the same real memory
+/// available: declared, it is stopped; declaring nothing, it finishes under
+/// the machine's own 512 MiB. A test with only the first half would pass on a
+/// runner whose figure was tight anyway, which is to say it would pass against
+/// the defect — and the control run with the change removed is in this
+/// branch's handoff.
 ///
 /// **Nothing here skips.** The figure is enforced by the job's own cgroup
 /// where this host has one and by `RLIMIT_AS` where it does not, and the
-/// direction asserted — 32 MiB stops a 67 MiB string, 563 MiB does not — is
-/// the same under both. What the fallback cannot do is bound a process
-/// *tree*, and that is asserted where it belongs, on the sentence the runner
-/// prints (`herd_runner::job_ceiling`'s own tests).
+/// direction asserted is the same under both. What the fallback cannot do is
+/// bound a process *tree*, and that is asserted where it belongs, on the
+/// sentence the runner prints (`herd_runner::job_ceiling`'s own tests).
 #[tokio::test]
 async fn a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s() {
     // A machine that says what it lends and what it keeps, because a hub
@@ -3627,65 +3634,71 @@ async fn a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s() {
         "declared-ceiling",
         herd_proto::HostSize::new(Some(8192), Some(4)).with_floor(Some(1024)),
         |confinement| {
-            // What this machine's owner lends every job: far less than the
-            // job below declares, and far less than it uses.
-            confinement.memory_max = 32 << 20;
+            // What this machine's owner lends every job: far more than the
+            // job below declares, and more than the script needs.
+            confinement.memory_max = 512 << 20;
             confinement.timeout = Duration::from_secs(60);
         },
     )
     .await;
 
-    // A bounded hog: twenty-five doublings of one byte is a 32 MiB string in
-    // the shell's own process, and building it holds the old copy and the
-    // new at once — past the machine's 32 MiB and well inside the 563 MiB
-    // the job declares. Bounded rather than the unbounded doubling that
-    // `an_allocation_past_the_ceiling...` uses: the job has to be able to finish.
-    let hog = "a=x; n=0; while [ $n -lt 25 ]; do a=\"$a$a\"; n=$((n+1)); done; \
+    // A bounded hog: twenty-six doublings of one byte is a 64 MiB string in
+    // the shell's own process, and building it holds the old copy and the new
+    // at once — comfortably past the 52 MiB the declaration below earns, and
+    // comfortably inside the 512 MiB the machine lends. Bounded rather than
+    // the unbounded doubling `an_allocation_past_the_ceiling_kills_the_job_
+    // and_only_the_job` uses, because this test is about *which* ceiling bit
+    // and the job that is not stopped has to be able to finish.
+    let hog = "a=x; n=0; while [ $n -lt 26 ]; do a=\"$a$a\"; n=$((n+1)); done; \
                echo held ${#a} bytes";
 
     let declared = harness
         .run_declaring(
             hog,
             herdctl::Declared {
-                // 512 MiB, which with the margin is a 563 MiB ceiling.
-                memory_mib: Some(512),
+                // 48 MiB, which with the margin is a 52 MiB ceiling — above
+                // the 16 MiB floor, so this is the declaration biting and not
+                // the floor.
+                memory_mib: Some(48),
                 ..herdctl::Declared::default()
             },
         )
         .await;
-    assert_eq!(
+    assert_ne!(
         declared.outcome,
         JobOutcome::Exited { code: 0 },
-        "a job that declared 512 MiB was stopped by its runner's own 32 MiB: {:?} / {} / {}",
+        "a job that declared 48 MiB was allowed to hold 64 MiB, so its declaration \
+         reached nothing: {:?} / {} / {}",
         declared.outcome,
         declared.out,
         declared.err
     );
-    assert_eq!(
-        declared.out.trim(),
-        "held 33554432 bytes",
-        "and it held the whole 32 MiB: {} / {}",
-        declared.out,
-        declared.err
+    assert!(
+        !declared.out.contains("held 67108864"),
+        "the declared job ran past the ceiling it declared: {}",
+        declared.out
     );
 
     // The control, and the reason the half above is a measurement: the same
-    // script declaring nothing is held to the machine's figure, exactly as
-    // every job was before this field existed.
+    // script declaring nothing is held to the machine's figure, which is
+    // generous, and finishes — so what stopped the job above was its own
+    // declaration and not this host, this script or this shell.
     let undeclared = harness.run(hog).await;
-    assert_ne!(
+    assert_eq!(
         undeclared.outcome,
         JobOutcome::Exited { code: 0 },
-        "a job that declared nothing must still be held to --job-memory-max, or this \
-         runner has stopped capping the jobs nobody costed: {:?} / {} / {}",
+        "a job that declared nothing must still get --job-memory-max, which here is \
+         512 MiB and is ample: {:?} / {} / {}",
         undeclared.outcome,
         undeclared.out,
         undeclared.err
     );
-    assert!(
-        !undeclared.out.contains("held 33554432"),
-        "the undeclared job ran past the machine's 32 MiB: {}",
-        undeclared.out
+    assert_eq!(
+        undeclared.out.trim(),
+        "held 67108864 bytes",
+        "and it held the whole 64 MiB: {} / {}",
+        undeclared.out,
+        undeclared.err
     );
 
     // And the runner is unharmed by either of them.

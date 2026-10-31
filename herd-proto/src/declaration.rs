@@ -647,6 +647,15 @@ impl Requirements {
 /// against the memory a host lends, pays a tenth of a job for it rather than
 /// a whole one.
 ///
+///
+/// **What the margin applies to, and what it never lifts.** It applies to the
+/// *declared sum* and to nothing else. The ceiling a runner writes is bounded
+/// above by its owner's `--job-memory-max`, which is an absolute cap on the
+/// machine: the margin can make a declared figure's ceiling larger than the
+/// declaration, never larger than what the machine's owner lends one job
+/// (`herd_runner::job_ceiling`). A margin that could lift an owner's
+/// configured bound would be a figure a requester sent weakening invariant 2
+/// on somebody else's host.
 /// **One figure, in one place.** Both sides have to charge the same ceiling —
 /// `herd-hub/src/matcher.rs` is explicit that a hub counting a different set
 /// from the runner is the defect — so the margin lives here, on the contract,

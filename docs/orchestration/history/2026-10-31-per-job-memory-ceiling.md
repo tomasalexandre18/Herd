@@ -13,7 +13,7 @@
 ## Done
 
 **The defect, as briefed, is real. Every link was verified before anything
-was changed; all eleven citations hold, with the two line numbers noted
+was changed; every citation holds, with the two line numbers noted
 below.**
 
 | Claim | Verified at |
@@ -62,8 +62,14 @@ with its body's `let Ceiling::Cgroups` at `:604`. Nothing turned on either.
    nothing, and `Err` (a per-thread figure with no `-j`, D82) travels as
    nothing too, because a ceiling invented out of half a figure would be
    worse than the one the machine's owner lent.
-5. **The runner holds the job to it** (`herd_runner::job_ceiling`,
-   `herd-runner/src/confine.rs`): `JobCeiling { memory_max, need, floored }`.
+5. **The runner holds the job to it, and never to more than its owner lent**
+   (`herd_runner::job_ceiling`, `herd-runner/src/confine.rs`):
+   `JobCeiling { memory_max, need, lent, clamped, floored }`. The declared
+   ceiling is `min`-ed with `--job-memory-max`, so **a declaration can only
+   ever tighten** — the coordinator's ruling of 2026-10-31, and it is
+   invariant 2 rather than an optimisation: the hub does not know
+   `--job-memory-max` (`server.rs:1642`), so a figure a requester sent would
+   otherwise raise the most any job may hold on somebody else's machine.
    `job::execute` clones the `Confinement` and replaces its one memory figure,
    so `memory.max`, the fallback's `RLIMIT_AS` and the figure reported with
    `stopped_by_cap { memory }` are **one number by construction** — which is
@@ -83,10 +89,26 @@ with its body's `let Ceiling::Cgroups` at `:604`. Nothing turned on either.
 **`f(X)`, with its margin and the written reason.**
 
 ```
-ceiling_bytes = max( ((memory_mib + tmpfs_mib) * 110 / 100) * 2^20 ,
+ceiling_bytes = max( min( ((memory_mib + tmpfs_mib) * 110 / 100),
+                          job_memory_max_mib ) * 2^20 ,
                      MINIMUM_MEMORY_MAX )        # 16 MiB
 ```
 
+**So a declaration can only ever tighten a job's ceiling, never loosen it.**
+
+- **The `min` is invariant 2, and it is not an optimisation.** Without it a
+  figure a *requester* sent could raise the most any job may hold on somebody
+  else's machine: a runner lending 25 GiB at `--job-memory-max 2GiB` keeps
+  twelve seats (`jobs_at_once`), and twelve ceilings of 4.5 GiB is 52 GiB
+  permitted on a host that lent 25. **The hub cannot stop that** — it does not
+  know `--job-memory-max`, which no frame carries (`server.rs:1642`) — so it
+  will place a job declaring 4 GiB on a 2 GiB-cap runner and did so before
+  this field existed, and the runner held it to 2 GiB. With the bound,
+  `seats × --job-memory-max` still bounds the permitted total exactly as it
+  did, `--job-memory-max` goes on meaning what its name says, and no
+  machine's exposure is worse on any declaration however wrong. Weakening
+  invariant 2 is Alexa's to decide, not a side effect of carrying a figure.
+  A clamped job's own line says it clamped and says whose figure won.
 - **Both figures, because they are not independent.** Tmpfs pages are charged
   to the cgroup that writes them and `memory.swap.max` is 0, so they are
   unreclaimable and sit **inside** the ceiling. `j0000000069`: `limit
@@ -107,6 +129,9 @@ ceiling_bytes = max( ((memory_mib + tmpfs_mib) * 110 / 100) * 2^20 ,
   an order of magnitude above it, which is the side to be wrong on for a cap
   meant to kill a runaway job and not a working one, and small enough that
   ORCH-312's packing pays a tenth of a job for it rather than a whole one.
+  **And it applies to the declared sum and to nothing else**: the margin can
+  make a declared figure's ceiling larger than the declaration, never larger
+  than what the machine's owner lends one job.
   **Provenance:** the three GiB figures and the two kernel strings are the
   brief's quotation of the consumer's own report; the ~40 MiB residue is
   arithmetic on those rounded figures and is marked as such in the code.
@@ -205,10 +230,8 @@ elided from each path and nothing else is):
 docs ok
 ```
 
-The eleven new tests. Seven were run alone by name; the other four — the
-remaining `declaration::tests` — ran inside `cargo test -p herd-proto --lib`,
-which is the line quoted under them. Their known-bad fixtures are in the
-controls table below, not here:
+**The twelve new tests, each run alone by name** on this tree. Their
+known-bad fixtures are in the controls table below, not here:
 
 ```
 test declaration::tests::a_ceiling_clears_the_sum_that_killed_j0000000069 ... ok
@@ -217,6 +240,7 @@ test declaration::tests::an_impossible_figure_saturates_rather_than_wrapping ...
 test declaration::tests::the_line_names_both_figures_and_the_ceiling ... ok
 test what_a_job_was_costed_at_rides_the_assignment_and_an_older_runner_ignores_it ... ok
 test confine::tests::a_costed_job_gets_its_own_ceiling_and_an_uncosted_one_gets_the_machine_s ... ok
+test confine::tests::a_declaration_over_what_the_owner_lends_is_clamped_to_it_in_the_cgroup ... ok
 test confine::tests::a_declaration_under_the_floor_is_floored_and_says_so ... ok
 test confine::tests::a_host_that_cannot_enforce_a_per_job_ceiling_says_so_per_job ... ok
 test cgroup::tests::each_job_s_cgroup_carries_the_ceiling_that_job_was_costed_at ... ok
@@ -224,6 +248,7 @@ test server::tests::an_assignment_carries_a_declared_figure_and_never_a_guessed_
 test a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s ... ok
 ```
 
+Each of the twelve reported `test result: ok. 1 passed; 0 failed; 0 ignored`.
 `cargo test -p herd-proto --lib` in full: `93 passed; 0 failed; 0 ignored`.
 
 
@@ -238,25 +263,31 @@ has proved nothing.
 | the figure removed from the frame under test (`need: None`) | `what_a_job_was_costed_at_rides_the_assignment_and_an_older_runner_ignores_it` | `panicked … both figures have to be on the wire … {"type":"assign_job","job_id":"j1","attempt":1,"command":["true"]}` |
 | `open_for_job` ignores the figure it is given (`let _ = memory_max;`, the pre-change behaviour) | `each_job_s_cgroup_carries_the_ceiling_that_job_was_costed_at` | `panicked … the ceiling in the cgroup must be this job's own, not the machine's 2 GiB` |
 | `need_for` returns `None` for every job | `an_assignment_carries_a_declared_figure_and_never_a_guessed_one` | `panicked … assertion left == right failed` |
-| `job_ceiling` ignores the job's figure (`let asked = global;`) | `a_costed_job_gets_its_own_ceiling_and_an_uncosted_one_gets_the_machine_s` | `panicked … 8192 MiB declared plus the margin, and not the machine's 2 GiB` |
-| the same fixture | `a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s` (end to end) | `panicked … a job that declared 512 MiB was stopped by its runner's own 32 MiB: Exited { code: 2 } / /bin/sh: xrealloc: cannot allocate 8388736 bytes` |
+| **the `min` removed** (`let asked = declared.unwrap_or(global);`) — the declaration honoured upwards | **`a_declaration_over_what_the_owner_lends_is_clamped_to_it_in_the_cgroup`** | `panicked at confine.rs:1780 … the owner's configured cap wins over a figure a requester sent` |
+| `job_ceiling` ignores the job's figure (`let asked = global;`) | `a_costed_job_gets_its_own_ceiling_and_an_uncosted_one_gets_the_machine_s` | `panicked … 8192 MiB declared plus the margin, and not the machine's 16 GiB` |
+| the same fixture | `a_job_runs_under_the_ceiling_it_declared_and_not_its_runner_s` (end to end) | `panicked at confinement.rs:3667 … a job that declared 48 MiB was allowed to hold 64 MiB, so its declaration reached nothing: Exited { code: 0 } / held 67108864 bytes` |
 
-The last row is the one that matters: with the figure not reaching the runner,
-the shell dies inside the 32 MiB the machine lent, naming the allocation. With
-it reaching the runner the same script holds its whole 32 MiB string. The
-fallback host's own sentence, printed by the green run of that test and quoted
-verbatim, is the evidence for point 4:
+Two of those rows are the ones that matter. **The clamp:** with the `min`
+removed, a job declaring 13516 MiB on a runner lending 2 GiB has 13516 MiB
+written into its cgroup, read back out of `memory.max` — which is invariant 2
+weakened by a figure a requester sent, and is what the `min` forbids. **The
+chain:** with the declared figure not reaching the runner at all, the job that
+declares 48 MiB finishes its 64 MiB string under the machine's generous
+512 MiB, and the test says so in those words.
+
+The fallback host's own sentence, printed by the green end-to-end run and
+quoted verbatim, is the evidence for point 4:
 
 ```
-herd-runner: job j0000000001 declares 512 MiB of memory and 0 MiB of tmpfs,
-which is 563 MiB of ceiling once the 10% margin is on, and this host CANNOT
+herd-runner: job j0000000001 declares 48 MiB of memory and 0 MiB of tmpfs,
+which is 52 MiB of ceiling once the 10% margin is on, and this host CANNOT
 enforce a per-job ceiling: cgroup v2 delegation is unavailable: this runner
 cannot create a cgroup under /sys/fs/cgroup/chatons.slice/chatons-herd-claude-256608.scope
 (Permission denied (os error 13)). Run it as a systemd unit with Delegate=yes,
 or inside a delegated scope, and point --cgroup-root inside that subtree. What
-it gets instead is an address-space limit of 563 MiB on its first process,
+it gets instead is an address-space limit of 52 MiB on its first process,
 which bounds neither the job's process tree nor its resident memory — so the
-ceiling this job was admitted against is NOT ENFORCED here
+ceiling named above is NOT ENFORCED here
 ```
 
 and the hub's own line from the same run, which is the other half of the
@@ -264,8 +295,20 @@ chain:
 
 ```
 herd-hub: j0000000001 is attempt 1 on runner m4-declared-ceiling: … admitted
-512 MiB of memory, 6.5 GiB free of 7 GiB after it (8 GiB lent, 1 GiB kept as
+48 MiB of memory, 6.9 GiB free of 7 GiB after it (8 GiB lent, 1 GiB kept as
 its own floor); it reserves no tmpfs …
+```
+
+**And what a clamped job prints**, captured from the clamp test's own
+`JobCeiling::line` under `--nocapture` and quoted verbatim — the word, the
+figure that did not win and the figure that did:
+
+```
+herd-runner: job <id> declares 8192 MiB of memory and 4096 MiB of tmpfs,
+which is 13516 MiB of ceiling once the 10% margin is on — more than the 2 GiB
+this machine's owner lends any one job, so it is CLAMPED to the owner's
+figure: 2 GiB is this job's ceiling, and that is the memory.max of its own
+cgroup on this host
 ```
 
 **The last run, named and not quoted**, on this committed tree:
@@ -277,11 +320,11 @@ worktree's own `CARGO_TARGET_DIR`. Its receipt goes to
 report, and the output is **not** in this file: a handoff is a
 docs file, and a gate run made before it was written tested a different tree.
 
-**Skips.** **This branch introduces none, and changes none.** The eleven new
-tests were sited so that this host can make every one of their assertions,
-and the three `scripts/expected-skips/` lists are untouched: the twelve
-standing `HERD-SKIPPED` lines of `local.txt`, the two load-conditional names
-of `local-under-load.txt` and the thirty-eight `#[ignore]` names of
+**Skips.** **This branch introduces none, and changes none.** The twelve new
+tests, in six files, were sited so that this host can make every one of their
+assertions, and the three `scripts/expected-skips/` lists are untouched: the
+twelve standing `HERD-SKIPPED` lines of `local.txt`, the two load-conditional
+names of `local-under-load.txt` and the thirty-eight `#[ignore]` names of
 `ignored.txt` are all exactly as they were on `d32c87a`.
 
 **What any one run of the gate joins is a property of the host at that
@@ -295,28 +338,32 @@ never counted as a pass (D27, invariant 5).
 
 ## Risks and findings
 
-1. **A declaration is now binding downwards.** `ORCH-313`, drafted below.
-   A job that declares **less** than its runner's `--job-memory-max` is now
-   held to the smaller figure. On the consumer's server, where
-   `--job-memory-max` is `8GiB` (`docs/joining.md:527`), a job whose reading
-   answers `memory_mib=2048 tmpfs_mib=0` gets a 2252 MiB ceiling where it used
-   to get 8 GiB. **This is the intent of the change and the precondition of
-   ORCH-312** — a runner cannot pack by a figure it does not enforce — but it
-   is the one way this landing can make a job fail that passed the day before.
-   It is reported, not asked (CLAUDE.md, outcome 3), and the reversal is one
-   line: `max(f(declared), --job-memory-max)` in `job_ceiling`.
-   **Not measured against their declarations:** Herd is shipped, not operated
-   (D161), so nobody here knows what their reading answers. The one declared
-   sum we do know, `j0000000069`'s, is **helped** (9011 MiB against the 8192
-   that killed it).
-2. **The two halves of invariant 2 now count different memory.** `ORCH-312`.
-   D180's arithmetic was *"the cap every job is actually permitted is what is
-   counted"*, and after this branch that is no longer one number. On a runner
-   lending 25 GiB at `--job-memory-max 2GiB`, twelve seats can hold twelve
-   jobs declaring 4 GiB and permit 52 GiB. **The brief ordered this split**
-   and the next task closes it; until it lands, a fleet whose jobs declare
-   more than their runner's figure is less protected by the seat count than
-   it was, and more protected by the ceiling.
+1. **A declaration is now binding downwards, and only downwards.**
+   `ORCH-313`, drafted below. A job that declares **less** than its runner's
+   `--job-memory-max` is held to the smaller figure: on the consumer's server,
+   where `--job-memory-max` is `8GiB` (`docs/joining.md:527`), a job whose
+   reading answers `memory_mib=2048 tmpfs_mib=0` gets a 2252 MiB ceiling where
+   it used to get 8 GiB. **Upwards it cannot move at all**, so the one job in
+   their own report, `j0000000069`, whose declared sum earns 9011 MiB, is
+   clamped back to the 8 GiB that killed it: **no regression there, and no fix
+   either** — the fix for that job is their own declaration or their own
+   `--job-memory-max`, and this branch makes neither choice for them. The
+   downward direction is the intent and the precondition of ORCH-312, and it
+   is the one way this landing can make a job fail that passed the day before,
+   with `rc 124` and `stopped_by_cap { memory }`. It is reported, not asked
+   (CLAUDE.md, outcome 3); the reversal is to read the declared figure as a
+   floor instead of a ceiling. **Not measured against their declarations:**
+   Herd is shipped, not operated (D161), so nobody here knows what their
+   reading answers.
+2. **Seats are now pessimistic, and that is all they are.** `ORCH-312`.
+   `jobs_at_once` still counts seats by `--job-memory-max` while most jobs are
+   held to less, so a runner leaves memory it lends unused — a runner lending
+   25 GiB at `--job-memory-max 2GiB` keeps twelve seats and could hold far
+   more than twelve jobs declaring 512 MiB. **It is not a correctness hazard,
+   and the `min` is why:** `seats × --job-memory-max` still bounds the
+   permitted total exactly as it did before the figure travelled. Packing by
+   the granted sum is throughput, and it needs the hub charging the same
+   figure (`herd-hub/src/matcher.rs`).
 3. **`RLIMIT_AS` is now set from the per-job figure on a fallback host, which
    can be tighter than before.** `RLIMIT_AS` bounds virtual address space, not
    resident memory, and a runtime that reserves address space generously (a
@@ -384,7 +431,7 @@ cgroup, is what this costs: `memory: usage 8388608kB, limit 8388608kB … shmem
 anon plus 3.93 GiB of tmpfs against an 8.00 GiB ceiling that was the runner's
 global figure and not the job's.
 
-**Choice.** Four things.
+**Choice.** Five things.
 
 1. **One optional field on `AssignJob`**, not inside `Declaration`:
    `need: Option<JobNeed>`, `#[serde(default, skip_serializing_if = …)]`,
@@ -397,30 +444,46 @@ global figure and not the job's.
    declaration at all. Inside `Declaration` the figure would be lost for
    exactly the jobs that state it without declaring a command.
 2. **The runner writes `memory.max` from the job's figures when it has them
-   and from `--job-memory-max` when it does not.** The global flag is not a
-   leftover: `memory_need_mib` answers `Ok(None)` for a real class —
+   and from `--job-memory-max` when it does not, and never more than
+   `--job-memory-max` either way.** The global flag is not a leftover:
+   `memory_need_mib` answers `Ok(None)` for a real class —
    `herdctl submit -- true` — admitted on its capabilities alone, so the
    machine's figure is the only one anybody stated about it. One figure for
-   the uncosted, each job's own for the costed.
-3. **The ceiling is a function of both figures: `(memory_mib + tmpfs_mib)`
-   plus one margin of 10 %**, floored at `MINIMUM_MEMORY_MAX`. The tmpfs is
-   inside it because tmpfs pages are charged to the cgroup that writes them
-   and `memory.swap.max` is 0, so they are unreclaimable: Herd admits E-29 and
-   E-31 as independent quantities and they are not independent. A ceiling of
-   the declared sum **exactly** is the 8.00 GiB that killed `j0000000069`, so
-   nought is not an available margin. The margin is one named constant,
-   `herd_proto::CEILING_MARGIN_PERCENT`, so that the hub's packing can charge
-   the same ceiling without a second copy of the number; it is a proportion
-   because what it covers scales with the job — the report's own figures leave
-   about 40 MiB of 8 GiB unaccounted, which is page tables, slab, kernel
-   stacks and socket buffers, charged to the cgroup and visible to no
-   declaration.
-4. **A host with no delegated cgroup v2 says the ceiling is NOT ENFORCED, per
+   the uncosted, each job's own for the costed, and the owner's figure as the
+   bound on both.
+3. **The ceiling is a function of both figures, bounded by the owner's cap:
+   `min((memory_mib + tmpfs_mib) + 10%, --job-memory-max)`**, floored at
+   `MINIMUM_MEMORY_MAX`. The tmpfs is inside it because tmpfs pages are
+   charged to the cgroup that writes them and `memory.swap.max` is 0, so they
+   are unreclaimable: Herd admits E-29 and E-31 as independent quantities and
+   they are not independent. A ceiling of the declared sum **exactly** is the
+   8.00 GiB that killed `j0000000069`, so nought is not an available margin.
+   The margin is one named constant, `herd_proto::CEILING_MARGIN_PERCENT`, so
+   that the hub's packing can charge the same ceiling without a second copy of
+   the number; it is a proportion because what it covers scales with the job —
+   the report's own figures leave about 40 MiB of 8 GiB unaccounted, which is
+   page tables, slab, kernel stacks and socket buffers, charged to the cgroup
+   and visible to no declaration. **The margin applies to the declared sum and
+   never lifts the owner's cap.**
+4. **A declaration can only ever tighten, and that `min` is invariant 2.**
+   `--job-memory-max` is the most any job on a machine may hold, and a figure
+   a *requester* sent must not raise it. The hub cannot prevent that — it does
+   not know the flag, which no frame carries — so it will place a job
+   declaring 4 GiB on a 2 GiB-cap runner, and it did so before this field
+   existed. Without the bound, twelve seats of 2 GiB on a host lending 25 GiB
+   would permit twelve ceilings of 4.5 GiB, which is 52 GiB: invariant 2
+   weakened as a side effect of carrying a figure, and invariant 2 is Alexa's
+   to change. With it, `seats × --job-memory-max` bounds the permitted total
+   exactly as it did, and no machine's exposure is worse on any declaration
+   however wrong.
+5. **A host with no delegated cgroup v2 says the ceiling is NOT ENFORCED, per
    job.** The fallback is `RLIMIT_AS` on the job's first process: one
    process's address space, not a process tree's resident memory. A runner
    that printed the figure and left it there would be reporting a ceiling it
    does not hold, so the job's own line carries the words, the host's reason
-   and what is in force instead.
+   and what is in force instead. A clamped job's line says it clamped and
+   names both figures, so a reader who finds a job killed at its runner's
+   figure rather than its own does not have to do the arithmetic.
 
 **No `PROTOCOL_VERSION` bump, and the rule is the constant's own.**
 `herd-proto/src/lib.rs`'s doc comment on `PROTOCOL_VERSION` lists three shapes
@@ -449,24 +512,34 @@ day it is enforced: `j0000000069` reached 3.93 GiB of shmem, charged to its own
 cgroup, and the brief's own arithmetic shows a memory-only ceiling of 4505 MiB
 against 8030 MiB of real usage.
 
-**Alternative rejected — `max(f(declared), --job-memory-max)`**, so that the
-per-job ceiling only ever rises. Safer for the consumer by one failure mode —
-a job that under-declares would go on running — and it forecloses packing by
-the granted sum, which is the next task: a runner cannot pack by a figure it
-does not enforce, and D180's own arithmetic is that what is counted must be
-what is permitted. The consequence is recorded as a board row rather than
-hidden: a job declaring less than its runner's figure is now held to the
-smaller one.
+**Alternative rejected — honour the declaration in both directions**, so that
+a job declaring more than `--job-memory-max` is permitted more. It is the
+reading the field's name invites, and it is the one that weakens invariant 2:
+the figure comes from a *requester*, the hub cannot bound it because it does
+not know the flag, and the arithmetic is in item 4 above — 52 GiB permitted on
+a host that lent 25. Carrying a figure must not change what a machine's owner
+configured; raising that bound is a decision about what Herd promises, and
+therefore Alexa's.
 
-**What this costs, and it is not nothing.** `jobs_at_once` is unchanged, so a
-runner now permits the sum of its jobs' own ceilings while still counting
-seats by `--job-memory-max`: twelve seats of 2 GiB can hold twelve jobs
-declaring 4 GiB. That is the next task and it needs the hub counting the same
-set (`herd-hub/src/matcher.rs` is explicit), and it was left out of this
-branch so that one gate run can tell which change broke what. No exit code
-moved — `rc 124` remains one code for all four caps — no admission arithmetic
-moved, and no default figure moved.
+**Alternative rejected — take the declared figure as a *floor*** —
+`max(f(declared), --job-memory-max)` — so the ceiling only ever rises. Safer
+for the consumer by one failure mode, since a job that under-declares would go
+on running, and wrong for two reasons: it is the same weakening as above wound
+the other way, and it forecloses packing by the granted sum, because a runner
+cannot pack by a figure it does not enforce. The consequence of choosing the
+tighter reading is recorded as a board row rather than hidden: a job declaring
+less than its runner's figure is now held to the smaller one.
 
+**What this costs.** `jobs_at_once` is unchanged, so a runner still counts
+seats by `--job-memory-max` while most jobs are now held to less: seats are
+**pessimistic** and a machine leaves memory it lends unused. That is
+throughput and not exposure — `seats × --job-memory-max` still bounds the
+permitted total, which is what the `min` buys — and closing it is the next
+task, needing the hub to charge the same figure
+(`herd-hub/src/matcher.rs` is explicit). It was left out of this branch so
+that one gate run can tell which change broke what. No exit code moved —
+`rc 124` remains one code for all four caps — no admission arithmetic moved,
+and no default figure moved.
 **Reversibility.** High. Nothing was written to disk, no record shape moved,
 no frame is new and no version number moved. Removing the per-job ceiling is
 removing one argument from `Ceiling::open_for_job` and one call to
@@ -486,13 +559,13 @@ diff.
 
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
-| ORCH-312 | **A runner now permits the sum of its jobs' own ceilings while `jobs_at_once` still divides what it lends by one global figure, so the two halves of invariant 2 no longer count the same memory.** As of `per-job-memory-ceiling`, `memory.max` is each job's own — `(memory_mib + tmpfs_mib) + 10%`, `herd_proto::CEILING_MARGIN_PERCENT` — while `herd_runner::jobs_at_once` (`herd-runner/src/confine.rs`) is unchanged and still answers *(lent − floor) ÷ `--job-memory-max`*. D180's own arithmetic was "the cap every job is actually permitted is what is counted", and that is no longer one number: on a runner lending 25 GiB at `--job-memory-max 2GiB` the count is twelve, and twelve jobs each declaring 4 GiB are now permitted 52 GiB. **It was left out of that branch deliberately, on the brief's instruction, so that one gate can tell which change broke what** — and the branch changed nothing in the slot arithmetic, in admission or in any default figure | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, from the brief's own point 5 | herd-step | owed | Pack by the **granted sum**: hold at most the jobs whose ceilings fit in what this machine lends, less its floor, and have the hub charge the same figure — `herd-hub/src/matcher.rs` is explicit that a hub counting a different set from the runner is the defect, so the two sides move together. The margin is already one named constant in `herd-proto` for exactly this, so neither side needs a second copy. The figure to charge is `JobNeed::ceiling_mib`, not `memory_mib`, or the host is over-committed by the margin times the job count | `per-job-memory-ceiling` landing | `herd-runner/src/confine.rs` `jobs_at_once` and `job_ceiling`; `herd-proto/src/declaration.rs` `JobNeed`, `CEILING_MARGIN_PERCENT`; `herd-hub/src/matcher.rs` the `jobs_at_once` arm; **D180**, **D181**, **D182**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
+| ORCH-312 | **Seats are now pessimistic: a runner counts them by `--job-memory-max` while most jobs are held to less, so it leaves memory it lends unused.** As of `per-job-memory-ceiling`, `memory.max` is `min((memory_mib + tmpfs_mib) + 10%, --job-memory-max)` — each job's own figure where the hub costed it, **bounded above by the owner's cap**, so a declaration can only ever tighten. `herd_runner::jobs_at_once` (`herd-runner/src/confine.rs`) is unchanged and still answers *(lent − floor) ÷ `--job-memory-max`*. **This is an optimisation and not a correctness hazard**, and the `min` is why: `seats × --job-memory-max` still bounds the permitted total exactly as it did before the figure travelled, so no machine's exposure is worse on any declaration however wrong. What is left on the table is throughput — a runner lending 25 GiB at `--job-memory-max 2GiB` keeps twelve seats, and twelve jobs each declaring 512 MiB are held to 563 MiB apiece, so it could hold far more than twelve and does not | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, from the brief's own point 5 and the coordinator's ruling on the `min` the same day | herd-step | owed | Pack by the **granted sum**: hold at most the jobs whose ceilings fit in what this machine lends, less its floor, and have the hub charge the same figure — `herd-hub/src/matcher.rs` is explicit that a hub counting a different set from the runner is the defect, so the two sides move together. The margin is already one named constant in `herd-proto` for exactly this, so neither side needs a second copy. The figure to charge is `JobNeed::ceiling_mib` clamped by the runner's own cap, not `memory_mib`, or the two sides charge two numbers again | `per-job-memory-ceiling` landing | `herd-runner/src/confine.rs` `jobs_at_once` and `job_ceiling`; `herd-proto/src/declaration.rs` `JobNeed`, `CEILING_MARGIN_PERCENT`; `herd-hub/src/matcher.rs` the `jobs_at_once` arm; **D180**, **D181**, **D182**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
 
 **ORCH-313 and ORCH-314** (section *Open — seen, not agreed or sized*):
 
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
-| ORCH-313 | **A declaration is now binding downwards as well as upwards, and that is a change the first consumer can see.** `per-job-memory-ceiling` writes `memory.max` from the job's own figures whenever the hub costed it, so a job that declares **less** than its runner's `--job-memory-max` is now held to the smaller figure: on their server, where `--job-memory-max` is `8GiB` (`docs/joining.md:527`), a job whose reading answers `memory_mib=2048 tmpfs_mib=0` gets a 2252 MiB ceiling where it used to get 8 GiB. That is the point of the change — the figure admission weighs a job against is the figure the kernel holds it to, and it is what ORCH-312 needs in order to pack honestly — but it is also the one way this landing can make a job fail that passed the day before, and the failure mode is `rc 124` with `stopped_by_cap { memory }`, not a mystery. **Not measured against their declarations:** Herd is shipped and not operated (D161), so nobody here knows what their `labels_from` reading answers; what is known is the one figure in their own report, `j0000000069`, whose declared sum came to exactly the 8 GiB that killed it, and that job is **helped** by the change (9011 MiB) rather than hurt | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, derived from the brief's own point 2 and the figures in `docs/joining.md` | orchestrator (to report), then Alexa if he wants it reversed | open | **Report it, with no question attached** (CLAUDE.md, outcome 3): the direction is deliberate and reversible in one line. The cheap reversal, if a job of theirs starts failing, is `max(f(declared), --job-memory-max)` in `herd_runner::job_ceiling` — the ceiling then only ever rises — at the cost of ORCH-312, which cannot pack by a figure the runner does not enforce. Do not reverse it pre-emptively: a declaration nothing enforces is a declaration nobody will keep true | nothing | `herd-runner/src/confine.rs` `job_ceiling`; `herd-proto/src/declaration.rs` `JobNeed::ceiling_mib`; `docs/joining.md:527` and `:624`; **D161**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
+| ORCH-313 | **A declaration is now binding downwards, and that is the whole win of the change the first consumer can see.** `per-job-memory-ceiling` writes `memory.max` from `min((memory_mib + tmpfs_mib) + 10%, --job-memory-max)` whenever the hub costed the job, so a job that declares **less** than its runner's cap is held to the smaller figure: on their server, where `--job-memory-max` is `8GiB` (`docs/joining.md:527`), a job whose reading answers `memory_mib=2048 tmpfs_mib=0` gets a 2252 MiB ceiling where it used to get 8 GiB. **Upwards it cannot move at all** — the owner's cap bounds it — so the one job in their own report, `j0000000069`, whose declared sum earns 9011 MiB, is clamped back to the 8 GiB that killed it: **no regression there, and no fix either; the fix for that job is their own declaration or their own `--job-memory-max`.** The downward direction is deliberate, is what makes a declaration mean something, and is the precondition for ORCH-312 — but it is the one way this landing can make a job fail that passed the day before, with `rc 124` and `stopped_by_cap { memory }`, which is a named failure and not a mystery. **Not measured against their declarations:** Herd is shipped and not operated (D161), so nobody here knows what their `labels_from` reading answers | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, derived from the brief's point 2 and the figures in `docs/joining.md` | orchestrator (to report), then Alexa if he wants it reversed | open | **Report it, with no question attached** (CLAUDE.md, outcome 3): the direction is deliberate and reversible in one line. The cheap reversal, if a job of theirs starts failing, is to take the declared figure as a floor rather than a ceiling — `max(f(declared), --job-memory-max)` in `herd_runner::job_ceiling` — at the cost of ORCH-312, which cannot pack by a figure the runner does not enforce. Do not reverse it pre-emptively: a declaration nothing enforces is a declaration nobody will keep true | nothing | `herd-runner/src/confine.rs` `job_ceiling`; `herd-proto/src/declaration.rs` `JobNeed::ceiling_mib`; `docs/joining.md:527` and `:624`; **D161**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
 | ORCH-314 | **A tmpfs reservation declared with no memory figure reaches the runner as nothing, so it is charged to a cgroup whose ceiling never counted it.** `herd_proto::JobNeed` carries both figures or neither, and `need_for` (`herd-hub/src/server.rs`) sends it only when `memory_need_mib` answers a figure — so `herdctl submit --tmpfs-mib 4096 -- <command>` with no `--memory-mib` travels with no `JobNeed` at all and the job runs under `--job-memory-max`, with 4 GiB of unreclaimable shmem charged inside it. **Unreachable from a reading**, which is why it is a row and not a defect in the landing: `herd_proto::Requirements::read` demands all four keys and refuses `memory_mib=0`, so every job whose requirements came from a `labels_from` reading has both figures. It is reachable only from a bare submission that states one and not the other, and this is today's behaviour unchanged — the landing made it visible, not worse | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, read off the two paths | herd-step | open | Decide which of the two it is. Either the hub **refuses** a submission that reserves tmpfs without stating a memory need, by name, the way it refuses `memory_mib` and `build_thread_mib` given together — the honest reading, since a reservation nobody costed is one admission cannot weigh — or `JobNeed` carries `memory_mib: Option<u64>` and the runner adds the reservation to the global figure, which changes a default figure for a class of job and is therefore not an execution agent's call. **The first is cheaper and is a refusal, not a silent ceiling** | ORCH-312 | `herd-hub/src/server.rs` `need_for`; `herd-hub/src/job.rs` `memory_need_mib`, `tmpfs_need_mib`; `herd-proto/src/declaration.rs` `Requirements::read`, `JobNeed`; **E-29**, **E-31**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
 
 
@@ -500,7 +573,7 @@ diff.
 
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
-| ORCH-315 | **A runner started through the library announces no memory floor, so the hub admits no job that declares a memory need to it — and the failure is a silent wait, not a refusal.** `herd_runner::metrics::host_size()` answers `HostSize::new(total_memory_mib(), threads)` and **no floor**; `HostSize::admissible_memory_mib()` is `Some(lent − floor)` only when **both** are there, so it is `None`, and `herd-hub/src/matcher.rs`'s memory arm then answers `Admission::NotHere("… does not say how much memory it keeps back for itself, so a <n> MiB job cannot be admitted there")`. `herd-runner/src/main.rs` fills `herd_proto::default_memory_floor_mib` in before it dials, which is D180's own sentence — *"the same default the binary fills in before it dials, so the figure a runner enforces is the figure it announced"* — so **production is unaffected**; what is affected is every test that starts a runner with `herd_runner::Config::default()`, which is all of them. Measured 2026-10-31 on `per-job-memory-ceiling`: a job declaring `memory_mib = 512` against such a runner waited **eight minutes with zero CPU** and no child process, until the test was killed; `Harness::lending` in `herd-runner/tests/confinement.rs` now exists so a test can say the figure, and names the reason | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, measured by the hang and then read off `metrics.rs`, `placement.rs` and `matcher.rs` | herd-step | open | Decide where the default belongs. **Recommended: move it into `Config`'s own default or into `herd_runner::run`**, so the library and the binary announce the same machine — the asymmetry is the kind D23 forbids in its own domain, a figure that is read one way by one caller and another way by another. The cheaper half, which costs nothing and should happen either way: have `metrics::host_size()` say in its doc comment that it names no floor and that the caller must. Not urgent for the product, and a trap for the next agent writing a test about a declared figure | nothing | `herd-runner/src/metrics.rs` `host_size`; `herd-proto/src/placement.rs:130` `admissible_memory_mib`; `herd-hub/src/matcher.rs` the memory arm's `None` branch; `herd-runner/src/main.rs`; `herd-runner/tests/confinement.rs` `Harness::lending`; **D180**, **D23**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
+| ORCH-315 | **Production is unaffected — `herd-runner/src/main.rs` fills the default floor in before it dials — but a runner started through the *library* announces no memory floor, and then the hub admits no job that declares a memory need to it at all: the job waits forever, and it looks like a hang.** `herd_runner::metrics::host_size()` answers `HostSize::new(total_memory_mib(), threads)` and **no floor**; `HostSize::admissible_memory_mib()` (`herd-proto/src/placement.rs:130`) is `Some(lent − floor)` only when **both** are there, so it is `None`, and `herd-hub/src/matcher.rs`'s memory arm answers `Admission::NotHere("… does not say how much memory it keeps back for itself, so a <n> MiB job cannot be admitted there")` — `NotHere` and not a refusal, so the job keeps waiting for a runner that will never exist. D180's own sentence is what main.rs does: *"the same default the binary fills in before it dials, so the figure a runner enforces is the figure it announced."* What is affected is every test that starts a runner with `herd_runner::Config::default()`, which is all of them. Measured 2026-10-31 on `per-job-memory-ceiling`: a job declaring `memory_mib = 512` against such a runner sat **eight minutes with zero CPU time and no child process** before it was killed by PID. **`Harness::lending` in `herd-runner/tests/confinement.rs` is the thing that saves the next person** — it takes a `HostSize` and its doc comment names this whole trap | `herd-step` on `per-job-memory-ceiling`, 2026-10-31, measured by the hang and then read off `metrics.rs`, `placement.rs` and `matcher.rs` | herd-step | open | Decide where the default belongs. **Recommended: move it into `Config`'s own default or into `herd_runner::run`**, so the library and the binary announce the same machine — the asymmetry is the kind D23 forbids in its own domain, a figure read one way by one caller and another way by another. The cheaper half, which costs nothing and should happen either way: have `metrics::host_size()` say in its doc comment that it names no floor and that the caller must. Not urgent for the product, and a trap for the next agent writing a test about a declared figure | nothing | `herd-runner/src/metrics.rs` `host_size`; `herd-proto/src/placement.rs:130` `admissible_memory_mib`; `herd-hub/src/matcher.rs` the memory arm's `None` branch; `herd-runner/src/main.rs`; `herd-runner/tests/confinement.rs` `Harness::lending`; **D180**, **D23**; `docs/orchestration/history/2026-10-31-per-job-memory-ceiling.md` |
 
 ## Decisions needed
 

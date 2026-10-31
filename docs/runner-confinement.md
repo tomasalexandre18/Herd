@@ -413,7 +413,17 @@ that is a real class and not a leftover: `herdctl submit -- true` declares no
 whole-job memory need and is admitted on its capabilities alone, so the
 machine's own figure is the only one anybody has stated about it.
 
-The ceiling is `(memory_mib + tmpfs_mib) + 10%`, floored at `16MiB`.
+The ceiling is `min((memory_mib + tmpfs_mib) + 10%, --job-memory-max)`,
+floored at `16MiB`. **So a declaration can only ever tighten it.**
+
+- **`--job-memory-max` is an absolute bound and the `min` is invariant 2.** A
+  declaration a *requester* sent must not raise the most any job may hold on
+  somebody else's machine. The hub cannot prevent that — it does not know
+  `--job-memory-max`, which no frame carries — so it will place a job
+  declaring 12 GiB on a runner whose owner lends 2 GiB a job, and the runner
+  holds it to 2 GiB exactly as it did before the figure travelled. With the
+  bound, `jobs_at_once × --job-memory-max` still bounds the permitted total.
+  A clamped job's own line says it clamped and says whose figure won.
 
 - **The tmpfs is in it** because tmpfs pages are charged to the cgroup that
   writes them and `memory.swap.max` is 0, so they cannot be reclaimed: a job's
