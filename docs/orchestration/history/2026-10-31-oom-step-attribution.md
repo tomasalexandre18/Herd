@@ -172,9 +172,9 @@ had no dead pointer to correct and stays at its 90 lines (**D276**).
 **All four Rust gates plus `check-docs.sh`, through Herd as one bare
 `./scripts/gate.sh`** (`.rs` changed, so the full set is owed).
 
-**There is exactly one gate run, and its output cannot be here.** The
-first attempt was submitted before this file was committed and `gate.sh`
-**refused** it, which is the right answer and is recorded rather than
+**Three attempts, and the output of the one that counts cannot be
+here.** The first was submitted before this file was committed and
+`gate.sh` **refused** it, which is the right answer and is recorded rather than
 tidied away — job **`j0000000174`**, `"passed": false`,
 `"exit_code": 3`, `"cause": "exited"`, wall 55 ms, `bytes_written` 0,
 nothing compiled:
@@ -231,7 +231,7 @@ the under-load list and the mechanism working (**D187**) — with the
 **Quoted here, from the runs made before this commit:**
 `./scripts/check-docs.sh`, run locally — no toolchain, so it needs no
 Herd job — four times, green each time, most recently after this file
-and the third `board.md` row.
+and the fourth `board.md` row.
 
 ```text
 docs ok
@@ -250,19 +250,19 @@ this agent's report**. Nothing is added to the tree after it.
 
 **`./scripts/bench-preflight.sh` ran first, every time, and its refusal
 was obeyed by waiting.** Green at load 6.27 of a 9.00 ceiling before any
-work; **REFUSED** at load 10.28 when the gate was first wanted, and the
-heavy phase waited rather than starting; green again at **8.59** when it
-cleared, 21 GiB available, slice room 16 255 MiB over an 8 192 MiB
-floor, 371 GiB free. **`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never
+work; **REFUSED** three times — load 10.28, 9.29 and 11.14 — and the
+heavy phase waited each time rather than starting; green again at 8.59,
+then at 8.15, then once more before the last run, whose figures are in
+the agent's report. **`HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never
 set or exported.**
 
 **Skips: see the gate output in the agent's report.** Expected and
 compared as a **list**, never a count (D27, D187): twelve at rest, or
 the under-load list with `flood-fifty` and `flood-two-fifty` excused by
-name. **No skip was added by this task and none was joined.** The eight
-new unit tests and three new parse tests run on this host and make their
-assertions here: they are about the arithmetic over the counters and the
-wording of the lines, both of which are pure. **What they do not prove is
+name. **No skip was added by this task and none was joined.** All
+fifteen new tests run on this host and make their assertions here: they
+are about the arithmetic over the counters and the wording of the lines,
+both of which are pure. **What they do not prove is
 the kernel's own timing** — that `oom_group_kill` is raised before the
 first task is signalled and that `oom_kill` is raised one task at a time
 — because a test for that needs a real OOM kill in a delegated cgroup
