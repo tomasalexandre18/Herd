@@ -342,9 +342,9 @@ thing a second machine would ever have said about its own landing.
   the gated sha; the verbatim output goes to the receipt and to the
   merger's report, and the **next** landing is what carries it into the
   repository if it is wanted there. Same for the post-push run id: the
-  handoff and the report get it, and the next landing's board edit
-  records it. Two pushes for one batch is the one thing this section
-  forbids, and no bookkeeping is worth it.
+  handoff and the report get it, and the next landing writes it into its
+  own record, and into its board edit. Two pushes for one batch is the
+  one thing this section forbids, and no bookkeeping is worth it.
 - The batch is **everything ready when the merger starts**, not a fixed
   count. That is the orchestrator's call, recorded here so that it is not
   re-litigated.
@@ -372,6 +372,37 @@ thing a second machine would ever have said about its own landing.
   board and the last handoff, and a `failure` becomes a new board row
   before any new work is briefed. No automatic GitHub issue: issues are
   Alexa's.
+- **The next landing writes that run into its own record**, not only
+  into the board. `check-orchestration.sh` has a case group for it — *a
+  landing records its predecessor's post-push run* (ORCH-333) — which
+  reads the newest `<date>-merge-<batch>.md` under
+  `docs/orchestration/history/` and refuses a record that does not name
+  the **previous** landing's batch together with a run id and a verdict
+  for that run. The board edit stays as practice; what the record adds
+  is reachability, since the newest landing record is one file a check
+  can find by name, while a run id somewhere in `board.md` carries
+  nothing that ties it to a landing. The scope is **one paragraph** — it
+  ends at a blank line, at the next bullet or at the next heading — so
+  the batch, the id and the verdict stand together instead of one per
+  bullet. Wrapping across two or three lines is how batches 29, 30 and
+  31 wrote it and is accepted: nothing has to be crammed onto one line.
+  A predecessor whose push started no run at all gets the literal
+  `no ci.yml run` in that paragraph, which is a statement and not an
+  omission. The fields, and where to read the conclusion back from, are
+  in `docs/orchestration/templates/landing.md`, *CI run*.
+- **What that case does not do, said before anybody overrates it.** It
+  has no network and no toolchain: it cannot ask GitHub whether a run
+  exists, whether its head sha is the one named, or whether it passed,
+  and it never tries. It enforces that somebody went and looked and
+  wrote down what they saw. A mistyped digit passes it and so does a
+  false verdict — *No docs gate can check the record itself* above says
+  that comparison is a human's, and that stays exactly as true of the
+  verdict. What it refuses is the shape batch 32's record had: a claim
+  about the predecessor with no figure anywhere near it. That record
+  said batch 31's run was recorded in `board.md`, and `board.md` at
+  `9f76b54` holds no `41206929574` anywhere. Batch 33's record carries
+  batch 31's and batch 32's ids with a conclusion read back for each,
+  and passes.
 - **Getting here from where we are** is four dated steps, in order, and
   nobody improvises them: *Not an option*, below. Any pull request still
   open when the last of them is done is closed naming the landing that
