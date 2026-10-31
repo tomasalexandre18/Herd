@@ -1,4 +1,4 @@
-# Status — 2026-10-31
+# Status — 2026-11-01
 
 State now, replaced every session. **What is owed and what Alexa has not
 decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
@@ -33,9 +33,9 @@ GB/day** active, ~2.8 stopped; **`r_file` = 5.04**.
 binaries** — refused by version, not degraded. Told to extract now. **Both
 conditions it ships on are now met**: retention follows in v1.1, and
 **`herd-hub report` weighs the records, events and logs** (**D271**) — apparent
-size, said to be a floor, 1.97x under blocks.
-**Their 2026-10-31 loss — 17 files, 42 MiB under `finished, exited 0` — is
-fixed on `main`, unreleased** (**D291**): the hub asks when the verdict lands.
+size, said to be a floor, 1.97x under blocks. **Their 2026-10-31 loss — 17
+files, 42 MiB under `finished, exited 0` — is fixed on `main`, unreleased**
+(**D291**, **D292**): asked for at the verdict; a give-up is on the record.
 
 ## Where the software is
 
