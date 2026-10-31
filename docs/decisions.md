@@ -14578,3 +14578,78 @@ on published release pages, so it is Alexa's and not a cut's
 **measurement's** provenance is never re-versioned: `docs/joining.md`'s
 *"On our own queue runner (v0.4.1, one host, one version)"* stays at
 v0.4.1 because that is the build the 0.212 s was taken on (**D264**).
+
+## 2026-10-31 — D280 E-16 stays `part`, on three clauses nobody named
+
+**Context.** E-16's `coverage.md` note said *"what is left here is the
+per-runner budgets and keeper pinning"*, and `cut-v1.0.0`'s scope table
+carried that sentence forward into a stability promise — the first
+failure of **D278**'s own rule, found during batch 29's landing and
+corrected in the body before the tag. `coverage.md` was left owed the
+same correction (ORCH-307). This entry records what the correction
+found, because a recount of a `must` is a ruling and the last three
+(D272, D274, and E-42's) are each written down.
+
+**Re-verified clause by clause against `main` at `f7f2ea1` and again at
+`ae3ae40`, the commit `v1.0.0` tags, on 2026-10-31. No `.rs` file
+differs between the two.**
+
+**Both halves of the old sentence are false.** Per-runner budgets ship:
+`--pack-budget` (`herd-runner/src/main.rs:139`, **absent by default**,
+and absent means nothing bounds the store), the store's own measurement,
+the gc `PackStore::evict_to_budget`
+(`herd-runner/src/packstore.rs:1490`) and its one non-test caller
+`Session::sweep_packs_to_budget` (`herd-runner/src/lib.rs:1690`, run
+once per connection at `:4579`), with use against budget on the health
+report, in `status.json` and on `herd-hub status`. Keeper pinning ships
+on **both** sides: the runner honours `Welcome.keeper_for` and
+`PinPacks` and keeps them across a redial (**D262**), and the hub names
+keepers on `--keeper` and `--keeper-for` (**D266**) — neither flag has a
+default, so a hub given neither pins nothing.
+
+**Three other clauses keep the row `part`, and the first decides it.**
+
+1. *gc never removing what a queued or running job references.*
+   `Claims::referenced` (`herd-runner/src/packstore.rs:538`) is **empty
+   in the field and a fixture in every test**, which both sides say in
+   as many words: `packstore.rs:524` and `herd-runner/src/lib.rs:1663`-
+   `:1666`, where `pack_claims` builds `Claims { pins, ..default() }`
+   and so can name no pack at all. The layout step does not write back
+   what it laid out (ORCH-275). **The clause is proved against a claim
+   set a test wrote and against no real job.**
+2. *N = 5 most recent per key family, **configurable***. N ships twice,
+   as `KEEP_PER_KEY` (`herd-runner/src/packstore.rs:238`) and
+   `KEEPER_KEEP_PER_KEY` (`herd-hub/src/server.rs:343`). **No flag on
+   either binary sets it:** the runner's thirty-six long options and the
+   hub's twenty-one were enumerated and none is a keep-per-key.
+   `Claims::keep_per_key` is settable in code alone and the one caller
+   takes the default.
+3. *A runner's undelivered collections swept the same way, and only
+   once the hub has acknowledged them or their record is gone.* The
+   acknowledgement half removes a spool
+   (`Session::files_acknowledged`, the one path). The record-is-gone
+   half **sets the bytes aside under `unclaimed` and keeps them** —
+   `herd-runner/src/sweep.rs:102`, applied at
+   `herd-runner/src/lib.rs:3602`, with `sweep.rs:46` saying *"Terminal
+   here means `UNCLAIMED`, not `rm -rf`"* — and nothing in the tree
+   deletes one. Whether a runner may ever delete one is **ORCH-108,
+   with Alexa**. *"Swept the same way"* is also untrue in the budget's
+   sense: `outputs/` is not in the pack store.
+
+**This is a code reading and not a measurement**, and the row's note now
+says so: no binary was run for it. Clause 1 in particular is the one a
+suite or a live runner would have to re-prove.
+
+**The distinction the old note did not make.** Everything above is
+about a **runner's data root**. `--output-budget`, `--output-floor` and
+`--volume-free-floor` are the **hub's**, over the hub's own state root
+volume (**D152**, **D213**, **D254**), and `herd-hub report` weighs the
+hub's records (**D271**). **There is no free-space guard on a runner at
+all.** So a reader who took the hub's budget for the consumer's
+protection would be wrong about the one disk they are watching.
+
+**The tally does not move**, re-derived mechanically from the 44 `must`
+State cells rather than carried forward: 36 `merged`, 5 `part`, 1
+`planned`, 1 `waived`, 1 `withdrawn` = 44, over 55 rows. It agrees with
+what `deploy/release-notes/1.0.0.md:376` published. Had E-16 moved, the
+headline would read 37 and 4.

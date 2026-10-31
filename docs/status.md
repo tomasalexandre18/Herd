@@ -86,5 +86,5 @@ are latently red (ORCH-291) and the hollow green is closed (**D273**).
 3. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 4. **The runner's half of D225 has never run against a real hub** (ORCH-222).
-5. **`coverage.md`'s E-16 note names two clauses that ship** (ORCH-307); the
-   row stays `part` and the table does not move.
+5. **E-16 stays `part` on three clauses** (**D280**): an empty claim set, an
+   unsettable N, a spool kept under `unclaimed` (ORCH-275, ORCH-108).
