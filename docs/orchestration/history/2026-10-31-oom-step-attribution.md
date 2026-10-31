@@ -1,6 +1,6 @@
 # oom-step-attribution — handoff 2026-10-31
 
-- **Item:** ORCH-NEXT (four rows, in this branch's `board.md`; the
+- **Item:** ORCH-NEXT (five rows, in this branch's `board.md`; the
   merger allocates their numbers)
 - **Agent:** herd-step
 - **Branch / commit:** `oom-step-attribution` / its tip — the sha the
@@ -172,7 +172,7 @@ had no dead pointer to correct and stays at its 90 lines (**D276**).
 **All four Rust gates plus `check-docs.sh`, through Herd as one bare
 `./scripts/gate.sh`** (`.rs` changed, so the full set is owed).
 
-**Three attempts, and the output of the one that counts cannot be
+**Four attempts, and the output of the one that counts cannot be
 here.** The first was submitted before this file was committed and
 `gate.sh` **refused** it, which is the right answer and is recorded rather than
 tidied away — job **`j0000000174`**, `"passed": false`,
@@ -228,6 +228,28 @@ on their own readings of 9.26 against their own ceiling of 8, which is
 the under-load list and the mechanism working (**D187**) — with the
 `#[ignore]` census **38** and matching, every one carrying a reason.
 
+**The third attempt was RED too, and that red was not mine.** Job
+**`j0000000179`** on `13efad21`. `cargo fmt` **ok**, `cargo clippy
+--workspace --all-targets -- -D warnings` **ok (22 s)**, step 7's skip
+list matching exactly again, and the three log-cap tests — including the
+new `a_log_capped_step_adds_no_bytes_to_the_log_it_just_cut` — all
+**ok**, so the fix above held. One test failed:
+
+```text
+test a_link_cut_while_the_runner_is_full_loses_no_job ... FAILED
+test result: FAILED. 7 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out
+gate: RED sha=13efad21c3e42cc8041b2b597ba79a529f8a3595 failed=6:test-suite skips=under-load(flood-fifty=8.87>8,flood-two-fifty=8.87>8)
+```
+
+It is a hub outage fixture with wall-clock thresholds, it cannot reach
+any line this branch changed, and **it passed on the previous run of
+this same branch** — the two trees differ by one `if`, two reformatted
+assertions and one unit test. What differs is the host: load1 7.62 → 4.67
+on the run where it passed, 6.64 → **9.49** on the run where it did not.
+*Risks and findings* 8 has the measurement and it is a board row.
+**It is reported red and it is not excused**: no skip list was touched
+and no expectation was edited.
+
 **Quoted here, from the runs made before this commit:**
 `./scripts/check-docs.sh`, run locally — no toolchain, so it needs no
 Herd job — four times, green each time, most recently after this file
@@ -247,6 +269,14 @@ committed and before the branch is pushed. Its output goes to the Herd
 job's own log and to the receipt `gate.sh` writes under
 `target/herd-gate/<sha>.receipt` in this worktree, and **verbatim to
 this agent's report**. Nothing is added to the tree after it.
+
+**And its verdict is reported as it comes.** If the branch's own change
+is red again, it is red and the branch is not pushed. If the only red is
+*Risks and findings* 8's load-sensitive fixture, that is said in those
+words, with both runs' figures, and the merger judges the batch — a green
+gate for the landing is `herd-merger`'s own run on its own integration
+tip and never this branch's (`workflow.md`, *What a landing is*), so
+nothing here can be mistaken for one.
 
 **`./scripts/bench-preflight.sh` ran first, every time, and its refusal
 was obeyed by waiting.** Green at load 6.27 of a 9.00 ceiling before any
@@ -434,6 +464,33 @@ it. Filed as a row, not fixed here: deciding whether a runner's own lines
 belong inside the cap or outside it is a change to what the log cap
 *means*, not an attribution fix.
 
+### 8. A test that is red on this host under load, and in no skip list
+
+`a_link_cut_while_the_runner_is_full_loses_no_job`
+(`herd-hub/tests/announced_job_ceiling.rs:1079`). Two gate runs of this
+branch, half an hour apart:
+
+| sha | the test | load1 at the start | load1 after the suite |
+|---|---|---|---|
+| `adcc4df8` | ok | 7.62 | 4.67 |
+| `13efad21` | FAILED | 6.64 | **9.49** |
+
+The two trees differ in `.rs` by one `if`, two reformatted assertions and
+one unit test over a `Session` with no workspace. The failing fixture
+runs ad-hoc jobs that exit 0 under no cap, so it reaches none of them.
+Its own text names the mechanism: the hub called attempt 4 of
+`j0000000002` lost because *"the health report it sent 183.302453ms ago
+does not name attempt 4 of this job, and nothing has been heard about
+that attempt for 6.017909028s"*, on a runner reporting `load 9.69
+there`. A 6 s silence window and a health-report cadence, neither
+declared, on a host at load 9.5 — which is the class **D186** fixed for
+three other fixtures by declaring the figure they silently needed, and
+the class ORCH-128 says will keep arriving.
+
+**Nothing was done to it here**: not a skip list, not an expectation,
+not a threshold. A row, so that the next branch it reddens is not the
+one that has to discover it.
+
 ### 6. The workspace walk was kept clear of
 
 No test added here touches a directory the runner's workspace walk could
@@ -538,9 +595,9 @@ readings and asserts the **old** rule true on them in the same test;
 `history/2026-10-31-oom-step-attribution.md`.
 ```
 
-**For `docs/orchestration/board.md`** — four rows, **already applied on
+**For `docs/orchestration/board.md`** — five rows, **already applied on
 this branch**, reproduced here verbatim so the merged board can be
-checked line by line. Two in *Owed*, after ORCH-307; two in *Open*,
+checked line by line. Two in *Owed*, after ORCH-307; three in *Open*,
 after ORCH-303. The highest id on `main` is **ORCH-311**.
 
 In *Owed*:
@@ -555,6 +612,7 @@ In *Open*:
 ```markdown
 | ORCH-NEXT | **On a kernel with no `oom_group_kill` the mid-burst race is closed by one clause only, and that clause needs the step to have exited 0.** `OomWatermark::killed_in_this_step` (`herd-runner/src/job.rs`) judges a step on `oom_group_kill` where the kernel publishes it — one increment per event, raised before the first task is signalled — and on the cumulative per-process `oom_kill` where it does not. In that fallback a `down` that ends **without an exit code**, for any reason at all, can still read the tail of `run`'s own kill as its own, because the baseline was taken mid-burst. The field is Linux 5.17 and later, and this project cannot read the first consumer's kernel version (invariant 9, **D161**), so **which of the two guards carried j0000000069 is not known** | `oom-step-attribution`, 2026-10-31, *Risks and findings* 3; stated rather than closed, because closing it needs either a second reading after a settle or a figure only the consumer can report | herd-step | open | Decide between (a) one re-read of `memory.events` after a bounded settle when a step ended with no code and only `processes` moved, which costs every capped step a few ms, and (b) asking the first consumer to report whether `oom_group_kill` appears in a job cgroup's `memory.events` on their fleet. **(b) first:** a few ms is cheap, but it is a change to every capped step's path and it may be guarding a branch nobody runs | a report from the first consumer, for (b) | `herd-runner/src/job.rs` `OomWatermark`; `herd-runner/src/cgroup.rs` `OomKills`; `history/2026-10-31-oom-step-attribution.md` |
 | ORCH-NEXT | **The runner's own log lines are not counted against the log cap, so a line written after a log-capped step breaks the figure the requester was promised.** The cap is accounted in `log_bytes`, which only `stream_output` increments (`herd-runner/src/job.rs`); every line `say_in_the_log` writes is bytes the requester receives **beyond** it. A step the log cap stopped has had its own bytes cut at exactly the cap, so any runner line after it over-runs by its own length. **Measured, because `oom-step-attribution` made it reachable and the suite caught it in one run:** 1220 bytes against a 1 024 cap and 65733 against 65536, in `a_job_that_breaches_the_log_cap_and_exits_at_once_names_the_cap` and `a_job_flooding_its_log_is_stopped_at_the_log_cap`. That branch answered it by not writing its new line under the log cap. **The pre-existing paths remain and nothing tests them:** a declared job whose `run` breaches the log cap and whose `down` then fails writes `say_the_takedown_did_not_come_off`'s line into a log that is already full, and `say_the_job_never_started`'s does the same | `oom-step-attribution`, 2026-10-31, *Risks and findings* 7, found by its own red gate `j0000000177` | herd-step | open | Decide what the log cap means first, because the fix follows from it: either (a) the runner's own lines are **inside** the cap, which means counting them in `log_bytes` and cutting them too — a runner that cannot explain why it stopped a job — or (b) they are **outside** it by design, which means the cap is a bound on the *job's* output and the promise should say so wherever it is stated, including `--job-log-cap`'s own `--help`. **(b) is the recommendation:** a runner must always be able to say why it stopped a job, and four short sentences past a 64 MiB ceiling is not what the cap exists to prevent. Then one test per pre-existing path | — | `herd-runner/src/job.rs` `say_in_the_log`, `stream_output`, `say_the_takedown_did_not_come_off`, `say_the_job_never_started`; `herd-runner/tests/confinement.rs:466` and `:923`; `history/2026-10-31-oom-step-attribution.md` |
+| ORCH-NEXT | **`a_link_cut_while_the_runner_is_full_loses_no_job` goes red on this host under load, and it is in no skip list, so it reddens whatever branch is holding the gate when it happens.** Measured twice on the same branch, 30 minutes apart, on two trees whose only `.rs` difference is one `if` and one unit test neither of which it can reach: **ok** on `adcc4df8` with load1 7.62 at the gate's start and 4.67 after the suite, **FAILED** on `13efad21` with 6.64 rising to 9.49. Its own failure text names the mechanism: the hub called attempt 4 of `j0000000002` lost because *"the health report it sent 183.302453ms ago does not name attempt 4 of this job, and nothing has been heard about that attempt for 6.017909028s"*, on a runner reporting `load 9.69 there`. It is the class of ORCH-128 — a `real_herd`-shaped fixture with wall-clock thresholds and no declared need — and the class the three 30 s timeouts of 2026-10-28 belonged to before **D186** gave them a constant | `oom-step-attribution`, 2026-10-31, *Risks and findings* 8, found by two gate runs of its own | herd-step | open | **Do not add it to a skip list** — it would be a real assertion silently excused, which is the one thing D27 forbids. Give it what D186 gave the other three: find the figure it silently depends on and declare it. The candidates are the 6 s silence window and the health-report cadence against a host at load 9.5, both of which are the test's own and neither of which it states. Then re-measure at rest and under load, and if it cannot be made load-independent, decide whether it belongs in `local-under-load.txt` as a **named** load-conditional skip that prints the figure it read, which is the only form that is not an excuse | — | `herd-hub/tests/announced_job_ceiling.rs:1079`; gate receipts for `adcc4df8c7de8f0f98e46b1cf9058c2e4665315f` and `13efad21c3e42cc8041b2b597ba79a529f8a3595`; **D186**, ORCH-128; `history/2026-10-31-oom-step-attribution.md` |
 ```
 
 ## Decisions needed
