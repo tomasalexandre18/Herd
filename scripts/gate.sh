@@ -21,9 +21,9 @@
 # 1. A count is not a signal; a list is (D27). A skipped assertion is
 #    printed as skipped and never counted as passed, so this gate compares
 #    the run's skips against a committed list of expected ones and is RED on
-#    any skip that is not on it. It says nothing about the number: this host
-#    skips 12 at rest and 14 under load, and neither figure means anything on
-#    its own. The names do.
+#    any skip that is not on it. It says nothing about the number: the
+#    names expected here are in `scripts/expected-skips/`, and no count
+#    taken off those files means anything on its own. The names do.
 #
 #    Two kinds of skip, two lists, never merged (ORCH-202). A running test
 #    that cannot make its assertion on this host prints `HERD-SKIPPED`. A

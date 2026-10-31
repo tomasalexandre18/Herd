@@ -18,10 +18,10 @@
 # And an empty skip log is not by itself good news. `cargo test` stops
 # launching test binaries once one has failed, so a red run leaves the log
 # holding only what the binaries that did run wrote: on this workstation a
-# red run reported 0 skips where a complete run reports 12, and PR #86's red
-# `check` job on GitHub Actions printed the same reassurance on a runner
-# that reports 15 when green. Two things keep that honest, and both are
-# needed:
+# red run reported 0 skips where a complete run skips every name in
+# `scripts/expected-skips/local.txt`, and PR #86's red `check` job on
+# GitHub Actions printed the same reassurance on a runner with a skip list
+# of its own (`ci.txt`). Two things keep that honest, and both are needed:
 #
 #   * --no-fail-fast by default, so every test binary runs and the log is
 #     complete even when one of them fails. The suite is a gate: all of its

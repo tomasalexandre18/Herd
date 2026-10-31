@@ -210,10 +210,10 @@ not four because the obvious fourth cannot be done in its own step:**
    full list**: the two load-gated flood benches and nothing else
    (`scripts/expected-skips/README.md` documents it that way). The
    distinction is load-bearing. Blessing a loaded run straight into
-   `local.txt` would put all fourteen names there, and an at-rest run
-   would then be green with a flood bench silently skipped — an
-   assertion nobody checks, reported as a pass, which is the one thing
-   D27 exists to forbid.
+   `local.txt` would put the at-rest names **and** the two flood benches
+   there, and an at-rest run would then be green with one silently
+   skipped — an assertion nobody checks, reported as a pass, which is
+   the one thing D27 exists to forbid.
 
 **Why the `pull_request:` trigger cannot go in step 1, which is the
 whole reason there are three steps and not four.** `ci.yml` triggers on
@@ -466,20 +466,22 @@ cheaper than one we meet later.
   is the worked example of the two disagreeing: an assertion written for
   a 17 GiB machine was red here and green on CI. That class of
   difference will be found **after** the landing.
-- **Neither host checks the twelve confinement assertions, and the
-  dramatic version of this claim is false (measured 2026-10-28).** All
-  **twelve** skips measured here read *"cgroup v2 delegation is
+- **Neither host checks the confinement assertions behind invariant 2,
+  and the dramatic version of this claim is false (measured
+  2026-10-28).** Every skip measured here came back to cgroup v2
+  delegation, most of them in those words — *"cgroup v2 delegation is
   unavailable: this runner cannot create a cgroup under
   `/sys/fs/cgroup/chatons.slice/chatons-herd-claude-831000.scope`
-  (Permission denied (os error 13))"* — an agent on this workstation
+  (Permission denied (os error 13))"* — and an agent on this workstation
   cannot run them either, so it is **not** true that CI cannot check
-  invariant 2's confinement and this host can. The real difference
-  between 12 here and 14 on CI is two CI-only skips, both
+  invariant 2's confinement and this host can. The difference measured
+  that day, 12 names here against 14 on CI, was two CI-only skips, both
   `the_io_weight_verdict_follows_the_device_the_job_works_on` (*"no
   device offers bfq"*, *"no ZFS mount"*), which do not skip here because
-  `/mnt/ssd_980` has blk-iocost enabled. **The honest statement is the
-  narrow one: this host runs two assertions CI cannot, and neither host
-  runs the twelve.**
+  `/mnt/ssd_980` has blk-iocost enabled. Those are that day's figures;
+  the lists in `scripts/expected-skips/` are what either host skips now.
+  **The honest statement is the narrow one: this host runs two
+  assertions CI cannot, and neither host runs the delegation list.**
 - **The gate measures a cgroup slice, not a host (measured
   2026-10-28).** In-test the runner announced *"4.9 GiB rather than 31.1
   GiB, because /proc/self/cgroup is enclosed by memory.high 18 GiB on
