@@ -133,11 +133,26 @@ his — D248 answered it.
    frame nobody numbered then is a frame nobody can add now — which
    is why step 3's coalesce half has to be additive on an existing
    frame (D229) rather than a new one.
-2. **M12's remainder** — per-runner budgets and keeper pinning (the rest
-   of E-16), key-aware placement and the GC that moves packs (E-14).
-   What it buys: two musts. What it blocks: nothing below, but its
-   retention delay is a parked question, so it cannot be finished
-   without an answer.
+2. **M12's remainder** — **not** per-runner budgets and keeper pinning,
+   which both ship. The sentence this replaces named the two clauses of
+   E-16 that are **built**: `--pack-budget` with the store's own
+   measurement, the gc `evict_to_budget` and its one real caller
+   `Session::sweep_packs_to_budget`; and keeper pinning on both sides,
+   `--keeper` and `--keeper-for` on the hub, `keeper_for` and
+   `PinPacks` honoured across a redial on the runner (**D262**,
+   **D266**). Re-verified clause by clause on 2026-10-31
+   (`docs/coverage.md` E-16). What is **left** of E-16 is its
+   *referenced* clause, whose claim set is empty in the field so the
+   gc cannot see what a running job holds (ORCH-275); the word
+   *configurable* on the five-per-key figure, which is two constants
+   and no flag; and the removal half of the undelivered-collections
+   clause, which sets a spool aside rather than removing it
+   (ORCH-108). Key-aware placement is M12's too. **E-14 is a must
+   D275 records the consumer as having withdrawn**, so this step no
+   longer buys it; its `coverage.md` cell still reads `planned`
+   (ORCH-305). What it buys: **one** must, E-16. What it blocks:
+   nothing below, but its retention delay is a parked question, so it
+   cannot be finished without an answer.
 3. **E-42's coalesce half** — the push hook's producer submit. **The
    second clause of the sentence this replaces was false, and it was
    the orchestrator's own**, repeated from one of its briefs: it read
