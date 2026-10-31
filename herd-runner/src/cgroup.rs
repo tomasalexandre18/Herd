@@ -640,6 +640,53 @@ pub struct JobCgroup {
     dir: PathBuf,
 }
 
+/// The two counters `memory.events` keeps about out-of-memory kills, read
+/// together because only one of them can answer *which step* a kill belongs
+/// to.
+///
+/// `oom_kill` counts **processes**. With `memory.oom.group = 1` written on
+/// every job cgroup ([`JobCgroup::create`]) one kill event takes the whole
+/// job tree, and the kernel bumps this counter once per task as it walks
+/// them. The walk is not instantaneous — the first task's death is what wakes
+/// the runner up, while the rest are still being counted — so a reading taken
+/// the moment a step's child is reaped can be **mid-burst**, and the
+/// remainder lands in whatever is read next. That is how one kill came to be
+/// charged to two steps.
+///
+/// `oom_group_kill` counts **events**: the kernel bumps it once, before the
+/// first task of the group is signalled, so by the time any death can be
+/// observed it is already settled. It is the counter that matches the flag
+/// this runner itself sets, and it is what a step's verdict is read from
+/// wherever the kernel publishes it (Linux 5.17 and later). `None` says this
+/// kernel does not, and then the per-process counter is all there is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OomKills {
+    /// `oom_kill`: processes the kernel has killed here, cumulative.
+    pub processes: u64,
+    /// `oom_group_kill`: group kills, one per event — or `None` on a kernel
+    /// that does not publish the field.
+    pub group_kills: Option<u64>,
+}
+
+/// [`JobCgroup::oom_kills`] over the text, so that the reading is provable
+/// without a cgroup to read it from.
+///
+/// A field that is absent and a field that will not parse are one answer for
+/// `oom_group_kill`, and that answer is `None`: both mean this kernel offers
+/// nothing better than the per-process counter.
+pub fn oom_kills_in(text: &str) -> OomKills {
+    let field = |name: &str| {
+        text.lines()
+            .filter_map(|line| line.strip_prefix(name))
+            .filter_map(|count| count.trim().parse::<u64>().ok())
+            .next()
+    };
+    OomKills {
+        processes: field("oom_kill ").unwrap_or(0),
+        group_kills: field("oom_group_kill "),
+    }
+}
+
 impl JobCgroup {
     fn create(base: &Path, tag: &JobTag, limits: &JobLimits) -> io::Result<Self> {
         // The job's id is in the tag for a human reading `/sys/fs/cgroup`, but
@@ -707,18 +754,19 @@ impl JobCgroup {
         read_number(&self.dir.join("memory.peak"))
     }
 
-    /// How many times the kernel killed something in this cgroup for going
-    /// past the ceiling. Non-zero is what turns a SIGKILL into a named
-    /// outcome instead of "signalled by something".
-    pub fn oom_kills(&self) -> u64 {
-        let Ok(text) = fs::read_to_string(self.dir.join("memory.events")) else {
-            return 0;
-        };
-        text.lines()
-            .filter_map(|line| line.strip_prefix("oom_kill "))
-            .filter_map(|count| count.trim().parse::<u64>().ok())
-            .next()
-            .unwrap_or(0)
+    /// What the kernel has killed in this cgroup for going past the ceiling.
+    /// Non-zero is what turns a SIGKILL into a named outcome instead of
+    /// "signalled by something".
+    ///
+    /// A `memory.events` nobody could read reads as zero, which is why the
+    /// baseline a step's verdict is judged against never moves backwards
+    /// ([`crate::job`]'s own watermark): a single unreadable step would
+    /// otherwise charge the next one with every kill the job ever had.
+    pub fn oom_kills(&self) -> OomKills {
+        match fs::read_to_string(self.dir.join("memory.events")) {
+            Ok(text) => oom_kills_in(&text),
+            Err(_) => OomKills::default(),
+        }
     }
 
     /// Kill every process in the cgroup, children and grandchildren alike, in
@@ -2410,5 +2458,50 @@ mod tests {
         ceiling
             .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
             .expect("a base that hands io down takes the ceiling");
+    }
+
+    /// `memory.events` is read as **two** counters, because only one of them
+    /// says how many kill *events* there were.
+    ///
+    /// The text is the kernel's own shape, with `oom_group_kill` where Linux
+    /// 5.17 and later put it. `low`, `high` and `max` are there so the
+    /// parser is proved against a file with other fields in it rather than
+    /// against the one line it wants.
+    #[test]
+    fn memory_events_is_read_as_a_process_count_and_an_event_count() {
+        let found = oom_kills_in(
+            "low 0\nhigh 0\nmax 41\noom 1\noom_kill 8\noom_group_kill 1\n",
+        );
+        assert_eq!(
+            found,
+            OomKills {
+                processes: 8,
+                group_kills: Some(1),
+            },
+            "eight tasks killed, in one group-kill event"
+        );
+    }
+
+    /// A kernel that does not publish `oom_group_kill` says so as absence,
+    /// never as zero: zero would read as "no event has ever happened here",
+    /// which is a claim this file is not making.
+    #[test]
+    fn a_kernel_without_the_group_counter_is_read_as_absence() {
+        let found = oom_kills_in("low 0\nhigh 0\nmax 41\noom 1\noom_kill 8\n");
+        assert_eq!(found.processes, 8);
+        assert_eq!(
+            found.group_kills, None,
+            "absent is not zero: one is a kernel that cannot tell us, the \
+             other is a kernel telling us nothing was killed"
+        );
+    }
+
+    /// Nothing at all — the file missing, or a cgroup that was never made —
+    /// is zero kills and no event count, and the baseline in
+    /// [`crate::job`] is a high-water mark for exactly this reason.
+    #[test]
+    fn an_empty_or_unreadable_memory_events_is_no_kills() {
+        assert_eq!(oom_kills_in(""), OomKills::default());
+        assert_eq!(oom_kills_in("oom_kill not-a-number\n"), OomKills::default());
     }
 }
