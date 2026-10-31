@@ -2,9 +2,7 @@
 
 State now, replaced every session. **What is owed and what Alexa has not
 decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
-**The method is `CLAUDE.md` and `workflow.md`, in full** — no pull request,
-one batch, one `--no-ff` landing, a green `./scripts/gate.sh` for the merge's
-**second parent on an identical tree**, every gate through Herd (**D258**).
+**The method is `CLAUDE.md` and `workflow.md`, in full**; gates on Herd (D258).
 
 ## Releases
 
@@ -36,6 +34,8 @@ binaries** — refused by version, not degraded. Told to extract now. **Both
 conditions it ships on are now met**: retention follows in v1.1, and
 **`herd-hub report` weighs the records, events and logs** (**D271**) — apparent
 size, said to be a floor, 1.97x under blocks.
+**Their 2026-10-31 loss — 17 files, 42 MiB under `finished, exited 0` — is
+fixed on `main`, unreleased** (**D291**): the hub asks when the verdict lands.
 
 ## Where the software is
 

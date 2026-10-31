@@ -6145,6 +6145,101 @@ async fn relay_from_runner(
                 let _ = outbox.send(FromHub::JobResultAck {
                     job_id: job_id.clone(),
                 });
+                // **And the bytes, asked for the instant this hub learns
+                // there are any** (D148).
+                //
+                // The hub's standing question for outstanding collections is
+                // asked at join, from `ask_for_the_files_still_owed`, and its
+                // own comment says it goes out *before the hub reads a
+                // frame*. That ordering is a race with a verdict a runner
+                // held across a link break: the scan reads a record with no
+                // manifest on it, `collection_owed` answers `None` because
+                // `outputs.files` is empty, the hub names nothing — and the
+                // manifest is written milliseconds later, by the line above.
+                // Nothing asks again. The runner's pump is hub-driven and
+                // `Session::attach` deliberately does not restart it ("the
+                // next connection's `JobFilesHeld` starts them again"), and
+                // the held-verdict loop only ever gives up and reports. So
+                // the collection was never asked for by anybody, and
+                // `COLLECTION_SILENCE` later released a verdict naming all
+                // seventeen of the first consumer's files while their runner
+                // sat on the line holding every byte (2026-10-31, v1.0.0, 42
+                // MiB, a record that said `finished, exited 0`).
+                //
+                // Asking here makes that ordering irrelevant: the question
+                // is put at the first instant it has an answer. It is the
+                // scan's own derivation for one job — D79's one definition,
+                // asked a third way — so there is no second rule to keep in
+                // agreement with it.
+                //
+                // Guarded on the frame rather than the record, so an
+                // ordinary verdict, which is almost every verdict, reads no
+                // record for a collection it has not got.
+                //
+                // **What this costs on a healthy link, with the measurement
+                // and not without it.** A collection whose runner never lost
+                // its link is already being pumped when this frame is
+                // handled, so this is a second start for it: the frame
+                // reports the nothing this hub holds, `FilesOut::resume_from`
+                // winds that runner's cursor back to the start of the
+                // collection, and a second `pump_files` task joins the
+                // first. The two cannot duplicate a chunk between them —
+                // `FilesOut::next` hands each one out once, under the
+                // session's own lock — so what the rewind can cost is the
+                // chunks already in flight when it lands, re-sent and
+                // refused by offset, with the refusal carrying this hub's
+                // real holdings and winding the cursor forward again.
+                //
+                // Measured on `outputs_whole`, a real runner streaming 33
+                // files of a megabyte over loopback, twice: **zero** refused
+                // chunks. On a link whose round trip is microseconds the
+                // rewind lands before anything has been sent, so there is
+                // nothing to re-send. The window it could cost on a link
+                // with real latency is `FILES_IN_FLIGHT` 8 times
+                // `OUTPUT_CHUNK_BYTES` 1 MiB — 8 MiB, once per collection,
+                // self-correcting — and that figure is reasoned from those
+                // two constants, not measured. Either way it is a transfer
+                // cost and not a correctness one.
+                if outputs.streamed && !outputs.files.is_empty() {
+                    match state.store.collection_owed(&job_id) {
+                        Ok(Some(collection)) if collection.runner == name => {
+                            println!(
+                                "herd-hub: {job_id} ended leaving {} file(s) this hub does \
+                                 not have; asking {name} for them on the link its verdict \
+                                 arrived on",
+                                outputs.files.len()
+                            );
+                            let _ = outbox.send(FromHub::JobFilesHeld {
+                                job_id: job_id.clone(),
+                                attempt,
+                                held: collection.held,
+                            });
+                        }
+                        // The record's last attempt names another machine.
+                        // Not reachable through `is_current`, which has
+                        // already agreed that this speaker holds this
+                        // attempt — so it is said out loud rather than
+                        // passed over, because if it is ever printed the two
+                        // checks disagree.
+                        Ok(Some(collection)) => eprintln!(
+                            "herd-hub: {name} reported how {job_id} ended and its \
+                             collection is owed by {}, which is not it: nothing is asked \
+                             for",
+                            collection.runner
+                        ),
+                        // Nothing outstanding: the sweeper took it (D152), or
+                        // this hub already holds every byte. Either way there
+                        // is no question to ask.
+                        Ok(None) => {}
+                        // The scan at the next join is still the fallback, so
+                        // this is said and not retried.
+                        Err(error) => eprintln!(
+                            "herd-hub: whether {job_id} still owes this hub files cannot be \
+                             read, so {name} is not asked for them here: {error}. The next \
+                             connection's owed-collections scan is what is left"
+                        ),
+                    }
+                }
                 // Off the record, not out of the frame that just arrived, so
                 // a requester following live and a `herdctl wait` an hour
                 // later are given the same bytes by the same code: one answer

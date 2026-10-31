@@ -15314,3 +15314,61 @@ and none holds a `D` above 289, so no gap was closed and **D143**,
 entry of its own, correctly — it carries this same decision into
 `.claude/agents/herd-merger.md`, and a second number for one choice is
 what D148 forbids.
+
+## 2026-10-31 — D291 The hub asks for a collection when the verdict
+announces it
+
+The hub's standing question for outstanding collections is asked once per
+connection, at join, from `ask_for_the_files_still_owed` — and its own
+comment says the frame goes out *before the hub reads a frame*, which is
+what makes a runner's silence readable as "this hub wants nothing of
+yours". That ordering is a race with a verdict a runner held across a link
+break. The scan reads a record with no manifest on it, `collection_owed`
+answers `None` because `outputs.files` is empty, the hub names nothing, and
+the manifest is written milliseconds later by the re-offered verdict. The
+runner's pump is hub-driven, `Session::attach` deliberately does not restart
+it, and the held-verdict loop only ever gives up and reports — so nobody
+ever asks again.
+
+Measured on the first consumer's instance on 2026-10-31, v1.0.0: a link
+down for 71 s at host load 172, a job that finished inside that window, a
+verdict delivered on the next link, and **17 output files, 42 MiB, never
+collected** under a record reading `finished, exited 0`. The requester saw
+`herdctl` exit 2 with 17 "did NOT get" lines and the job's own record said
+it had succeeded. Their runner was on the line holding every byte, and a
+restart brought the whole collection home — 17 files, 43 011 442 bytes,
+digests matching their independent copy — which is why this is a missing
+request and not a broken transfer.
+
+**So the question is put where it first has an answer**: in the
+`ToHub::JobFinished` arm, after `record_the_end` has written the manifest,
+the hub asks `JobStore::collection_owed` for that one job and sends one
+`FromHub::JobFilesHeld` when the collection is owed by the runner that
+spoke. It is the scan's own derivation asked for one job — D79's one
+definition, asked a third way — so there is no second rule to keep in
+agreement with it, and it makes the join scan's ordering structurally
+irrelevant rather than tightening it.
+
+Hub only. No frame changed and no `PROTOCOL_VERSION` move: `JobFilesHeld`
+already existed and the runner already restarts its pump on receiving one.
+
+**What it costs, with the measurement and without the qualifier it has not
+earned.** A collection on a link that never broke is already being pumped
+when this frame is handled, so this is a second start for it: the frame
+reports the nothing the hub holds and `FilesOut::resume_from` winds that
+runner's cursor back to the start of the collection. The two pump tasks
+cannot duplicate a chunk between them — `FilesOut::next` hands each one out
+once under the session's lock — so what a rewind can cost is the chunks
+already in flight, re-sent and refused by offset, with the refusal carrying
+the hub's real holdings and winding the cursor forward again. Measured on
+`herd-hub/tests/outputs_whole.rs`, a real runner streaming 33 files of a
+megabyte over loopback, twice: **zero** refused chunks, because the rewind
+lands before anything has been sent. The window it could cost on a link
+with real latency is `FILES_IN_FLIGHT` 8 times `OUTPUT_CHUNK_BYTES` 1 MiB —
+8 MiB, once per collection — and that figure is **reasoned from those two
+constants, not measured**. It is a transfer cost and not a correctness one,
+and it is a row of its own rather than a second change in this one.
+
+Deliberately not in this decision: an event recorded where a short
+collection is given up on (a record-format addition, its own row and its
+own entry), and anything about the requeue storm.
