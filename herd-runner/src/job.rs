@@ -2267,6 +2267,31 @@ mod tests {
         );
     }
 
+    /// The same replay with a `down` that ended **without** an exit code, so
+    /// that the group counter is what has to carry it.
+    ///
+    /// Both guards fix j0000000069 and the two are tested apart on purpose: a
+    /// test where `down` exits 0 passes with the group counter taken out, and
+    /// one where it is signalled passes with the exit-code clause taken out.
+    /// Together they leave neither clause able to be removed unnoticed.
+    #[test]
+    fn one_oom_kill_is_charged_to_one_step_even_when_down_is_signalled_too() {
+        let mut mark = OomWatermark::default();
+        let at_run = read(3, Some(1));
+        assert!(mark.killed_in_this_step(at_run, &signalled()));
+
+        let at_down = read(8, Some(1));
+        assert!(
+            the_old_rule(at_run, at_down),
+            "the old rule is true here too, which is what has to be refused"
+        );
+        assert!(
+            !mark.killed_in_this_step(at_down, &signalled()),
+            "no second event in `oom_group_kill`, so no second kill — \
+             whatever ended `down`"
+        );
+    }
+
     /// And the fix does not work by making `down` unable to report a cap.
     /// Two real kills — two `oom_group_kill` events — are both reported.
     #[test]
