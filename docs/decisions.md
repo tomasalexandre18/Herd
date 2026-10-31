@@ -15162,3 +15162,91 @@ which said that if the count bound were ever dropped this is where it had
 to be answered; it is renamed, not deleted, and answers it. The
 consequence test lost its `admitted < at_once` term, which modelled a
 bound the hub no longer applies.
+
+## 2026-10-31 — D288 A skip total is not written down; prose names
+the file that holds the list
+
+**Context.** D187 made the **gate** compare the skip list and never the
+count. Prose was left out, and no gate reads prose. Three landings paid
+for that in a row. Batch 31 added one name to
+`scripts/expected-skips/local.txt` and silently falsified every sentence
+that carried a total. ORCH-313 swept four of those sentences at batch 33
+and its detector read `scripts/` and `docs/` only, so a fifth survived
+in code — where, in that same batch, a correction from *twelve* to
+*thirteen* was made at `herd-runner/src/cgroup.rs:2532` on the
+orchestrator's own instruction, and was true for one day. And
+`scripts/report-skips.sh` carried *"a runner that reports 15 skips when
+green"*, whose false part was the **qualifier**: the 15 came from run
+40439537929, a red run that printed "AT LEAST 15" because it had not
+finished (D179), while CI's green list is `ci.txt`, blessed from run
+40564336703. ORCH-070 had named this rule on 2026-10-26 and nobody had
+written it down.
+
+**Choice.** Alexa's ruling, 2026-10-31, in the stronger form the sweep
+had already implemented in practice: **a skip or ignore total is not
+written down. Where prose needs to point at one, it names the file that
+holds the list. Where a figure is genuinely a measurement, it carries
+its host, its date and its run or sha, and is labelled as that run's
+measurement rather than as a current total.** It is written in
+`scripts/expected-skips/README.md`, the directory a reader goes to when
+they want a number, and the worked example of its second half is
+`local-under-load.txt`'s own header: it keeps its **14** as one blessed
+run's measurement, with host, date and sha, and says that what
+`local.txt` holds at rest *"is local.txt's business and is not restated
+here"*.
+
+**What it exempts, by name.** `docs/status.md` is *state*, replaced
+every session (invariant 8), so a current total there is what that file
+is for; `docs/coverage.md` carries headline figures by design. Both were
+read against this rule at ORCH-333 and left untouched.
+
+**Alternative rejected.** A `check-docs.sh` rule that a skip total under
+`docs/` must name its host and its date — ORCH-333's own proposal.
+Nothing mechanical can tell a total from any other number in prose, and
+the two files that legitimately hold one are the two the rule exempts,
+so the check would have been a false-positive generator over the only
+corpus it can read.
+
+**Reversibility.** High. One section of one README; no code reads it.
+
+**On the number.** Allocated **D288** at batch 34's integration, the
+next free number above D287 on `origin/main` and above every unlanded
+branch; numbers are identifiers and gaps stay (D148, invariant 8).
+
+## 2026-10-31 — D289 A citation into a prose document names a heading
+or quotes a phrase; a line number is for code
+
+**Context.** `docs/orchestration/board.md`'s ORCH-250 row cited
+`docs/orchestration/workflow.md` four times by line: `:623` for the
+phrase *"at roughly 8.5 GB of build tree each"*, `:620`-`:625` and
+`:620`-`:641` for the heavy-agent bullet, and `:829`-`:841` for the
+handoff measurement. Batch 34 adds 31 lines to that file, all after
+`:374`, so all four numbers would have had to move. Measured at that
+integration, **none of the four pointed at what it named before this
+batch touched anything**: on `origin/main` at `7309b167`, `:623` reads
+*"direction of 2026-10-30: « a partir de maitenant que du herd …"* and
+`:620`-`:641` is the opening of *Execution goes through Herd*, while
+the heavy-agent bullet is in *Concurrency and host rules* and the
+measurement it cites `:829`-`:841` for is in *Handoff and resumption*.
+The row had rotted once already, silently; renumbering it by 31 would
+have carried four wrong citations to four new wrong numbers.
+
+**The rule.** The orchestrator's ruling, 2026-10-31: **a citation into
+a prose document names a heading or quotes a phrase. A line number is
+for code, where the gate pins it.** Nothing watches a line number in
+prose, so `file:line` into prose is the same object as the
+hand-maintained skip total **D288** removes — a number kept by hand
+with no detector behind it — and it rots the moment the file grows. It
+is applied **on touch**: when a citation is being fixed anyway it is
+converted, and **never as a sweep**, because converting every citation
+in the corpus would cost more than it returns.
+
+**What it does not cover.** A citation into **code** keeps its line —
+`gate.sh:374`, `herd-runner/src/cgroup.rs:2532`, the shell guards —
+because the four Rust gates read those files, so a line that moves is a
+line something meets. A **handoff** is a dated record and is never
+edited, so its citations are not converted and are not defects when
+they rot: they were true on their date. And the rule is about where a
+citation points, not about whether what it points at is true. Nothing
+mechanical reads it, exactly as `check-orchestration.sh`'s
+predecessor-run case cannot read GitHub (D288's neighbour, ORCH-334).
