@@ -2023,6 +2023,197 @@ if grep -qE '^[[:space:]]*exec[[:space:]]*<[[:space:]]*/dev/null' \
 else
   ok "pre-push keeps the stdin git hands it: the ref list is its input"
 fi
+
+echo "== a landing records its predecessor's post-push run (ORCH-333)"
+# The gap this closes. A landing cannot record its own `ci.yml` run: the
+# push that starts it comes after the tree is frozen, so the committed
+# record says "none yet -- this push starts it" and the NEXT landing is
+# the only place that run can be written down (templates/landing.md,
+# *The two copies are not identical*). Nothing mechanical held that
+# chain, and it broke: batch 33's merger found TWO runs owed rather than
+# one, because batch 32's record claimed batch 31's run was recorded in
+# `board.md` -- the sentence is still there, "Batch 31's own run is
+# recorded at this landing in `board.md`" -- and it was not. Three
+# prohibitions in this project are held by machinery; this one was held
+# by memory alone, which is the definition of a control that is not one.
+#
+# What it CANNOT do, and nobody should read it as doing. This script has
+# no network and no toolchain. It cannot ask GitHub whether run
+# 41222040363 exists, whether its head sha is the one named, or whether
+# it passed -- and it never tries. It enforces exactly one thing: that
+# the newest landing record names the previous landing's batch together
+# with a run id and a verdict for it, inside one paragraph. A merger
+# who invents both passes this case. So it is a check that somebody WENT
+# AND LOOKED AND WROTE DOWN WHAT THEY SAW, not a verification that what
+# they wrote is true. The verdict's truth is a human's reading of
+# `gh run view`, and `workflow.md` (*What a landing is*) is where it stays.
+#
+# Why one paragraph and not "somewhere in the file". A run id in one
+# bullet and a verdict in another are two claims a reader has to join up,
+# and joining them up wrongly is how batch 32's sentence read as if it
+# carried both. One line would have been too narrow and was measured to
+# be: this prose wraps at 79 columns, and batches 29, 30 and 31 each
+# wrote the figure correctly across two or three lines. Calibrated on
+# the real records on 2026-10-31 -- the records of batches 28, 29, 30,
+# 31 and 33 pass, and batch 32's is the only one of the six that fires.
+# The accepted verdicts are GitHub's own conclusions (`success`,
+# `failure`, `cancelled`, `timed_out`, `skipped`, `neutral`, `stale`,
+# `action_required`) plus `failed`; a landing whose predecessor started
+# no run at all writes the literal `no ci.yml run` in that paragraph
+# instead, which is a statement and not an omission.
+#
+# The limit, stated so the next reader does not overrate it: this is
+# co-occurrence inside a paragraph, not attribution. A paragraph that
+# names both batches and carries one run id satisfies it, and a mistyped
+# digit satisfies it too. What it refuses is the shape batch 32 actually
+# had -- a claim about the predecessor with no figure anywhere near it.
+#
+# Cost: two awk passes over two files per case, and one `cp` of the
+# landing records for the real-tree fixture. It does not run
+# check-docs.sh, so it adds nothing to the 38 whole-corpus runs this
+# file is otherwise paid for.
+
+# lr_prev_run <dir>: prints nothing when the newest landing record in
+# <dir> carries the previous landing's run id and a verdict on one line,
+# and prints the complaint when it does not. Fewer than two landing
+# records is nothing to check -- the first landing has no predecessor.
+lr_prev_run() {
+  lr_list=""
+  for lr_f in "$1"/*-merge-*.md; do
+    [ -f "$lr_f" ] || continue
+    lr_b=${lr_f##*/}
+    lr_tag=${lr_b#*-merge-}
+    lr_list="$lr_list${lr_b%%-merge-*} ${lr_tag%.md} $lr_f
+"
+  done
+  # Date first, then the batch tag by version order, so that
+  # batch-26-regate sorts before batch-27 and batch-9 before batch-27.
+  lr_sorted=$(printf '%s' "$lr_list" | LC_ALL=C sort -k1,1 -k2,2V)
+  [ "$(printf '%s' "$lr_sorted" | grep -c .)" -ge 2 ] || return 0
+  lr_new=$(printf '%s\n' "$lr_sorted" | tail -1 | cut -d' ' -f3)
+  lr_prevtag=$(printf '%s\n' "$lr_sorted" | tail -2 | head -1 | cut -d' ' -f2)
+  lr_num=$(printf '%s' "$lr_prevtag" | tr -dc '0-9')
+  if [ -z "$lr_num" ]; then
+    printf '%s: the previous landing (%s) has no batch number in its name\n' \
+      "${lr_new##*/}" "$lr_prevtag"
+    return 0
+  fi
+  # One PARAGRAPH, not one line: this prose is wrapped at 79 columns,
+  # and batches 29, 30 and 31 each wrote the figure correctly across two
+  # or three of them. A block ends at a blank line, at the next bullet
+  # and at the next heading, so a claim in one bullet cannot be answered
+  # by a run id in another.
+  LC_ALL=C awk -v num="$lr_num" -v f="${lr_new##*/}" '
+    function check() {
+      if (blk == "") return
+      if (blk ~ ("batch[ _.-]*" num "([^0-9]|$)")) {
+        named = 1
+        if (blk ~ /[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/ &&
+            blk ~ /(success|failure|failed|cancelled|canceled|timed[ _-]out|skipped|neutral|stale|action_required)/)
+          ok = 1
+        if (blk ~ /no ci\.yml run/) ok = 1
+      }
+      blk = ""
+    }
+    { l = tolower($0) }
+    /^[[:space:]]*$/ { check(); next }
+    /^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]/ { check() }
+    /^#/ { check() }
+    { blk = blk " " l }
+    END {
+      check()
+      if (ok) exit 0
+      if (named)
+        printf "%s: names batch %s, but no paragraph of it carries a run id (8+ digits) AND a verdict for that run\n", f, num
+      else
+        printf "%s: never names batch %s, whose post-push ci.yml run it is the only record that can carry\n", f, num
+    }
+  ' "$lr_new"
+}
+
+lr_case() { # <name> <dir> <quiet|fires>
+  lr_out=$(lr_prev_run "$2")
+  if [ "$3" = quiet ]; then
+    if [ -z "$lr_out" ]; then ok "$1"
+    else bad "$1" "$(printf '%s\n' "$lr_out" | sed 's/^/    /')"; fi
+  else
+    if [ -n "$lr_out" ]; then ok "$1"
+    else bad "$1" "    the detector said nothing, so its silence proves nothing"; fi
+  fi
+}
+
+# Synthetic landings, two names and nothing else, the way the collation
+# probe above is synthetic: the shapes are what is under test, and a
+# fixture built out of the real list would make this case move whenever
+# the real list does.
+lr=$tmp/landings
+lr_fixture() { # <dir> <content of the newest record's CI run section>
+  mkdir -p "$1"
+  printf '## CI run\n\nnothing\n' > "$1/2026-10-30-merge-batch-41.md"
+  printf '## CI run\n\n%s\n' "$2" > "$1/2026-10-31-merge-batch-42.md"
+}
+lr_fixture "$lr/good" \
+  'batch 41  ci.yml 99887766554  main 0ac1dd2  success  7m12s'
+lr_case "landing: the predecessor's run id and verdict on one line is enough" \
+  "$lr/good" quiet
+lr_fixture "$lr/silent" \
+  'None yet -- this push starts it.'
+lr_case "landing: a record that never names its predecessor is refused" \
+  "$lr/silent" fires
+lr_fixture "$lr/claimed" \
+  "Batch 41's own run is recorded at this landing in \`board.md\`."
+lr_case "landing: naming the predecessor with no run id is refused" \
+  "$lr/claimed" fires
+lr_fixture "$lr/noverdict" \
+  'batch 41  ci.yml 99887766554 -- recorded, not waited on'
+lr_case "landing: a run id with no verdict for it is refused" \
+  "$lr/noverdict" fires
+lr_fixture "$lr/ownrun" \
+  'batch 42  ci.yml 99887766554  success  9m01s
+
+Batch 41 landed the day before, and its own run is not named here.'
+lr_case "landing: a run id for its OWN run does not answer for the previous one" \
+  "$lr/ownrun" fires
+# The wrapped form, which is how batches 29 to 31 actually wrote it:
+# three lines of one bullet, the figure split across them.
+lr_fixture "$lr/wrapped" \
+  "- **CI run:** none yet -- this push starts it. Batch 41's own run is
+  recorded in \x60board.md\x60 at this landing: \x60ci.yml\x60 **99887766554**,
+  \x60completed\x60/\x60success\x60."
+lr_case "landing: the figure wrapped across one bullet is accepted" \
+  "$lr/wrapped" quiet
+# And the bound on that: a different bullet does not answer for it.
+lr_fixture "$lr/otherbullet" \
+  "- Batch 41's own run is recorded in \x60board.md\x60 at this landing.
+- An unrelated bullet: \x60ci.yml\x60 **99887766554**, \x60success\x60."
+lr_case "landing: a run id in a different bullet does not answer for it" \
+  "$lr/otherbullet" fires
+lr_fixture "$lr/noran" \
+  'batch 41: no ci.yml run -- the push did not start one'
+lr_case "landing: an explicit \"no ci.yml run\" is a statement, not an omission" \
+  "$lr/noran" quiet
+mkdir -p "$lr/first" && printf '## CI run\n\nnothing\n' \
+  > "$lr/first/2026-10-31-merge-batch-42.md"
+lr_case "landing: the first landing has no predecessor and is not refused" \
+  "$lr/first" quiet
+
+# And the known-bad fixture that is not synthetic: the real records with
+# batch 33 removed, so the newest is batch 32 -- the landing that broke
+# the chain. A detector that stays quiet here would have been written for
+# nothing, so this is the case that earns the real-tree one below.
+mkdir -p "$lr/real32"
+cp "$root"/docs/orchestration/history/*-merge-*.md "$lr/real32/" 2>/dev/null
+rm -f "${lr:?}/real32"/*-merge-batch-33.md
+lr_out=$(lr_prev_run "$lr/real32")
+case "$lr_out" in
+  *"names batch 31"*"no paragraph"*)
+    ok "landing: fires on the real record that broke the chain (batch 32)" ;;
+  *) bad "landing: it must fire on batch 32's record, for that reason" \
+       "$(printf '%s\n' "${lr_out:-nothing at all}" | sed 's/^/    /')" ;;
+esac
+lr_case "landing: the real tree's newest landing record carries it" \
+  "$root/docs/orchestration/history" quiet
+rm -rf "${lr:?}"
 echo
 if [ "$skips" -eq 0 ]; then
   echo "check-orchestration: $pass passed, $fail failed"
