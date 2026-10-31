@@ -79,13 +79,36 @@ committed:
 docs ok
 ```
 
-The **last run**, on the committed tree, is `./scripts/gate.sh` bare and
-whole, submitted through Herd (`--label build`, `--memory-mib 4700`,
-`ws://127.0.0.1:8791`) with its own `CARGO_TARGET_DIR` under
-`/mnt/ssd_980/herd/build/`. Its receipt is written by the gate itself
-under `deploy/gate-receipts/`; the verbatim output and the job id are in
-the agent's report, not in this file, because a second commit to carry
-them would need a second gate run.
+**The first gate run was RED, on `cargo fmt` alone, and is recorded
+here rather than discarded.** Herd job **`j0000000175`** on sha
+`2d45b6b52d1f30f93fa4280e69ac54dd52d4edc2`:
+
+```
+gate: RED sha=2d45b6b52d1f30f93fa4280e69ac54dd52d4edc2 failed=4:cargo-fmt skips=under-load(flood-fifty=8.15>8,flood-two-fifty=8.15>8)
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+Two diffs, both in the new block, both layout and neither logic:
+rustfmt wanted the third tuple of the exit-code array exploded, and
+wanted `assert_eq!`'s `*limit, SHMEM_CEILING,` packed onto one line
+(the opposite of what was guessed — rustfmt packs an `assert_eq!`'s
+non-string arguments). Applied exactly as rustfmt printed them. **No
+test, expectation or assertion was changed to make a gate green.**
+
+What that red run already proves, because the gate runs every step
+whatever fails: **steps 5, 6 and 7 passed on this code.** Clippy was
+clean under `-D warnings`, the suite was green, and step 7 said *"the
+skip list matches the expectation exactly"* — so the new test ran,
+skipped on this host, and its thirteenth name matched
+`scripts/expected-skips/local.txt` as added.
+
+The **last run**, on the tree as finally committed, is
+`./scripts/gate.sh` bare and whole, submitted through Herd the same way
+(`--label build`, `--memory-mib 4700`, `ws://127.0.0.1:8791`, an
+absolute `cd` into this worktree and `CARGO_TARGET_DIR=/mnt/ssd_980/
+herd/build/shmem-charge`). Its verbatim verdict, its job id and its
+receipt path are in the agent's report, not in this file: a second
+commit to carry them would need a third gate run.
 
 **Skips:** this host has no delegated cgroup v2, so the new assertion
 **joins the standing family and is printed as skipped, never as passed**
@@ -98,6 +121,11 @@ HERD-SKIPPED: a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling
 Its reason is premise 2 — the `RLIMIT_AS` fallback — and the skip says
 what would settle it: a delegated scope, by the recipe in
 `docs/runner-confinement.md`.
+
+The at-rest list is thirteen; the run itself observed **fifteen**, the
+two extra being `flood-fifty` and `flood-two-fifty`, each excused by
+name out of `scripts/expected-skips/local-under-load.txt` because the
+bench's own line read `8.15>8`. Neither is this task's.
 
 ## Risks and findings
 
@@ -161,6 +189,15 @@ what would settle it: a delegated scope, by the recipe in
 9. **A gate run in such a scope needs `-p MemoryMax=`**, as
    `docs/orchestration/gotchas/a-delegated-scope-blinds-the-preflight.md`
    requires; both probe and recipe carry it.
+
+10. **`./scripts/bench-preflight.sh` exits 0 even when it prints
+    `REFUSED, do not start the heavy phase.`** Measured three times on
+    2026-10-31: refused on load 14.27, 10.22 and 11.97, exit code `0`
+    each time. The brief calls it "a gate, not advice", and it is one by
+    its words only — an agent or a script that tested `$?` would sail
+    straight through a refusal. This task read the verdict line instead
+    and waited until it said `ok, safe to start.` **Nothing was set or
+    exported**, `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` least of all.
 
 ## Drafted for `herd-merger`
 

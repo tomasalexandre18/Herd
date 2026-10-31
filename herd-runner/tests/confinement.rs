@@ -1478,7 +1478,10 @@ async fn a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling() {
              signal while the shell outlived it, which happens only where \
              memory.oom.group did not take",
         ),
-        (92, "this host's job environment has no dd, so nothing was written"),
+        (
+            92,
+            "this host's job environment has no dd, so nothing was written",
+        ),
     ] {
         if subject.outcome == (JobOutcome::Exited { code }) {
             skipped(
@@ -1502,8 +1505,7 @@ async fn a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling() {
             ..
         } => {
             assert_eq!(
-                *limit,
-                SHMEM_CEILING,
+                *limit, SHMEM_CEILING,
                 "the job was stopped by a memory ceiling that is not the one it was given"
             );
             assert!(
