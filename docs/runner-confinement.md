@@ -486,18 +486,20 @@ M4.
 real kernel, the real binaries and a real hub — and then prints every
 assertion this host could not make.
 
-**Twelve** assertions need cgroup v2 delegation on this workstation, which
-a GitHub Actions runner and a plain login session do not have. This
+**Thirteen** assertions need cgroup v2 delegation on this workstation,
+which a GitHub Actions runner and a plain login session do not have. This
 sentence said **two** — the *named* memory outcome and the cgroup branch
 of the startup report — until 2026-10-30: it counted the first two
 written and nothing obliged it to follow the ten added after it
-(ORCH-241's class). The twelve are named in
+(ORCH-241's class). It said **twelve** until 2026-10-31, when
+`a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling` was
+added and became the thirteenth. The thirteen are named in
 `scripts/expected-skips/local.txt`, which is the list and the only thing
 worth quoting, because a count means nothing across hosts (ORCH-070).
-Two of the twelve need a **block device** under the job's directory as
+Two of the thirteen need a **block device** under the job's directory as
 well as delegation, so a delegated host whose data root is ZFS still
-cannot make them; `/mnt/ssd_980` here is one, which is why twelve is
-reachable on this machine at all. On a host that cannot make them they
+cannot make them; `/mnt/ssd_980` here is one, which is why all thirteen
+are reachable on this machine at all. On a host that cannot make them they
 are **skipped with their reason** rather than failed or quietly passed. A
 skip prints a `HERD-SKIPPED:` line and appends it to `$HERD_SKIP_LOG`,
 because `cargo test` hides the stdout of a passing test — so
@@ -508,10 +510,12 @@ and into its summary. A green check is not the same claim on every host,
 and that difference is meant to be visible from the terminal and on the
 pull request.
 
-### Making those twelve: the invocation is the finding
+### Making those: the invocation is the finding
 
 Measured on 2026-10-30, one session, one host, the same binaries, in each
-case counting how many of the twelve assertions were *made*:
+case counting how many of the assertions were *made*. The list held
+**twelve** names that day, so every denominator below is twelve and is
+that run's, not this list's length today:
 
 | invocation | made |
 |---|---|
@@ -530,16 +534,18 @@ enabled for its children. Both print twelve skips, so a measurement that
 records only the count cannot tell the two apart — and the second one
 looks exactly like delegation not working.
 
-**Two of the twelve are unit tests** and live in the `herd_runner` lib
+**Two of the thirteen are unit tests** and live in the `herd_runner` lib
 test binary, not in `confinement`:
 
 - `a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device`
 - `a_declared_ceiling_changes_what_the_inert_weight_line_says`
 
-`--list` gives ten names in `confinement` and these two in
-`herd_runner`, with no overlap, so an in-scope run of `confinement`
-alone caps at ten whatever else is right. The recipe below was
-`confinement` only until 2026-10-30 and could never have reached twelve.
+`--list` gave ten names in `confinement` and these two in `herd_runner`
+on 2026-10-30, with no overlap, so an in-scope run of `confinement`
+alone caps at the `confinement` names whatever else is right — eleven
+of them since 2026-10-31, the thirteenth being a `confinement` name.
+The recipe below was `confinement` only until 2026-10-30 and could never
+have reached twelve.
 
 ```sh
 nix develop --command cargo test --workspace --no-run
@@ -565,15 +571,16 @@ shell in a script and pass that script's path — remembering that the
 script's own shell process is then the thing that causes the `EBUSY`
 above.
 
-### What twelve in-scope assertions are worth, exactly
+### What the in-scope assertions are worth, exactly
 
-The net gain is **+11, not +12**. One assertion stops being checkable
-rather than starting to pass: `a_fallback_is_shouted_not_mentioned`
-cannot be made on a host that no longer falls back, and it skips with
-its own reason — `herd-runner/src/confine.rs:1061` already writes that
-skip, so this is the design working, not a defect. So an in-scope
-expectation list is **not `local.txt` minus twelve**: it loses twelve
-names and gains that one. And
+Measured against the twelve of 2026-10-30, the net gain is **+11, not
++12**. One assertion stops being checkable rather than starting to pass:
+`a_fallback_is_shouted_not_mentioned` cannot be made on a host that no
+longer falls back, and it skips with its own reason —
+`herd-runner/src/confine.rs:1061` already writes that skip, so this is
+the design working, not a defect. So an in-scope expectation list is
+**not `local.txt` minus its delegation names**: it loses them and gains
+that one. And
 `pressure_refuses_nothing_and_delays_nothing`
 (`herd-runner/tests/confinement.rs:3082`) appeared in **one of three**
 in-scope runs — condition-dependent, and unrelated to delegation. Both

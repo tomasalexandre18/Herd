@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use herd_hub::{Hub, JobDirStore, JobStore};
 use herd_proto::{Cap, JobOutcome, LogStream};
+use herd_runner::metrics::DEFAULT_TMPFS_PATH;
 use herd_runner::testing::TempDir;
 use herd_runner::{Confined, Confinement};
 use tokio::task::JoinHandle;
@@ -1246,6 +1247,301 @@ async fn the_runner_says_which_memory_ceiling_it_enforces() {
             );
         }
     }
+}
+
+// ------------------------------------------- E-31 against E-29 (D-NEXT) ----
+
+/// How much tmpfs the subject job writes, and the ceiling it writes under.
+/// Three times the ceiling, so a job that survives has survived by a margin
+/// no accounting slack can explain.
+const SHMEM_CEILING: u64 = 64 << 20;
+const SHMEM_WRITTEN_MIB: u64 = 192;
+
+/// What a delegated scope would settle, said in every skip of the test below.
+const WHAT_WOULD_SETTLE_THE_CHARGE: &str = "a delegated scope — `systemd-run \
+     --user --scope -p Delegate=yes -p MemoryMax=12G <the test binary> \
+     --test-threads 1`, the recipe in docs/runner-confinement.md — would settle \
+     whether a tmpfs byte a job writes is charged to that job's own memory.max";
+
+/// A directory on the host's tmpfs, removed whatever happens.
+///
+/// **Not a [`TempDir`]**, which is rooted at `std::env::temp_dir()`: under the
+/// gate that is the nix-shell's directory on ordinary disk, and a file there is
+/// page cache, which is reclaimable and so measures nothing about this
+/// question. This one is rooted at [`DEFAULT_TMPFS_PATH`], the very tmpfs
+/// E-31's admission figure is measured from.
+///
+/// It is made and removed by the **test**, never by the job: the point of the
+/// test is that the job may be killed mid-write, and a job killed mid-write
+/// runs no cleanup of its own. Without this `Drop` a charged verdict would
+/// leave tens of mebibytes on the host's shared tmpfs after every run.
+struct OnTheHostsTmpfs {
+    dir: PathBuf,
+}
+
+impl OnTheHostsTmpfs {
+    /// `Err` with the reason when this host lends no tmpfs a job could write
+    /// in — a premise that did not hold, never a verdict.
+    fn new(label: &str) -> Result<Self, String> {
+        // The capacity, which is what E-31 announces. A tmpfs too small for
+        // the quantity cannot answer the question either way: a write that
+        // stopped at ENOSPC is not a write that stopped at a ceiling.
+        let room = herd_runner::metrics::tmpfs_room_mib(DEFAULT_TMPFS_PATH)?;
+        if room < SHMEM_WRITTEN_MIB * 2 {
+            return Err(format!(
+                "{DEFAULT_TMPFS_PATH} has {room} MiB of capacity and this test writes \
+                 {SHMEM_WRITTEN_MIB} MiB into it, so on a tmpfs this small an ENOSPC \
+                 and a memory ceiling could not be told apart"
+            ));
+        }
+        let name = format!("herd-test-{label}-{}", std::process::id());
+        let dir = Path::new(DEFAULT_TMPFS_PATH).join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::create_dir(&dir) {
+            return Err(format!(
+                "{DEFAULT_TMPFS_PATH} has room but is not writable here: {error}"
+            ));
+        }
+        Ok(Self { dir })
+    }
+
+    fn file(&self) -> PathBuf {
+        self.dir.join("written-by-the-job")
+    }
+}
+
+impl Drop for OnTheHostsTmpfs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// **The question a per-job ceiling turns on: is a tmpfs byte a job writes
+/// charged to that job's own `memory.max`?**
+///
+/// Herd admits `tmpfs_mib` (E-31) separately from `memory_mib` (E-29), as two
+/// independent quantities. They are **not** independent. Shmem pages are
+/// charged to the cgroup of the task that touches them, and a job's cgroup is
+/// created with `memory.swap.max = 0` (`herd-runner/src/cgroup.rs`), so the
+/// charge can be neither swapped out nor dropped. A job that reserves tmpfs
+/// and uses it is therefore killed at its `memory_mib` however much tmpfs it
+/// declared — so a per-job ceiling set to `memory_mib + margin` would
+/// OOM-kill, on its first day, every job that reserves tmpfs and fills it. The
+/// first consumer has already paid this once, and their kernel's own memcg
+/// OOM report for job j0000000069 is the real-world positive this fixture
+/// reproduces: on the job cgroup `herd-job-1785059-6…`, `usage 8388608kB,
+/// limit 8388608kB … shmem 4219834368` — 4.031 GiB anonymous plus 3.930 GiB
+/// shmem is 7.961 GiB against an 8.000 GiB ceiling, which closes. The killed
+/// `qemu`'s own `shmem-rss` read **0** while its cgroup carried nearly 4 GiB
+/// of shmem: the charge is accounted at the **cgroup**, not at the process,
+/// which is why a per-process reading cannot see it (their report, their
+/// figures, their machine — invariant 9).
+///
+/// **Two things that report does not settle, and this test does.** Their
+/// tmpfs is theirs, `/mnt/ssd_980/chatons/ram`, a mount **outside** Herd's
+/// `--host-tmpfs` path, so it proves the kernel's charging rule and not
+/// Herd's own bookkeeping; this fixture writes into [`DEFAULT_TMPFS_PATH`],
+/// which is the mount E-31 measures. And a formula is not the whole cure:
+/// that job declared 1792 MiB of memory and reserved 2.5 GiB of tmpfs, and
+/// used 2.30× and 1.57× of those, so a ceiling correctly computed as
+/// `memory_mib + tmpfs_mib + margin` would still have killed it. Counting
+/// tmpfs in the ceiling is **necessary and not sufficient**; the declarations
+/// were also wrong, which is the consumer's half.
+///
+/// ## Three outcomes, each visible, none silent
+///
+/// - **charged** — the subject job is `stopped_by_cap{memory}`. That is the
+///   measured answer and what this test asserts.
+/// - **not charged** — the subject writes all of it and prints `survived`.
+///   A **failure** here, and a loud one: it would mean the kernel's accounting
+///   had changed under Herd, and that every ceiling arithmetic resting on the
+///   paragraph above has to be redone.
+/// - **the premise did not hold** — a skip with its reason, never a pass.
+///   Four separate ways, checked in order, because each would otherwise
+///   produce a job that survives for a reason unrelated to the question.
+///
+/// ## How each way the premise can fail is closed
+///
+/// 1. **No tmpfs.** Herd names a job no tmpfs at all: `job_environment`
+///    (`herd-runner/src/confine.rs`) points `TMPDIR`, `TMP`, `TEMP` and
+///    `XDG_RUNTIME_DIR` at the job's workspace on the data root, which is
+///    ordinary disk. A test writing to `$TMPDIR` would measure page cache and
+///    nothing else. What a job *can* reach is [`DEFAULT_TMPFS_PATH`] by
+///    absolute path, because M4 gives a job no mount namespace and says so
+///    (`herd-runner/src/root.rs`: "What M4 does **not** do is stop a job that
+///    names an absolute path outside the root"). That is also exactly the
+///    tmpfs E-31 measures its own figure from, so this measures the quantity
+///    the admission arithmetic actually uses.
+/// 2. **No kernel ceiling.** Without a delegated cgroup v2 the ceiling is
+///    `RLIMIT_AS` on the first process (`herd-runner/src/job.rs`), which is
+///    per-process, bounds no tree, and which `dd` writing to a file never
+///    trips because the bytes never enter its address space. On such a host
+///    the subject survives for the wrong reason, so
+///    [`kernel_ceiling_or_reason`] is asked **before** any verdict is read.
+/// 3. **A ceiling that does not bite.** Delegation can be present and the
+///    ceiling still fail to kill at this scale. So the same ceiling is first
+///    shown to kill the same quantity of **anonymous** memory: a known-bad
+///    fixture, in the test, on every run. Only a control that died licenses
+///    reading the subject at all — otherwise a surviving subject means
+///    nothing, the detector having been dead rather than the charge absent.
+/// 4. **A job that never wrote.** Exit 90, 91 or 92 says the job could not
+///    create its file, that its write failed of itself, or that the host has
+///    no `dd`. Each is a skip, never a survival.
+///
+/// A fifth hazard is closed by construction rather than by a check: the
+/// runner's workspace walk calls `set_permissions(mode | 0o700)` every 200 ms
+/// on a directory it cannot list, and its trigger is duration, not
+/// concurrency. It cannot reach this fixture, because every walk in
+/// `herd-runner/src/root.rs` starts at the workspace and `restore_ancestors`
+/// returns early unless the path is under the root it was given. The fixture
+/// is on `/dev/shm`, outside the data root entirely.
+#[tokio::test]
+async fn a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling() {
+    const TEST: &str = "a_tmpfs_byte_a_job_writes_is_charged_to_its_own_memory_ceiling";
+
+    // Premise 1: a tmpfs this host lends, that a job could write in.
+    let fixture = match OnTheHostsTmpfs::new("shmem-charge") {
+        Ok(fixture) => fixture,
+        Err(why) => {
+            skipped(TEST, &format!("{why} — {WHAT_WOULD_SETTLE_THE_CHARGE}"));
+            return;
+        }
+    };
+
+    // Premise 2: the ceiling is the kernel's, not RLIMIT_AS on one process.
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            TEST,
+            &format!(
+                "{why} — so `memory.max` bounds no tree here, and a job writing \
+                 {SHMEM_WRITTEN_MIB} MiB of tmpfs would survive the RLIMIT_AS fallback \
+                 whether or not its shmem was charged: the premise of this measurement \
+                 did not hold and nothing about the charge was checked. \
+                 {WHAT_WOULD_SETTLE_THE_CHARGE}"
+            ),
+        );
+        return;
+    }
+
+    let harness = Harness::new("shmem-charge", |confinement| {
+        confinement.memory_max = SHMEM_CEILING;
+        confinement.timeout = Duration::from_secs(30);
+    })
+    .await;
+
+    // Premise 3, the known-bad fixture: the same ceiling and the same
+    // quantity, as *anonymous* memory. `dd` with one big block allocates the
+    // whole buffer and faults every page of it, so this is the same number of
+    // bytes the subject writes, charged the one way nobody disputes.
+    let control_script = format!(
+        "command -v dd >/dev/null 2>&1 || exit 92; \
+         dd if=/dev/zero of=/dev/null bs={SHMEM_WRITTEN_MIB}M count=1 2>/dev/null \
+         || exit 91; \
+         echo survived"
+    );
+    let control = harness.run(&control_script).await;
+    if control.outcome == (JobOutcome::Exited { code: 0 }) || control.out.contains("survived") {
+        skipped(
+            TEST,
+            &format!(
+                "the control arm survived: {SHMEM_WRITTEN_MIB} MiB of ANONYMOUS memory under \
+                 a {} MiB ceiling ended {:?}, so this host's ceiling does not kill at this \
+                 scale and a surviving tmpfs arm would prove nothing about the charge — the \
+                 detector was not shown to fire, so its silence is not a result. \
+                 {WHAT_WOULD_SETTLE_THE_CHARGE}",
+                SHMEM_CEILING >> 20,
+                control.outcome
+            ),
+        );
+        return;
+    }
+
+    // The subject: the same ceiling and the same quantity, written into the
+    // host's tmpfs instead of into anonymous memory.
+    let target = fixture.file();
+    let subject_script = format!(
+        "command -v dd >/dev/null 2>&1 || exit 92; \
+         : > \"{target}\" 2>/dev/null || exit 90; \
+         dd if=/dev/zero of=\"{target}\" bs=1M count={SHMEM_WRITTEN_MIB} 2>/dev/null \
+         || exit 91; \
+         echo survived",
+        target = target.display()
+    );
+    let subject = harness.run(&subject_script).await;
+
+    // Premise 4: a job that never wrote a byte says so by its exit code.
+    for (code, why) in [
+        (90, "the job could not create its file on the tmpfs"),
+        (
+            91,
+            "the job's write failed of itself: out of room, or `dd` killed by a \
+             signal while the shell outlived it, which happens only where \
+             memory.oom.group did not take",
+        ),
+        (92, "this host's job environment has no dd, so nothing was written"),
+    ] {
+        if subject.outcome == (JobOutcome::Exited { code }) {
+            skipped(
+                TEST,
+                &format!(
+                    "{why} (exit {code}), so none of the {SHMEM_WRITTEN_MIB} MiB existed to \
+                     be charged and this measurement was void: {}",
+                    subject.err
+                ),
+            );
+            return;
+        }
+    }
+
+    // The verdict, three-way and explicit.
+    match &subject.outcome {
+        // Charged: the measured answer, and the one this test asserts.
+        JobOutcome::StoppedByCap {
+            cap: Cap::Memory,
+            limit,
+            ..
+        } => {
+            assert_eq!(
+                *limit,
+                SHMEM_CEILING,
+                "the job was stopped by a memory ceiling that is not the one it was given"
+            );
+            assert!(
+                !subject.out.contains("survived"),
+                "a job stopped by its memory cap cannot also have printed `survived`: {:?}",
+                subject.out
+            );
+        }
+        // Not charged: the two admitted quantities would really be
+        // independent, and every sentence above is wrong.
+        JobOutcome::Exited { code: 0 } => panic!(
+            "NOT CHARGED: a job under a {} MiB ceiling wrote {SHMEM_WRITTEN_MIB} MiB into \
+             {DEFAULT_TMPFS_PATH} and lived, while the same quantity of anonymous memory \
+             under the same ceiling ended {:?}. Shmem is no longer charged to the job that \
+             touches it, so E-29 and E-31 ARE independent and every ceiling arithmetic \
+             that assumed otherwise has to be redone. The job said {:?}",
+            SHMEM_CEILING >> 20,
+            control.outcome,
+            subject.out
+        ),
+        // Dead, but not by the memory cap: a disk-budget kill, a timeout or a
+        // bare signal answers a different question, and is never read as
+        // charged.
+        other => panic!(
+            "AMBIGUOUS: the job that wrote {SHMEM_WRITTEN_MIB} MiB of tmpfs under a {} MiB \
+             memory ceiling ended {other:?}, which is neither `stopped_by_cap{{memory}}` nor \
+             a clean exit, so it says nothing about whether that shmem was charged to it. \
+             The job said out {:?} / err {:?}",
+            SHMEM_CEILING >> 20,
+            subject.out,
+            subject.err
+        ),
+    }
+
+    // And the runner is unharmed by either arm: it takes the next job.
+    let after = harness.run("echo the runner lived").await;
+    assert_eq!(after.outcome, JobOutcome::Exited { code: 0 });
+    assert_eq!(after.out.trim(), "the runner lived");
 }
 
 // ------------------------------------------- CPU, IO and pid bounds ----
