@@ -82,8 +82,10 @@ Land batch <n>: <subject, imperative English, ≤ 72 chars>
   parent, `git diff --quiet <sha> HEAD` clean; receipt <path>
 - **Skips:** <n>, each named under *Evidence* and printed as a skip
   (D27); "no skip" if none
-- **CI run:** <id> — recorded, not waited on. Batch <n-1>'s own run,
-  `ci.yml` <id>, <verdict> — read back by id, and see *CI run* below
+- **CI run:** <id> — recorded, not waited on; see *CI run* below
+- **Previous run:** batch <n-1> · `ci.yml` <id> · <verdict> — read back
+  by id. One bullet, this exact label, no placeholder left in it: a gate
+  reads this line and nothing else for that figure
 
 ## What changed and why
 
@@ -146,31 +148,64 @@ paying. Say which was done: recorded, or waited on by choice because the
 landing was judged risky. Its verdict is read at the next session start,
 and a failure becomes an `ORCH-nnn` row before new work is briefed.
 
-Then, in a paragraph of its own, **the previous landing's run**: that
-landing's batch, its `ci.yml` run id, and a verdict for that run, all
-three in the same paragraph. A landing cannot record its own run — the
-push that starts it comes after the tree is frozen — so the next landing
-is the only place that run can be written down, and this is that place.
-Take the id from the previous merger's report, or find it with
+Then, in its own bullet, **the previous landing's run**, in this one
+labelled field and nowhere else:
+
+- **Previous run:** batch 33 · `ci.yml` 41228366473 · success
+
+A landing cannot record its own run — the push that starts it comes
+after the tree is frozen — so the next landing is the only place that
+run can be written down, and this field is that place. Take the id from
+the previous merger's report, or find it with
 `gh run list --workflow ci.yml --branch main --limit 10` matched to that
 landing's merge sha; then read the conclusion back **by id** with
 `gh run view <id>`, never off a list line. Use GitHub's own conclusion
 word (`success`, `failure`, `cancelled`, `timed_out`, `skipped`,
 `neutral`, `stale`, `action_required`), and write the literal
-`no ci.yml run` when that push started none — a statement, not an
-omission. Unlike this landing's own run, this one is **not** deferred:
-it goes in the committed copy too.
+`no ci.yml run` in the field when that push started none — a statement,
+not an omission. Unlike this landing's own run, this one is **not**
+deferred: it goes in the committed copy too.
+
+What the field is, exactly, because a gate reads it:
+
+- one top-level bullet, opening `- **Previous run:**` — that label, that
+  capitalisation;
+- carrying the **previous** landing's batch number, a `ci.yml` run id of
+  at least `run_digits` digits (8; real ids are 11), and one conclusion
+  word for that run — or the literal `no ci.yml run`;
+- with no `<placeholder>` left anywhere in it;
+- exactly one such bullet in the record. Two are refused rather than
+  resolved: a record with two answers has not got one.
+
+The separator is cosmetic — `·`, a comma, a dash, words. The field may
+wrap over as many lines as it needs, and may carry a nested sub-bullet
+under it for the figure; what ends it is a line that is not indented, or
+a blank line. A fenced block is **not** the field: paste the `gh run
+view` output into your handoff as evidence if you like, but the claim is
+this bullet. A markdown table is not the field either.
 
 `check-orchestration.sh` reads it, under *a landing records its
 predecessor's post-push run* (ORCH-333), from the newest
-`<date>-merge-<batch>.md` in `docs/orchestration/history/`. It is scoped
-to **one paragraph**, which ends at a blank line, at the next bullet or
-at the next heading: the batch, the id and the verdict must stand
-together, and a claim in one bullet is not answered by a figure in
-another. Wrapping over two or three lines is fine, and is what batches
-29 to 31 did — nothing has to be crammed onto one line. The paragraph
-may be the **CI run:** bullet at the top of this record instead, as long
-as all three are inside it.
+`<date>-merge-<batch>.md` in `docs/orchestration/history/`, and it runs
+at step 2 of `gate.sh` — before any cargo step, so a missing field costs
+about a minute and not a compile. It is required of landings dated
+**2026-11-01 or later** (`lr_from`); records written before the field
+existed are printed as a skip with that reason and never refused. If the
+previous landing is not named `-merge-batch-<n>.md` — a hotfix, a
+re-gate under another word — there is no batch number to ask for, and
+that too is a printed skip, not a failure.
+
+Why a labelled field and not a sentence in the prose. The first shape of
+this check asked whether some paragraph of the record mentioned the
+predecessor's batch near eight digits and a verdict word, and
+`herd-reviewer` measured three ways to pass it without recording
+anything: a table whose predecessor row said *not read yet* (a table has
+no blank line, so it is one paragraph), the word *successful* beside a
+byte count, and a record merely quoting one of this check's own case
+names. A control that goes green on the defect it was built for ends the
+vigilance that was holding the rule, which is how batch 32 happened.
+The field cannot be satisfied by accident; that, and not truth, is what
+it buys (ORCH-335, 2026-10-31).
 
 What that check cannot do: it has no network, so it never establishes
 that the run exists, that its head sha is the one named, or that the

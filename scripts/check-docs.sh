@@ -211,6 +211,16 @@ done
 # the floor. Moving it is one line, and the rule is a no-op until a
 # landing is dated on or after it.
 landing_from=2026-10-29
+# One width for a `ci.yml` run id, and this is its only definition: the
+# predecessor-run section of check-orchestration.sh reads this very line
+# out of this file rather than keeping a second copy. It had one, and the
+# two gates asserted 6 digits here and 8 there for the same figure
+# (ORCH-335). Real ids are 11 digits (41228366473), so 8 is a floor that
+# refuses a 6-digit typo. No live record relies on the digits at all:
+# measured 2026-10-31, all 34 landings on or after $landing_from satisfy
+# the **CI run:** line through `none`, none of them through a number, so
+# raising 6 to 8 refuses nothing that is written down today.
+run_digits=8
 landings=""
 for f in docs/orchestration/history/*-merge-*.md; do
   [ -f "$f" ] || continue
@@ -219,11 +229,15 @@ for f in docs/orchestration/history/*-merge-*.md; do
   landings="$landings $f"
 done
 if [ -n "$landings" ]; then
-  bad_landings=$(LC_ALL=C awk '
+  bad_landings=$(LC_ALL=C awk -v d="$run_digits" '
     BEGIN {
       nh = split("What changed and why|Branches in this batch|Evidence|Left out|Decisions allocated|Board rows|CI run", head, "|")
       hex = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
-      run = "[0-9][0-9][0-9][0-9][0-9][0-9]"
+      # Built rather than written out, so that run_digits above is the
+      # one place the width lives. No interval braces: this awk is run
+      # with LC_ALL=C and the file keeps to the literal form throughout.
+      n = d + 0
+      for (i = 0; i < n; i++) run = run "[0-9]"
     }
     function want(c, s) { if (!c) miss = miss (miss ? ", " : "") s }
     function flush() {

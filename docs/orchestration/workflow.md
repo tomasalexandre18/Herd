@@ -65,8 +65,15 @@ What is technically enforced and what is only written is in
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.
 6. **Review when it is a rule.** A change to `CLAUDE.md`, agents,
-   permissions, hooks, `check-docs.sh` or an invariant gets a
-   `herd-reviewer` pass before integration; a micro-edit does not.
+   permissions, hooks, **any gate script** (`scripts/*.sh`,
+   `scripts/githooks/*`) or an invariant gets a `herd-reviewer` pass
+   before integration; a micro-edit does not. The list named
+   `check-docs.sh` alone until 2026-10-31, and a reviewer reading it
+   literally was right that a change to `check-orchestration.sh` — a
+   gate that decides whether a landing may happen — required no review:
+   the omission was in this list, not in anyone's compliance. The
+   review that found it is the one that covers this line
+   (`herd-reviewer`, 2026-10-31, ORCH-335).
 7. **Integrate and land.** `herd-merger` takes a **batch** of finished
    branches — everything ready when it starts — and merges them **one at
    a time** onto one integration branch off `origin/main`: conflicts
@@ -381,15 +388,29 @@ thing a second machine would ever have said about its own landing.
   for that run. The board edit stays as practice; what the record adds
   is reachability, since the newest landing record is one file a check
   can find by name, while a run id somewhere in `board.md` carries
-  nothing that ties it to a landing. The scope is **one paragraph** — it
-  ends at a blank line, at the next bullet or at the next heading — so
-  the batch, the id and the verdict stand together instead of one per
-  bullet. Wrapping across two or three lines is how batches 29, 30 and
-  31 wrote it and is accepted: nothing has to be crammed onto one line.
-  A predecessor whose push started no run at all gets the literal
-  `no ci.yml run` in that paragraph, which is a statement and not an
-  omission. The fields, and where to read the conclusion back from, are
-  in `docs/orchestration/templates/landing.md`, *CI run*.
+  nothing that ties it to a landing. The claim goes in **one labelled
+  field**, `- **Previous run:** batch <n-1> · ci.yml <id> · <verdict>`,
+  and in nothing else: not a paragraph of prose, not a table row, not a
+  fenced block. A predecessor whose push started no run at all gets the
+  literal `no ci.yml run` in that field, which is a statement and not an
+  omission. The field, its exact shape and where to read the conclusion
+  back from are in `docs/orchestration/templates/landing.md`, *CI run*.
+  It is required of landings dated 2026-11-01 or later; a record written
+  before the field existed, or a predecessor not named for a batch, is a
+  printed skip with its reason and not a failure (D27's shape).
+- **The first shape of that check was retired after one landing, and
+  the reason generalises.** It asked whether some paragraph of the
+  record mentioned the predecessor's batch near eight digits and a
+  verdict word. `herd-reviewer` measured three ways to pass it with
+  nothing recorded: a table whose predecessor row said *not read yet*
+  (a table has no blank line, so the whole table is one paragraph), the
+  word *successful* beside a byte count, and a record merely quoting one
+  of the check's own case names. A control that can go green on the
+  defect it was built for does not merely fail to help: it ends the
+  vigilance that was holding the rule, which is how batch 32 happened.
+  So **a claim a machine checks is a labelled field, never prose**
+  (ORCH-335, 2026-10-31) — the construction `check-docs.sh` already uses
+  for **Batch:**, **Gate:**, **Skips:** and **CI run:**.
 - **What that case does not do, said before anybody overrates it.** It
   has no network and no toolchain: it cannot ask GitHub whether a run
   exists, whether its head sha is the one named, or whether it passed,
@@ -398,11 +419,12 @@ thing a second machine would ever have said about its own landing.
   false verdict — *No docs gate can check the record itself* above says
   that comparison is a human's, and that stays exactly as true of the
   verdict. What it refuses is the shape batch 32's record had: a claim
-  about the predecessor with no figure anywhere near it. That record
-  said batch 31's run was recorded in `board.md`, and `board.md` at
-  `9f76b54` holds no `41206929574` anywhere. Batch 33's record carries
-  batch 31's and batch 32's ids with a conclusion read back for each,
-  and passes.
+  about the predecessor with no figure in the field that must carry it.
+  That record said batch 31's run was recorded in `board.md`, and
+  `board.md` at `9f76b54` holds no `41206929574` anywhere. What the
+  field buys over the paragraph is not truth either: it is that the
+  claim cannot be assembled out of two unrelated sentences and cannot
+  be made by accident by a record that is merely discussing runs.
 - **Getting here from where we are** is four dated steps, in order, and
   nobody improvises them: *Not an option*, below. Any pull request still
   open when the last of them is done is closed naming the landing that
