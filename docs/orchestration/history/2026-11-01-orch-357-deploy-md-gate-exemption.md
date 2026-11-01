@@ -1,7 +1,7 @@
 # orch-357-deploy-md-gate-exemption — handoff 2026-11-01
 
-- **Item:** ORCH-357, plus three `ORCH-NEXT` rows this task files in
-  *Owed* for what the work and the reviewer's block turned up
+- **Item:** ORCH-357, plus three `ORCH-NEXT` rows in *Owed* and two
+  sentences added to rows that already existed (ORCH-310, ORCH-129)
 - **Agent:** herd-step
 - **Branch / commit:** `orch-357-deploy-md-gate-exemption` / see the
   agent's report for the sha, based on origin/main
@@ -28,32 +28,13 @@ and says the Rust gates were **not run** locally, covered by the landing's
 Five lines at 74, 78, 79, 74 and 75 columns; `CLAUDE.md` stays at 150
 against the 150-line cap of `check-docs.sh:34`-`:37`.
 
-**It is prose where its five neighbours are a file, a file, two
-directories and a glob, and that is the decision of this branch rather
-than an accident of fitting.** The first spelling committed here was
-`deploy/**.md`, which **does not match `deploy/release-notes/1.1.0.md` —
-the file whose release produced ORCH-357.** `herd-reviewer` blocked on
-it and was right; the measurement is *Risks and findings* 1.
-
-**Why prose and not the corrected glob.** Both wordings fit in five
-lines and both were measured (*Risks and findings* 2). The corrected
-glob `` `deploy/**/*.md` (markdown only) `` was available at 74, 77, 79,
-74, 75. It was not chosen, for one reason: **a glob in this document has
-no engine.** Nothing mechanical reads this list — that is established in
-4 — so a glob here is evaluated only by a reader's belief about a glob
-dialect, which is exactly how `deploy/**.md` crossed the v1.1.0 handoff,
-the board row's recommendation, Alexa's validation and one commit of
-this branch without anyone expanding it. `deploy/**/*.md` would replace
-it with a second construct whose **zero-directory case** a reader must
-know, and that case is live and populated here: `deploy/README.md` and
-`deploy/release-notice.md` are 2 of the 7 markdown files under
-`deploy/`. It does match them, verified in both engines — but the next
-reader must take that on faith or test it, and the failure mode is the
-mirror of the one being fixed, a reader concluding `deploy/README.md`
-owes four gates. *"Only the markdown under `deploy/`"* has no expansion
-to get wrong at any depth. The list is already mixed notation —
-`docs/` and `.claude/` are bare directory prefixes, not globs — so a
-worded entry is not out of place in it.
+**It is prose where its neighbours are two files, two directories and a
+glob, and that is a decision of this branch rather than an accident of
+fitting.** The first spelling committed here was `deploy/**.md`, which
+**does not match `deploy/release-notes/1.1.0.md` — the file whose
+release produced ORCH-357.** `herd-reviewer` blocked on it and was
+right; the measurement is *Risks and findings* 1, and the reasoning for
+prose over the corrected glob is 2.
 
 **What the boundary is, and why it is not a coverage loss.** `deploy/`
 holds **16 files: 7 markdown and 9 that are not** —
@@ -71,13 +52,24 @@ dressed as the correction of a letter.
 **What the exemption governs, stated narrowly.** Only whether an agent
 pays the compile **locally, before its own commit**. `scripts/gate.sh`
 runs steps 0 to 8 over the whole tree at the landing on the gated sha,
-`pre-push` refuses a push without that receipt, and `.github/workflows/`
-`ci.yml` has no `paths` filter. **Nothing reaches `main` ungated by this
-exemption**, and an earlier draft of this handoff implied otherwise.
+`pre-push` refuses a push without that receipt, and
+`.github/workflows/ci.yml` has no `paths` filter. **Nothing reaches
+`main` ungated by this exemption**, and an earlier draft of this handoff
+implied otherwise.
+
+**The ceiling was not raised, and that was not this agent's call to
+make.** `check-docs.sh`'s `limit=150` stands. **D251** (ORCH-249,
+2026-10-30) already forbids raising it, with a sharper warrant than the
+one an earlier draft of this handoff offered on its own authority: *a
+limit that exists to force this very discipline would be spent to buy
+the lesson, and invariants have been silently compressed to fit it once
+already* (ORCH-002, 2026-10-24). This branch is also a live instance of
+**ORCH-129**, the row that says a change to `CLAUDE.md` is a constrained
+edit and must be briefed as one; see *Risks and findings* 5.
 
 **The board.** ORCH-357 left *Open* for the tail of *Owed*, state
-`done`, owner `herd-step`. Three `ORCH-NEXT` rows sit under it, listed
-in *Drafted for `herd-merger`*.
+`done`. Three `ORCH-NEXT` rows sit under it and two existing rows gain a
+sentence each; all five are listed in *Drafted for `herd-merger`*.
 
 ## Not done, and why
 
@@ -87,13 +79,14 @@ in *Drafted for `herd-merger`*.
    widening this one"*, and the gotchas were not among the paths it
    allowed. It is reported and **rowed**, with the final spelling in the
    row so the next agent cannot land a third one.
-2. **`scripts/check-docs.sh` is not touched**, deliberately and on the
-   orchestrator's instruction. Two things that were floated and refused:
-   narrowing `CLAUDE.md`'s letter to the script's two `deploy/` globs
-   does not fit in five lines, and it would couple the method's letter
-   to one script's internal corpus, so a later widening of the script
-   would silently change what `CLAUDE.md` says. The corpus question is
-   its own row.
+2. **`scripts/check-docs.sh` is not touched**, deliberately. Two things
+   floated and refused: narrowing `CLAUDE.md`'s letter to the script's
+   two `deploy/` globs does not fit in five lines, and it would couple
+   the method's letter to one script's internal corpus, so a later
+   widening of the script would silently change what `CLAUDE.md` says.
+   **And its `deploy/` comment wants no correction at all** — see
+   *Risks and findings* 4, which withdraws a claim this handoff and a
+   board row made about it.
 3. **No `docs/decisions.md` byte is written.** One entry is drafted
    below, headed `D-NEXT`; the merger allocates the number (D148,
    invariant 8). The highest decision on `main` is D295.
@@ -103,9 +96,16 @@ in *Drafted for `herd-merger`*.
    `2026-11-01-release-v1.1.0.md:379`. History is append-only and not
    rewritable (`check-docs.sh:286`-`:296`), and each states correctly
    what the rule was on its own date. The false `nix flake check`
-   warrant of 5 also stands at
-   `2026-11-01-merge-batch-39.md:286` for the same reason.
-5. **The batch-39 landing narrative in `board.md`'s *Next* section is
+   warrant of 7 also stands at `2026-11-01-merge-batch-39.md:286` for
+   the same reason.
+5. **No row is opened for the missing `nix flake check` line in
+   `CLAUDE.md`'s *Commands* fence.** It is one sentence in **ORCH-310**'s
+   next action instead: that row already holds *"a clause that must go
+   in `CLAUDE.md`'s *Commands* block and does not fit"*, with the
+   11-character budget measured, and the two are the same unit of work
+   on the same scarce line. `herd-reviewer` and the orchestrator each
+   withdrew an *"earns a row"* on it.
+6. **The batch-39 landing narrative in `board.md`'s *Next* section is
    left alone.** It says the question *"edits `CLAUDE.md` and is
    therefore Alexa's, with a recommendation in the row"*, true of that
    landing and not falsified by his having since decided.
@@ -114,9 +114,9 @@ in *Drafted for `herd-merger`*.
 
 **This branch is prose only.** `CLAUDE.md`,
 `docs/orchestration/board.md` and this file. No `.rs`, no `Cargo.toml`
-byte, no `Cargo.lock` byte, no script, no workflow — the correction
-after the reviewer's block changed nothing about that, and the gate
-class is the same as it was on the first commit.
+byte, no `Cargo.lock` byte, no script, no workflow — and neither
+correction after the review pass changed that, so the gate class is the
+one the first commit had.
 
 **The four Rust gates were NOT RUN.** `nix flake check`,
 `cargo fmt --all --check`,
@@ -131,8 +131,8 @@ passed.
 nothing was submitted to Herd, no compile was started, no job touched
 the queue. It gates a heavy phase and this branch has none.
 
-**Runs made before this file was committed**, verbatim. The first pair
-is from the first commit, the second from the corrected tree:
+**Runs made before this file was committed**, verbatim, the same pair on
+each of the three commits:
 
 ```
 $ ./scripts/check-docs.sh
@@ -186,8 +186,6 @@ the second. **The spelling was not invented on this branch** — it came
 from the v1.1.0 handoff, through the board row's recommendation, into
 what Alexa validated — but this branch is where it was committed, and
 testing a glob before writing it into the method was this agent's job.
-The lesson is in the drafted entry, because it is the reason the final
-clause carries no glob at all.
 
 **2. The two wordings, measured.** Reproduced with a greedy wrapper
 using `check-docs.sh`'s own column count (codepoints, not bytes):
@@ -199,11 +197,17 @@ using `check-docs.sh`'s own column count (codepoints, not bytes):
 | `deploy/**/*.md` (its markdown only) | 6 | — |
 | under `deploy/`, its markdown alone | 6 | — |
 
-Both five-line forms fit. The reviewer's measurement of the first is
-reproduced exactly, and so is the finding that keeping the parenthetical
-*and* the corrected glob needs six lines. Greedy wrapping is
-line-count-optimal, so there is no five-line arrangement of the six-line
-rows. The choice between the two five-line forms is argued in *Done*.
+Both five-line forms fit; greedy wrapping is line-count-optimal, so
+there is no five-line arrangement of the six-line rows. **Prose was
+chosen over the correct glob because a glob in this document has no
+engine.** Nothing mechanical reads this list (4), so a glob here is
+evaluated only by a reader's belief about a dialect — which is how
+`deploy/**.md` crossed four documents unexpanded. `deploy/**/*.md` is
+correct, and it would still require a reader to know that `**/` matches
+**zero** directories before they could place `deploy/README.md` and
+`deploy/release-notice.md`, which are 2 of the 7. Words have no
+expansion to get wrong at any depth. The orchestrator raised a grammar
+objection to the worded form and withdrew it.
 
 **3. `deploy/` holds 7 markdown files and 9 others, not 5 and 11.** The
 first version of this handoff, its board row and its drafted entry all
@@ -211,23 +215,56 @@ said *"five markdown, and eleven that are not"* while naming nine files
 by name — two wrong figures and an internal contradiction.
 `git ls-files deploy | grep -c '\.md$'` is **7**, the complement is
 **9**, the total is 16. The 5 was propagated from
-`check-docs.sh:88`-`:89`, which says *"all five markdown files under
-`deploy/`"* and was true when it was written on 2026-10-30, before
+`check-docs.sh:87`-`:88`, which says *"all five markdown files under
+`deploy/`"* and was true when written on 2026-10-30, before
 `release-notes/1.0.0.md` and `1.1.0.md` existed. **A figure in a comment
-is dated even when the comment does not say so**, and this one was
-copied into three places without being recounted.
+is dated even when the comment does not say so.** That stale figure is
+now rowed, in the same comment block and the same edit.
 
-**4. Nothing mechanical holds the exempt list *today*, and that claim
+**4. A refutation this handoff and a board row carried is withdrawn:
+`check-docs.sh`'s `deploy/` comment is correctly reasoned as written.**
+An earlier version of this branch said its stated reason for excluding
+`deploy/*/*.md` *"does not survive"* and *"cannot be the reason"*, and
+set a board row's next action to correcting it. **That was a misreading
+of the comment's structure.** `:90`-`:96` states **two choices with two
+reasons in matching order**: `.md`-only because
+`docker-compose.yml`, `env.example`, `herd-runner.service`,
+`nixos-herd-runner.nix`, `wsl2-check.sh` and the two files under
+`reverse-proxy/` *"are not prose and have no business being
+width-checked"*; and one-directory-at-a-time because `deploy/*/*.md`
+*"would have pulled in whatever the next subdirectory turns out to
+hold"*. The refutation attacked the **first** reason as though it were
+offered for the **second** choice. Nothing in that comment needs
+fixing, and the row now says so; if it is touched at all it is to
+**add** the hazard it leaves implicit. Raised by `herd-reviewer`,
+relayed to this agent as a refutation by the orchestrator, and withdrawn
+by both — recorded here because it reached a board row before it was
+caught.
+
+**5. The constraint that shaped this task was discovered, not briefed —
+which is ORCH-129's own content.** ORCH-129 is `open` and its next
+action is *"brief it as a constrained edit, not an edit: any task that
+must add to `CLAUDE.md` is told the two figures and told which bullet it
+may shorten in exchange"*. This brief named neither the 150-line cap nor
+the 79-column width; both were found by reading `check-docs.sh` after
+the first draft of the clause had already been written and did not fit.
+No harm resulted — the clause fits and the ceiling held — but the row
+exists so that this is observed rather than survived, so it is recorded
+in ORCH-129's own *Evidence* cell with its date. **And the refusal to
+raise the cap was already settled by D251**, which an earlier draft
+presented as this agent's judgment; the attribution is corrected in
+*Done*, in the row and in the drafted entry.
+
+**6. Nothing mechanical holds the exempt list *today*, and that claim
 needs the qualifier it did not have.** `check-docs.sh:168`-`:170`
 already asserts literal strings in `CLAUDE.md` with `grep -qF` — it
 loops over `docs/orchestration/board.md`,
 `docs/orchestration/workflow.md` and `.claude/agents` and notes when one
 is no longer named — and `check-orchestration.sh:143`-`:144` proves that
 exact class red by mutation. **So the shape that could hold this list
-exists, a few lines from where `CLAUDE.md` is already checked for width
-and length**, and *"nothing mechanical holds it"* is a statement about
-today and not about what is possible. It is rowed. The unqualified
-version was this agent's and `herd-reviewer` refuted it.
+exists**, and *"nothing mechanical holds it"* is a statement about today
+and not about what is possible. It is rowed. The unqualified version was
+this agent's and `herd-reviewer` refuted it.
 
 What the search itself established stands, and the detector was proven
 on a known-bad fixture before its silence was trusted (`grep` here is
@@ -244,62 +281,57 @@ directory, plus a planted `scripts/planted-bad.sh` holding
   `check-orchestration.sh:325`, the file list its meta-gate copies into
   a scratch repo. Neither is a gate-exempt list.
 
-**5. The seven-hit count, corrected.** On the committed tree, excluding
-this file, `git grep -nF -e '.github/*.md'` returns **7 lines in 6
-files**, not the five the first version of this handoff claimed while
-enumerating six. The figure is load-bearing for 4, so here it is in
-full: `CLAUDE.md:85`; `board.md:211` and `board.md:212`, the ORCH-357
-row and the gotcha row, which quote the list rather than hold it;
+On the committed tree, excluding this file,
+`git grep -nF -e '.github/*.md'` returns **7 lines in 6 files**, not the
+five an earlier draft claimed while enumerating six: `CLAUDE.md:85`;
+`board.md:211` and `:212`, which quote the list rather than hold it;
 `gotchas/docs-only-gates.md:12`, which **does** hold it and is stale;
 and the three dated history files of *Not done* 4. Every hit is prose.
 `git grep -nF -e 'Gates before a commit'` returns `CLAUDE.md:84` and
-three history references. `git grep -nE -e 'prose.only|docs.only|`
-`markdown.only'` over `scripts`, `.claude`, `.github`, `Makefile` and
-`flake.nix` returns nothing. All five `.claude/agents/*.md` have
+three history references. All five `.claude/agents/*.md` have
 `grep -c 'README\.md'` of 0; `herd-step.md:19`-`:21` says *"Prose
 only"* with no directory list.
 `.claude/hooks/orchestrator-guard.sh:126` holds a path list that is not
 this one — what the orchestrator may not write in the main checkout,
 with `deploy/` on it already — and is unaffected.
 
-**6. The warrant, corrected twice.** The brief's and the board row's
-reason for keeping `deploy/*.nix` on the gated side was that it and
-`deploy/env.example` *"are read by `nix flake check`"*, gate step 3.
-**They are not:** `flake.nix:27`-`:35` builds `src` with
-`lib.fileset.toSource` over a `lib.fileset.unions` of exactly
+**7. The warrant, corrected three times before it was right.** The
+brief's and the board row's reason for keeping `deploy/*.nix` on the
+gated side was that it and `deploy/env.example` *"are read by `nix flake
+check`"*, gate step 3. **They are not:** `flake.nix:27`-`:35` builds
+`src` with `lib.fileset.toSource` over a `lib.fileset.unions` of exactly
 `./Cargo.toml`, `./Cargo.lock`, `./herd-proto`, `./herd-hub`,
 `./herd-runner` and `./herdctl`, its own comment saying it is
 *"narrowed so that editing `docs/` or this comment does not rebuild
 Rust"*; `flake.nix` declares **no `checks` and no `nixosModules`
 output**; and `deploy/nixos-herd-runner.nix:74` is the file itself
-describing adding `nixosModules.herd-runner = ./deploy/`
-`nixos-herd-runner.nix` *"to flake.nix"* as a thing not done, while
-`:39` shows the consumer importing it from their own `/etc/nixos`,
-which is their machine and not ours (D161).
+describing adding a `nixosModules.herd-runner` entry *"to flake.nix"* as
+a thing not done, while `:39` shows the consumer importing it from their
+own `/etc/nixos`, which is their machine and not ours (D161).
 
-**Then the replacement warrant was itself a true claim carrying a false
-qualifier**, and `herd-reviewer` caught that too. It said
-`check-docs.sh` is *"the only gate that reads any file under
-`deploy/`"*. **Two prose gates read that markdown:**
-`check-docs.sh:97`-`:99` directly, and `check-orchestration.sh`, whose
-`fresh()` at `:99`-`:103` copies the real `deploy/release-notes` into
-every one of its corpora — 49 copies, 48 of which go on to run
-`check-docs.sh` over them. Narrowed to what is true and sufficient:
-**no Rust gate reads any file under `deploy/`, and two prose gates read
-its markdown.** That is the warrant in the clause, the row and the
-drafted entry.
+The replacement then claimed `check-docs.sh` was *"the only gate that
+reads any file under `deploy/`"* — a true claim with a false qualifier,
+since `check-orchestration.sh` reads that markdown too. **And the fix
+for that was itself loose:** *"two prose gates read its markdown"* is
+not true of all 7 files. `check-orchestration.sh`'s `fresh()` at
+`:99`-`:103` copies `deploy/release-notes` **alone** into each of 49
+corpora, 48 of which run `check-docs.sh`, so the 5 files under
+`release-notes/` have two prose readers and `deploy/README.md` and
+`deploy/release-notice.md` have exactly one. Stated precisely, and this
+is the form in the clause's row and the entry: **no Rust gate reads any
+file under `deploy/`; `check-docs.sh` reads all 7 markdown files;
+`check-orchestration.sh` reads the 5 under `release-notes/`.**
 
-**7. Not a finding of this branch, reported and not acted on:**
-`CLAUDE.md`'s *Commands* fence lists three `nix develop` commands and
-`check-docs.sh`, while the prose beside it says *"all four Rust
-gates"*. The four, from `scripts/gate.sh:301`-`:308`, are `nix flake
-check` (step 3), `cargo fmt` (4), `cargo clippy` (5) and the test suite
-(6). **`nix flake check` is the one the fence does not show.** Nothing
-is false, but the block a reader copies has three of the four. Not
-fixed: it costs a line `CLAUDE.md` does not have, and it is outside what
-this brief allowed. Not rowed either, pending the orchestrator's word.
+**8. The operative test is `.md`, not the word markdown.** A future
+`deploy/notes.markdown` would be markdown to a reader and therefore
+exempt by `CLAUDE.md:85`, and `.md` to no glob and therefore read by no
+prose gate. None exists today — all 7 are `.md` — and it is one of two
+routes into the gap the corpus row carries, the other being a third
+directory under `deploy/`. **Both are true before this change and after
+it, and neither is caused by it:** the exemption changed which files owe
+a local compile, not which files a prose gate reads.
 
-**8. There is no `deploy/hub.nix`.** The brief used it as the file a
+**9. There is no `deploy/hub.nix`.** The brief used it as the file a
 reader should be able to place; the `.nix` under `deploy/` is
 `deploy/nixos-herd-runner.nix`.
 
@@ -311,36 +343,34 @@ since the orchestrator asked this agent to decide and justify it.
 **It earns an entry.** The precedent cuts both ways — ORCH-070 went into
 `decisions.md` because prose was its only holder, and the board-row
 indent guard did not because the guard and its comment were the record.
-The question is whether a second prose record adds anything when the
-holder is already `CLAUDE.md`, which every agent reads at start-up. It
-does, for three reasons:
+Three reasons, and the entry argues the third against **D251** by name,
+because D251 is the standing ruling on where a rule that does not fit
+`CLAUDE.md` goes and a reader who finds it would otherwise reopen the
+question:
 
 1. **`CLAUDE.md` holds the rule and cannot hold the warrant.** The
    boundary is the load-bearing half, and the only reason anyone accepts
-   it over *"add `deploy/`"* is 6 above — a warrant that was **false in
-   three documents and then over-qualified in a fourth** before it came
-   out right. Six words of clause cannot carry that, and the 150-line
-   cap means they never will.
+   it over *"add `deploy/`"* is 7 above — a warrant that was **false in
+   three documents, then over-qualified, then still loose** before it
+   came out right. Six words of clause cannot carry that, and the
+   150-line cap means they never will.
 2. **Nothing mechanical holds it today, and something could.**
    `check-docs.sh:168`-`:170` is the shape, proven red as a class by
-   `check-orchestration.sh:143`-`:144`. Until that row is built, the
-   boundary's only guards are prose sentences — one of which, the
-   gotcha, is already stale. This is the qualified form of the claim; 4
-   has the unqualified one and why it was wrong.
-3. **The notation is the residual risk, and it is not guarded.** The
-   clause is deliberately prose where its neighbours are globs, and a
-   later editor will be tempted to regularise it — *"only the markdown
-   under `deploy/`"* back into `` `deploy/**.md` ``. That is not a
-   hypothesis: it is what this branch did, with Alexa's validation
-   behind it, and the result silently excluded the release notes while
-   reading as though it included them. **An append-only record is what
-   makes that tidy-up recognisable as a regression rather than a
-   cleanup.** This replaces an argument in the first draft of this
-   handoff which claimed the boundary rode on a droppable parenthetical;
-   `herd-reviewer` refuted it — with the glob still in the clause the
-   `.md` carried the boundary, and widening needed a visible semantic
-   edit — and it is struck rather than reworded, because a false
-   argument cannot be corrected once appended (D148).
+   `check-orchestration.sh:143`-`:144`. Until that row is built the
+   boundary's only guards are prose sentences, one of which — the
+   gotcha — is already stale.
+3. **The notation is the residual risk, it is not guarded, and
+   `workflow.md` is not where it belongs.** D251 routes an operational
+   rule that does not fit `CLAUDE.md` to `workflow.md`. What has no home
+   here is not an operational rule but a warrant, and `workflow.md`
+   holds method rather than rationale: nothing an agent must *do* would
+   change if the four paragraphs below were pasted into it. This
+   replaces an argument in the first draft of this handoff which claimed
+   the boundary rode on a droppable parenthetical; `herd-reviewer`
+   refuted it — with the glob still in the clause the `.md` carried the
+   boundary, and widening needed a visible semantic edit — and it is
+   struck rather than reworded, because a false argument cannot be
+   corrected once appended (D148).
 
 The entry, verbatim, with `D-NEXT` replaced by the next number. The
 header is 77 columns, measured unfenced, so it does not trip the
@@ -383,19 +413,21 @@ the ground that `deploy/*.nix` and `deploy/env.example` *"are read by
 crates, declares no `checks` and no `nixosModules` output, and leaves
 `deploy/nixos-herd-runner.nix` to the consumer's own `/etc/nixos`
 (D161). What holds instead, and is enough: **no Rust gate reads any
-file under `deploy/`, and two prose gates read its markdown** —
-`check-docs.sh` directly, and `check-orchestration.sh`, whose `fresh()`
-copies the real `deploy/release-notes` into each of its corpora and
-runs `check-docs.sh` over 48 of them. **What no Rust gate reads is not
-something an exemption may assume on its behalf**: exempting a file
-because a gate covers it is a measured claim, exempting one because no
-gate would notice is the opposite, and that is why the boundary stops
-at markdown.
+file under `deploy/`.** `check-docs.sh` reads all 7 of its markdown
+files; `check-orchestration.sh` reads the 5 under `release-notes/`,
+which `fresh()` copies into each of its corpora. **What no Rust gate
+reads is not something an exemption may assume on its behalf**:
+exempting a file because a gate covers it is a measured claim,
+exempting one because no gate would notice is the opposite, and that
+is why the boundary stops at markdown. The operative test is **`.md`**
+— a `deploy/notes.markdown` would be markdown to a reader and `.md` to
+no glob, so exempt here and read by no prose gate. None exists; the
+hazard is rowed.
 
 **It is written in words, not a glob, and that is part of the
-decision.** The first spelling was `` `deploy/**.md` ``, and it was
-carried from the v1.1.0 handoff into the board's recommendation, into
-this validation, and into one commit. **It does not match
+decision.** The first spelling was `` `deploy/**.md` ``, carried from
+the v1.1.0 handoff into the board's recommendation, into this
+validation, and into one commit. **It does not match
 `deploy/release-notes/1.1.0.md`** — the file whose release produced
 the row. `**` is recursive only as a whole path component, so
 `deploy/**.md` degrades to `deploy/*.md`; `git ls-files` with
@@ -404,33 +436,38 @@ and `deploy/release-notice.md` alone. **A glob in a method document
 has no engine.** Nothing mechanical reads this list, so a glob here is
 evaluated only by a reader's belief about a dialect — which is how a
 wrong one crossed four documents unexpanded. `deploy/**/*.md` is
-correct and was measured as fitting, and was still not chosen: its
-zero-directory case is live, two of the seven markdown files sit
-directly under `deploy/`, and a reader must know that `**/` matches no
-directory at all before they can place them. Words have no expansion
-to get wrong.
+correct and was measured as fitting, and was still not chosen: two of
+the seven markdown files sit directly under `deploy/`, so a reader
+must know that `**/` matches no directory at all before they can place
+them. Words have no expansion to get wrong.
 
-**Why this is recorded when `CLAUDE.md` already says it.** The rule's
-holder is prose every agent reads, so the rule needs no second record;
-the **warrant** and the **notation** do. `check-docs.sh` caps
-`CLAUDE.md` at 150 lines and it is at 150; the gates paragraph fills
-five lines, one of them at exactly 79 columns. The paragraph above
-cannot live there. Nothing mechanical holds the list **today** —
-searched across `scripts/`, `.claude/hooks/`, `.github/workflows/`,
-`flake.nix` and `Cargo.toml` with a detector first proven on a planted
-copy — though `check-docs.sh:168` already asserts literal `CLAUDE.md`
-strings with `grep -qF` and is the shape that could, which is rowed
-separately. So the boundary's only guards are prose, and the standing
-risk is a later editor regularising the words back into a glob and
-reintroducing exactly the defect this entry closes. `CLAUDE.md` is
-rewritten; this file is appended to. That is why it is recorded here.
+**Why this is recorded, and why here.** The rule's holder is prose
+every agent reads, so the rule needs no second record; the **warrant**
+and the **notation** do. `check-docs.sh` caps `CLAUDE.md` at 150 lines
+and it is at 150, with the gates paragraph at five lines and one of
+them at exactly 79 columns, so the paragraphs above cannot live there.
+**D251** (ORCH-249) is why the cap was not raised rather than
+negotiated — a limit that exists to force this discipline would be
+spent to buy the lesson — and D251 also routes a rule that does not
+fit `CLAUDE.md` to `workflow.md` *Concurrency and host rules*. **This
+is not that case**: what has no home is not an operational rule but a
+warrant, and `workflow.md` holds method rather than rationale, so
+nothing an agent must do would change if this entry were pasted into
+it. Nothing mechanical holds the list **today** — searched across
+`scripts/`, `.claude/hooks/`, `.github/workflows/`, `flake.nix` and
+`Cargo.toml` with a detector first proven on a planted copy — though
+`check-docs.sh:168` already asserts literal `CLAUDE.md` strings with
+`grep -qF` and is the shape that could, which is rowed separately. So
+the boundary's only guards are prose, and the standing risk is a later
+editor regularising the words back into a glob whose dialect they have
+not tested. `CLAUDE.md` is rewritten; this file is appended to. That
+is why it is recorded here.
 
-D27, D148, D161, D279, ORCH-162, ORCH-357.
+D27, D148, D161, D251, D279, ORCH-129, ORCH-162, ORCH-357.
 ```
 
-**Four `board.md` rows, all in the tree on this branch**, so none needs
-pasting. One keeps its number; **three need one each, in document
-order**:
+**Five `board.md` edits, all in the tree on this branch**, so none needs
+pasting. **Three numbers to allocate, in document order:**
 
 1. `board.md:211`, *Owed*, `| ORCH-357 | … | herd-step | done |` — this
    task. Already numbered.
@@ -438,45 +475,48 @@ order**:
    two stalenesses in `gotchas/docs-only-gates.md`: the five-entry list,
    and a *Verify* step that asks for a green `check` job on a pull
    request nobody opens. Its *Next action* carries the **final**
-   spelling to copy, so a third one cannot be landed by accident.
+   spelling to copy.
 3. `board.md:213`, *Owed*, `| ORCH-NEXT | … | herd-planner | owed |` —
    `check-docs.sh:168` is the shape that could hold the exempt list
-   mechanically. **Edits a gate script, so it owes all four Rust gates
-   and a reviewer pass of its own; not a condition of this landing.**
+   mechanically.
 4. `board.md:214`, *Owed*, `| ORCH-NEXT | … | herd-planner | owed |` —
-   `check-docs.sh`'s stated reason for excluding `deploy/*/*.md` does
-   not survive, a better unstated one does, and the corpus now reads
-   less of `deploy/`'s markdown than `CLAUDE.md` exempts. **Edits a gate
-   script.**
+   the corpus reads less of `deploy/`'s markdown than `CLAUDE.md`
+   exempts, by two routes, plus the stale *"all five markdown files"*
+   figure in the same comment block.
+
+**3 and 4 edit the same script and cross-reference each other**: both
+owe all four Rust gates and a reviewer pass on `scripts/check-docs.sh`,
+so whoever picks up either should carry both and pay that once. Neither
+is a condition of this landing.
+
+Two rows that already exist gain one sentence each, **no number
+needed**: **ORCH-310**'s next action now carries the missing `nix flake
+check` line in the *Commands* fence, since it is the same scarce line
+that row already measured; **ORCH-129**'s evidence now carries this
+branch as a dated instance of a constrained edit briefed as an edit.
 
 Nothing else is drafted: no `D-NEXT` reference left anywhere in the tree
 to renumber, no `cut-v*`, no tag.
 
 ## Decisions needed
 
-**None blocking.** Two calls are made here rather than asked, both
-reversible on an unlanded branch:
-
-1. **Prose over the corrected glob** in `CLAUDE.md`, argued in *Done*
-   against the alternative the orchestrator offered. If the reviewer
-   prefers `` `deploy/**/*.md` (markdown only) ``, it fits at five lines
-   and the swap is one line of the paragraph.
-2. **The decision entry is drafted** rather than skipped, on the
-   orchestrator's explicit ruling that this agent decide and justify it.
+**None blocking.** One call is made here rather than asked, and it is
+reversible on an unlanded branch: **prose over the corrected glob** in
+`CLAUDE.md`, argued in *Risks and findings* 2. It survived a reviewer
+pass and a withdrawn grammar objection. The drafted entry is drafted
+rather than skipped on the orchestrator's explicit ruling that this
+agent decide and justify it.
 
 ## Resume point
 
-`herd-reviewer` sees the branch a second time. The three things worth
-the pass, in order: whether *"only the markdown under `deploy/`"* is the
-right call against the corrected glob, and whether its reasoning holds;
-whether the drafted entry's three arguments are now all true, argument 3
-especially, since it replaces one that was refuted and `decisions.md`
-cannot be corrected after the fact; and whether *Risks and findings* 5's
-recount is right this time. Then `herd-merger` integrates the branch in
-the batch's one landing, allocating **three** `ORCH-NEXT` numbers in
-document order and **one** decision number, and runs `./scripts/gate.sh`
-on the gated sha, which is what covers the four Rust gates this branch
-did not run.
+**`herd-merger`, not review.** The reviewer's block and the
+orchestrator's five acceptance changes are all addressed, and neither
+`CLAUDE.md` nor any gate script changed after the review pass — the
+five changes are confined to `board.md` and this file. The merger
+integrates the branch in the batch's one landing, allocating **three**
+`ORCH-NEXT` numbers in document order and **one** decision number, and
+runs `./scripts/gate.sh` on the gated sha, which is what covers the four
+Rust gates this branch did not run.
 
 ## Processes
 
@@ -484,6 +524,6 @@ did not run.
 no PID killed. `CARGO_TARGET_DIR` was never set and **no `target/` was
 created**, because this branch touches no code — so there is none to
 delete (`workflow.md`, *Concurrency and host rules*). The scratch
-fixture of *Risks and findings* 4 was a copy under this agent's own
+fixture of *Risks and findings* 6 was a copy under this agent's own
 scratchpad subdirectory, outside the worktree and the repository, and is
 removed.
