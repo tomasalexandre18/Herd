@@ -6,36 +6,36 @@ decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
 
 ## Releases
 
-**v1.0.0 is landed and tagged by `herd-merger`** (**D212**, **D277**); a
-release's own notes stay **Alexa's** (**D210**). **Stable means v1.0.0**
-(**D204**); the notes carry **no headline figure** — his choice — and a
-sourced table: the 44 `must` cells at `f7f2ea1` read **36 / 5 / 1 / 2**, E-14
-`planned` there and `withdrawn` here since 2026-10-31. **Named as not met,
-five**: E-49 waived and **unmeasured**, E-50 and E-14 **withdrawn**
-(**D248**, **D275**), record retention cut to **v1.1**, **one known-unstable
-test shipping**, breaking blocker **B8**. **All three versions have moved** —
-`PROTOCOL_VERSION` **3**, `RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** —
-and there is **no migration path** (**D243**).
+**v1.0.0 is landed and tagged by `herd-merger`** (**D212**, **D277**); its
+notes stay **Alexa's** (**D210**). **Stable means v1.0.0** (**D204**); they
+carry **no headline figure** — his choice — and a sourced table: the 44 `must`
+cells at `f7f2ea1` read **36 / 5 / 1 / 2**. **Not met, five**: E-49 waived and
+**unmeasured**, E-50 and E-14 **withdrawn** (**D248**, **D275**), retention cut
+to **v1.1**, **one known-unstable test shipping**, breaking blocker **B8**.
+**All three versions moved** — `PROTOCOL_VERSION` **3**, `RECORD_VERSION`
+**2**, `LAYOUT_VERSION` **2** — with **no migration path** (**D243**).
 
 ## What is known about the consumer's machines, and when
 
-Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
-**Their hub and runner are up since 20:23 on 2026-10-29**, so the ceiling is
-**two** heavy agents; the exchange is ours to open, unanswered (**D249**).
+Their facts reach us as dated reports (D161). **Their hub and runner are up
+since 20:23 on 2026-10-29**, so the ceiling is **two** heavy agents; the
+exchange is ours to open, unanswered (**D249**).
 
-**From their reports:** **37.6 GiB kept for nothing**, fixed in the code and
-still on their disk — **freed by the release, not the merge**, **no migration
-reclaims it** (**D221**, **D242**, ORCH-205) — and **50 spools their runner
-refuses to offer** (**D224**, ORCH-185, -186). **Disk is a rate:** **11
-GB/day** active, ~2.8 stopped; **`r_file` = 5.04**.
-**Reset from zero at v1.0.0, reconfirmed 2026-10-30:** the current root
-(**3334 `job.json`, 5.9 MiB**) is set aside and is **unreadable by v1.0.0's
-binaries** — refused by version, not degraded. Told to extract now. **Both
-conditions it ships on are now met**: retention follows in v1.1, and
-**`herd-hub report` weighs the records, events and logs** (**D271**) — apparent
-size, said to be a floor, 1.97x under blocks. **Their 2026-10-31 loss — 17
-files, 42 MiB under `finished, exited 0` — is fixed on `main`, unreleased**
-(**D291**, **D292**): asked for at the verdict; a give-up is on the record.
+**From their reports:** **37.6 GiB kept for nothing**, fixed in code, still on
+disk — **freed by the release, not the merge**, **no migration reclaims it**
+(**D221**, **D242**, ORCH-205) — and **50 spools their runner refuses to
+offer** (**D224**, ORCH-185, -186). **Disk is a rate:** **11 GB/day** active,
+~2.8 stopped; **`r_file` = 5.04**. **Reset from zero at v1.0.0, reconfirmed
+2026-10-30:** the current root (**3334 `job.json`, 5.9 MiB**) is set aside,
+**unreadable by v1.0.0's binaries** — refused by version, not degraded; extract
+now. Both ship conditions are met: retention in v1.1, `herd-hub report` weighs
+the record (**D271**) — apparent size, a floor, 1.97x under blocks. **Their
+2026-10-31 incident is fixed on `main`, unreleased, in two halves:** the 17
+files, 42 MiB lost under `finished, exited 0` (**D291**, **D292**) is hub-only,
+complete; `j0000000655`'s 8 re-offers in 0.51 s to the machine still running it
+— exit 125, no verdict — is **bounded, not removed** (**D294**): one refusal
+per *connection*, re-armed by a redial; **runner first, or a hub alone fixes
+nothing**: a v1.0.0 runner sends no key.
 
 ## Where the software is
 
