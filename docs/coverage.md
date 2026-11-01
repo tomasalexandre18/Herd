@@ -344,10 +344,12 @@ not had that pass.
 
 Five things a reader must not mistake for done:
 
-1. **Merged is not running.** **The newest tag is v1.0.0**, cut from
-   `main` at `ae3ae40` on 2026-10-31 (**D212**, **D277**); v0.4.1 was
-   the newest until then, and this line read v0.3.0 until 2026-10-30
-   and was two releases stale. **Tagged is neither published nor
+1. **Merged is not running.** **The newest tag is v1.1.0**, cut from
+   `main` at batch 39's landing commit on 2026-11-01 (**D212**); v1.0.0
+   was the newest until then (`ae3ae40`, 2026-10-31, **D277**), v0.4.1
+   before that, and this line read v0.3.0 until 2026-10-30 and was two
+   releases stale. **v1.1.0 moves none of the three numbers** — 3, 2 and
+   2 — so it resets no state root. **Tagged is neither published nor
    deployed:** a release's own notes are Alexa's (**D210**). What the
    consumer's machines actually
    run is a fact that reaches us only as a dated report (D161), and the

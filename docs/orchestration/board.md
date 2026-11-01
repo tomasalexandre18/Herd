@@ -347,8 +347,9 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ORCH-352 | **Four places in the tree still assert the merged claim the design statement retires, and one of them gives the consumer wrong advice.** All four pre-date this branch and none is in its diff, so no regression — but the branch is what retires the claim in writing while changing no record byte, which leaves the record's own prose holding what the protocol dropped. `herd-hub/src/job.rs:323`-`:327`, whose `holding` field says *"which is the ceiling it announced"* where the new proto doc says a self-collision reports `holding < most` **by construction**; `:1937`-`:1938`; `:1951`-`:1956` (`runners_that_were_full`); and the sentence a requester really reads at `herd-hub/src/server.rs:8789`-`:8794` — *"by machines that were already as full as the ceiling they announced … **Add capacity**, or look at why the two counts disagree"*, which for a self-collision is wrong advice twice over | `herd-reviewer` N3, 2026-11-01, answering the brief's *"does anything else still assert the old claim?"* | herd-planner | open | **Read the budget row above and D182 first**: the sentence cannot be fixed without the record change that row owns, so this is not a separate proposal. The three doc corrections are free of it | the budget row above | the four cited sites; `herd-proto/src/lib.rs`, `at_its_ceiling`'s doc |
 | ORCH-353 | **ORCH-330 was not needed here, and that is the second fixture in two days where a bound preceded the clock.** The analysis §4.6 recommended ORCH-330's cheap half — a `Policy` the hub re-reads while up — as a precondition of T3's fixture, on the ground that it needs two phases with opposite clock requirements. It needs neither. The watchdog's write-off is reached by a frame: `ToHub::AttemptAbandoned` with no count enters `give_the_job_another_go(..., TheRunnerWentAway)`, the very call the watchdog makes, so the ending, the budget charged and every record field match and only the `ended` sentence differs. And the rate is bounded by `FromHub::HealthRecorded`, which the hub sends **after** recording the report and judging the queue, so "the hub did not offer this job again" is a positive assertion over a bounded frame list rather than a wait on nothing happening. No sleep, no cut socket, no `tokio::time::pause` | `herd-step`, 2026-11-01, confirmed by `herd-reviewer` the same day; the same door the collection-short event found | herd-planner | open | Re-size ORCH-330 against the two fixtures said to need it that did not, before a clock seam is built for a third | — | `herd-hub/tests/one_machine_runs_one_job_once.rs` module doc; `herd-hub/tests/collection_short_on_the_record.rs:31`-`:40` |
 | ORCH-354 | **`herd-runner/src/confine.rs:479` says there are "three sentences about room on a machine that reach the same record", and there are more.** `herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT` — *"one machine runs one job once"* — is a further clause an `attempt_ended` line can carry, and the only one that is not arithmetic about a machine's size; `herd_hub::matcher::A_SECOND_ATTEMPT_OF_ITS_OWN` is the hub's own clause for the same pair, on a `waiting` line. The disjointness claim at `:483` is still true and is now asserted over all five clauses and both of this branch's new sentences; it is the count in the prose that is stale. **What no gate asserts, and the const docs now say so instead of claiming otherwise, is the link across the crates**: `herd-runner` is only a `[dev-dependencies]` of `herd-hub`, so a test binary is the only place both constants exist at once and a rename on one side would pass a release build. Left unedited because `confine.rs` was outside this branch's write paths | `herd-step`, 2026-11-01; scope and over-claim both corrected by `herd-reviewer` F5 and F6 the same day | herd-step | open | Three words in `confine.rs:479`-`:485`, at whatever landing next touches that file. The cross-crate gap is a separate question and wants sizing, not a word | — | `herd-runner/src/confine.rs:479`-`:485`; the five-clause block of `herd-hub/tests/announced_job_ceiling.rs`'s `the_runners_ceiling_sentence_is_not_the_hubs` |
-| ORCH-NEXT | **A v1.1.0 hub bounds a pre-2026-10-31 runner by the sum of the ceilings it would grant, while that runner still bounds itself by the count it announced.** **Reasoned from the code, not measured**, and the row exists so the reasoning is checked rather than carried. The dividing line is `f060e9d` (*Bound a runner by the sum of the ceilings it granted*, 2026-10-31), which is **not** an ancestor of `v1.0.0`: a v1.0.0 runner therefore announces `memory_lent_mib` and `memory_floor_mib` — both predate `v0.1.0` — so `admissible_memory_mib()` is `Some` on the hub, and `herd-hub/src/matcher.rs:991`-`:1004` then sets `out_there` to **the machine's own word alone** (`it_said_it_is_holding`, `None` in the ordinary state), not to the hub's records; the matcher's own comment says *"this whole bound is inert on a machine that stated its size"*. Admission is `Σ charged ≤ lent − floor` (D285, D287) and the runner's own `take_job` on that build is `running >= most_at_once` with `most = max((lent − floor) / cap, 1)` (`herd-runner/src/confine.rs:528`). So with declared jobs smaller than the cap the hub can offer more than the runner will take, and a refusal storm is how `j0000000655` died. **A self-limiting loop is plausible and its rate is not measured:** the first `RefusedAsFull` sets `it_said_it_is_holding`, and `herd-hub/src/server.rs:2917` **clears it with `.take()` on every health report** — `HEALTH_EVERY` is 15 s — so the count bound re-arms at the health cadence rather than persisting. Nothing here times that, and the body of `deploy/release-notes/1.1.0.md` states the hazard as unmeasured and gives no figure | `herd-release`, 2026-11-01, preparing v1.1.0; raised by the orchestrator and verified against the tree by the cut | herd-step | open | Measure it against a **v1.0.0** runner and a v1.1.0 hub, with declared jobs under the cap: count the refusals and time the re-arm. **Not a v0.4.1 runner, which the orchestrator's brief named and the tree refutes:** v0.4.1 is `PROTOCOL_VERSION` 2 against this hub's 3, the check is equality (`herd_proto::version_mismatch_reason`), so it is refused at the handshake and can never reach admission. v1.0.0 is the only build that both talks to a v1.1.0 hub and lacks `f060e9d` | — | `f060e9d`; `git merge-base --is-ancestor f060e9d v1.0.0` fails; `herd-hub/src/matcher.rs:991`-`:1004`; `herd-hub/src/server.rs:2917`; `herd-runner/src/confine.rs:509`-`:539`; `herd-proto/src/lib.rs:170` (`HEALTH_EVERY`), `:3084` (equality check); D285, D287, D294 |
-| ORCH-NEXT | **`docs/operating.md`'s *What this means for you, concretely, today* has no row for v1.1.0, and a reader on v1.0.0 can conclude the four reset steps apply to them.** The section states *"v0.4.0 and v0.4.1 are at 2, 1 and 1; v1.0.0 is the release that moves all three"* and calls the four steps above it *"**the** procedure for the v0.4.1 → v1.0.0 move"*. v1.1.0 carries 3, 2 and 2 — **all three unmoved** — so none of that is false and the cut did not touch it (**D279**: a bump corrects the prose it falsifies and goes no further; prose it makes merely *incomplete* stays a docs task). It is incomplete in the one direction that costs an operator their state root if they guess wrong, which is why it is a row and not a note. The release body carries the answer for this release — *"The four steps in `docs/operating.md` are the v0.4.1 → v1.0.0 procedure and do not apply to this upgrade"* — so nothing is unanswered in public; what is missing is the answer in the file an operator reads when no release page is in front of them | `herd-release`, 2026-11-01, preparing v1.1.0, under D279's own carve-out | herd-step | open | One row or one paragraph in `docs/operating.md` saying a release that moves none of the three numbers needs none of the four steps, and that v1.1.0 is the first such release since v0.3.x. `docs/joining.md`'s install snippet was bumped by this cut, following `84fa359`'s precedent; `deploy/release-notice.md` is Alexa's and was not touched (D279, ORCH-217) | — | `docs/operating.md:701`-`:713`; `deploy/release-notes/1.1.0.md` *Read this first, in this order*; D279; `84fa359` |
+| ORCH-355 | **A v1.1.0 hub bounds a pre-2026-10-31 runner by the sum of the ceilings it would grant, while that runner still bounds itself by the count it announced.** **Reasoned from the code, not measured**, and the row exists so the reasoning is checked rather than carried. The dividing line is `f060e9d` (*Bound a runner by the sum of the ceilings it granted*, 2026-10-31), which is **not** an ancestor of `v1.0.0`: a v1.0.0 runner therefore announces `memory_lent_mib` and `memory_floor_mib` — both predate `v0.1.0` — so `admissible_memory_mib()` is `Some` on the hub, and `herd-hub/src/matcher.rs:991`-`:1004` then sets `out_there` to **the machine's own word alone** (`it_said_it_is_holding`, `None` in the ordinary state), not to the hub's records; the matcher's own comment says *"this whole bound is inert on a machine that stated its size"*. Admission is `Σ charged ≤ lent − floor` (D285, D287) and the runner's own `take_job` on that build is `running >= most_at_once` with `most = max((lent − floor) / cap, 1)` (`herd-runner/src/confine.rs:528`). So with declared jobs smaller than the cap the hub can offer more than the runner will take, and a refusal storm is how `j0000000655` died. **A self-limiting loop is plausible and its rate is not measured:** the first `RefusedAsFull` sets `it_said_it_is_holding`, and `herd-hub/src/server.rs:2917` **clears it with `.take()` on every health report** — `HEALTH_EVERY` is 15 s — so the count bound re-arms at the health cadence rather than persisting. Nothing here times that, and the body of `deploy/release-notes/1.1.0.md` states the hazard as unmeasured and gives no figure | `herd-release`, 2026-11-01, preparing v1.1.0; raised by the orchestrator and verified against the tree by the cut | herd-step | open | Measure it against a **v1.0.0** runner and a v1.1.0 hub, with declared jobs under the cap: count the refusals and time the re-arm. **Not a v0.4.1 runner, which the orchestrator's brief named and the tree refutes:** v0.4.1 is `PROTOCOL_VERSION` 2 against this hub's 3, the check is equality (`herd_proto::version_mismatch_reason`), so it is refused at the handshake and can never reach admission. v1.0.0 is the only build that both talks to a v1.1.0 hub and lacks `f060e9d` | — | `f060e9d`; `git merge-base --is-ancestor f060e9d v1.0.0` fails; `herd-hub/src/matcher.rs:991`-`:1004`; `herd-hub/src/server.rs:2917`; `herd-runner/src/confine.rs:509`-`:539`; `herd-proto/src/lib.rs:170` (`HEALTH_EVERY`), `:3084` (equality check); D285, D287, D294 |
+| ORCH-356 | **`docs/operating.md`'s *What this means for you, concretely, today* has no row for v1.1.0, and a reader on v1.0.0 can conclude the four reset steps apply to them.** The section states *"v0.4.0 and v0.4.1 are at 2, 1 and 1; v1.0.0 is the release that moves all three"* and calls the four steps above it *"**the** procedure for the v0.4.1 → v1.0.0 move"*. v1.1.0 carries 3, 2 and 2 — **all three unmoved** — so none of that is false and the cut did not touch it (**D279**: a bump corrects the prose it falsifies and goes no further; prose it makes merely *incomplete* stays a docs task). It is incomplete in the one direction that costs an operator their state root if they guess wrong, which is why it is a row and not a note. The release body carries the answer for this release — *"The four steps in `docs/operating.md` are the v0.4.1 → v1.0.0 procedure and do not apply to this upgrade"* — so nothing is unanswered in public; what is missing is the answer in the file an operator reads when no release page is in front of them | `herd-release`, 2026-11-01, preparing v1.1.0, under D279's own carve-out | herd-step | open | One row or one paragraph in `docs/operating.md` saying a release that moves none of the three numbers needs none of the four steps, and that v1.1.0 is the first release on the far side of v1.0.0's one reset — the first upgrade since it that asks nothing of a state root. **Not "the first release that resets nothing"**: every release from v0.3.0 to v0.4.1 sat at 2, 1 and 1, so each of them moved none of the three and v1.0.0 is the only release that has ever moved any. That superlative is the unearned one `646ab34` struck from the body and from `coverage.md`; it survived in this row's own next action and is corrected here by the integrator, because a false sentence in a file is not a commit message that cannot be rewritten. `docs/joining.md`'s install snippet was bumped by this cut, following `84fa359`'s precedent; `deploy/release-notice.md` is Alexa's and was not touched (D279, ORCH-217) | — | `docs/operating.md:701`-`:713`; `deploy/release-notes/1.1.0.md` *Read this first, in this order*; D279; `84fa359` |
+| ORCH-357 | **`CLAUDE.md`'s gate rule exempts by directory and `deploy/` is not on the list, so by its letter a markdown-only change under `deploy/` owes all four Rust gates.** The rule exempts `CLAUDE.md`, `README.md`, `docs/`, `.claude/` and `.github/*.md`; `deploy/release-notes/<version>.md` is prose that ships in the tree (**ORCH-162**) and `check-docs.sh` already asserts its existence, its non-emptiness and its width, so the four Rust gates read nothing a change to it can move. `cut-v1.1.0`'s 2026-11-01 correction was exactly this case and did the honest thing: it ran `check-docs.sh` and reported the four as **not run, never as passed**. The row is the question of whether the letter of the rule should change, not a claim that the correction was wrong | `herd-release`, 2026-11-01, flagged deciding nothing; agreed and filed by `herd-merger` at batch 39's landing | herd-planner | open | Size it, then decide who it belongs to: adding `deploy/**.md` to the exempt list edits **`CLAUDE.md`**, which is the method and therefore Alexa's under *When to ask Alexa*, so this is one question with a recommendation and not a docs fix. **Recommendation: exempt `deploy/**.md` and no other path under `deploy/`** — `deploy/*.nix` and `deploy/env.example` are read by `nix flake check` and must keep owing the gates. Until it is decided, the letter stands and a prose change under `deploy/` reports the four as not run | — | `CLAUDE.md` *Commands*, the gates paragraph; `docs/orchestration/history/2026-11-01-release-v1.1.0.md` *The correction of 2026-11-01, and what it was gated with*; `scripts/check-docs.sh` (the ORCH-162 release-notes rule); ORCH-162 |
 
 ## Active — an agent holds it
 
@@ -1829,3 +1830,89 @@ to touch (D161).
     message and the merger's report, and **its post-push run id is in
     the report alone**, because this item is committed before the gate
     runs (ORCH-121).
+
+32. **v1.1.0 is landed and tagged** — batch 39, **one branch**,
+    `cut-v1.1.0`, tip `503902a`, **no `ORCH-nnn` of its own**, handoff
+    `history/2026-11-01-release-v1.1.0.md`. **No conflict and nothing to
+    resolve**: `origin/main` at `40f21ca` is the branch's own base, so
+    the merged tree is the branch's tree, file for file — which is why
+    the board was read **both ways** line by line rather than trusted
+    (*One landing per batch*). **Alexa validated the publication on
+    2026-11-01 and chose 1.1.0**; the notes are his (**D210**) and ship
+    **in the tree** (ORCH-162), so this is the first release with no
+    paste to make. The tag follows the push as its own act (**D212**).
+
+    **All three numbers are unmoved** — `PROTOCOL_VERSION` 3,
+    `RECORD_VERSION` 2, `LAYOUT_VERSION` 2, read at both tags through
+    `release.yml`'s own `sed` — so **no state root is reset** and
+    `operating.md`'s four steps do not apply. **The upgrade order is
+    every runner, then the hub, required and not advisory**: a v1.0.0
+    runner sends no `still_running_attempt`, which the hub reads as an
+    absence of testimony, so a hub upgraded alone fixes nothing.
+
+    **The release names a promise it does not keep, which is Alexa's
+    choice and not a drafting accident.** v1.0.0's published page says
+    record retention is *"cut from v1.0.0, following in v1.1"*; this is
+    v1.1.0 and the engine does not exist (ORCH-098's decision is `done`,
+    its implementation rows are `owed`). He chose to publish naming the
+    gap over holding the tag and over a number that does not claim 1.1,
+    so that section of the body is the answer and **nobody softens it
+    later on the ground that it reads harshly**. The *mixed fleet*
+    section is deliberately labelled **unmeasured** and must not acquire
+    a figure.
+
+    **One decision, D295**, pasted from the branch's *Drafted for
+    `herd-merger`* with only `D-NEXT` replaced: a pickaxe over a
+    constant's name cannot see its value move. Above **D294** on `main`
+    and above every unlanded branch — all 30 non-ancestor remote refs
+    and 13 non-ancestor local branches were read at this integration and
+    none holds a `D` above 294 or an `ORCH` above 354 (ORCH-777,
+    ORCH-998 and ORCH-999 are fixtures and prose examples, not rows) —
+    so no gap was closed and **D143, D154 and D170 stay**.
+
+    **Three rows: ORCH-355** (the mixed-fleet skew hazard, reasoned from
+    the code and **not measured**, with a **v1.0.0** runner as its
+    control because a v0.4.1 one is refused at the handshake),
+    **ORCH-356** (`docs/operating.md` has no row for a release that
+    moves none of the three numbers) and **ORCH-357**, filed at this
+    landing: `CLAUDE.md`'s gate rule exempts by directory and `deploy/`
+    is not on the list, so by its letter a markdown-only change under
+    `deploy/` owes all four Rust gates. The cut reported them **not
+    run**, which is correct; whether `deploy/**.md` joins the exempt
+    list edits `CLAUDE.md` and is therefore Alexa's, with a
+    recommendation in the row.
+
+    **Two prose corrections were made at the landing, and both are
+    named rather than folded in.** `docs/coverage.md:347` read *"The
+    newest tag is v1.0.0"* — true at the bump and false the instant the
+    tag is pushed, and no commit on the branch could correct it without
+    asserting something false first; batch 29's landing is the
+    precedent. And **ORCH-356's own next action carried the unearned
+    superlative** `646ab34` had struck from the body and from
+    `coverage.md`: *"the first such release since v0.3.x"*. **It is
+    false** — every release from v0.3.0 to v0.4.1 sat at 2, 1 and 1, so
+    each moved none of the three, and **v1.0.0 is the only release that
+    has ever moved any**. The row now carries the narrower true
+    sentence. The same superlative stands in `81efea2`'s **commit
+    message**, where it cannot be corrected without a force-push, which
+    is forbidden with no exception; it is in no file.
+
+    **`docs/status.md` was replaced and stayed at 90 lines, which is the
+    fourth landing running that had to trade a line out of it to add
+    one.** What was traded out, so the trade is a decision and not a
+    loss: the `herd-hub report` sentence (**D271**), the *fetch says
+    which path it took* clause (**D223**, **D240**) and the *`--help`
+    figure, `EBUSY`, controller* clause (**D245**, **D259**, **D265**).
+    All three are decisions in `docs/decisions.md` and lose nothing but
+    a pointer. The obsolete half of the old text went with them: *"both
+    ship conditions are met: retention in v1.1"* is what this release
+    falsifies.
+
+    **Batch 38's post-push run, which only this landing can record:**
+    `ci.yml` run **41272918750** on `main` at
+    `40f21ca32a90e83b9d14baa5e9ef62d98c77f94d`, `completed`/`success` at
+    04:23:37Z, read back **by id** with `gh run view` at this
+    integration and not off a list line. Batch 39's own gate verdict,
+    skip list and gated sha are in the merge message and the merger's
+    report, and **its post-push run id is in the report alone**, because
+    this item is committed before the gate runs (ORCH-121).
