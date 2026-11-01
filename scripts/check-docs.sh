@@ -2,13 +2,26 @@
 # Enforces the docs discipline of CLAUDE.md invariant 8, so that it does not
 # have to be enforced by hand in review.
 #
-# Adding a rule here: check-orchestration.sh runs this whole script 38 times,
+# Adding a rule here: check-orchestration.sh runs this whole script 48 times,
 # each over a full copy of the real repository, because a control only ever
 # seen green is not known to work and each case needs its own fresh corpus.
 # The cost of any rule that is linear in the corpus is therefore multiplied
-# by 38 in the `docs` CI job, which has a 5-minute cap. One such rule already
-# took that job past the cap (2026-10-27; see the 79-column check below).
-# Measure a new whole-corpus rule against the suite, not against one run.
+# by 48. One such rule already took the `docs` job past its cap (2026-10-27;
+# see the 79-column check below). Measure a new whole-corpus rule against
+# the suite, not against one run.
+#
+# The cost, as a dated measured figure rather than a count, because the
+# count alone tells a future author nothing about the headroom left:
+#   48 whole-corpus runs; check-orchestration.sh 63 s on this host
+#   2026-11-01; ~120 s in CI at the x1.9 host-to-CI factor measured
+#   2026-10-27 (history/2026-10-27-docs-gate-cost.md); against the `docs`
+#   job's 300 s cap. So about 40% of the cap, not the fifth that the
+#   host figure alone suggests.
+# For scale: that same file measured 25 cases at 9.63 s here and ~20 s in
+# CI on 2026-10-27. Cases x1.9 and wall x6.5 in five days -- the cost is
+# cases x corpus, so it grows faster than either, and `docs/` is now the
+# bigger half. The cap is the thing to watch, and this is the figure to
+# re-measure before adding a whole-corpus rule.
 set -uo pipefail
 
 # A stable locale for grep, sed and sort below. The column count has its own
@@ -48,7 +61,10 @@ n=$(wc -l < docs/status.md)
 # check-orchestration.sh, so a relapse to byte counting goes red.
 #
 # A fence opens at any indent and closes only at the indent it opened on,
-# and a table row is exempt at any indent (ORCH-117). Both anchors were at
+# and a table row is exempt at any indent (ORCH-117). Note that the
+# board-row guard further down says the opposite about an indented table
+# row, deliberately: this exemption is about MEASURING WIDTH and applies to
+# every file, while that guard fixes the row SHAPE of board.md alone. Both anchors were at
 # column 1 until 2026-10-27, so a fenced block or a table nested inside a
 # list item was width-checked like prose: three fences and one table, on
 # that one day, in handoffs whose evidence has to stay verbatim. Closing
@@ -171,6 +187,73 @@ if [ -f "$board" ]; then
   want="Waiting Owed Open Active Blocked Next"
   got=$(grep -oE '^## (Waiting|Owed|Open|Active|Blocked|Next)' "$board" | sed 's/^## //' | tr '\n' ' ' | sed 's/ $//')
   [ "$got" = "$want" ] || note "$board sections are '$got', want '$want' in that order"
+  # A board row is written in exactly one shape, `| ORCH-<n> | `, and this
+  # guard REQUIRES that shape rather than blacklisting a bad one.
+  #
+  # The three checks below all anchor on the literal `^| ORCH-`, so their
+  # blind set is every line that renders as a row of this table and does not
+  # begin with exactly those characters -- not merely an indented one.
+  # Measured 2026-11-01, every detector proven on a column-1 known-bad first
+  # by breaking a state cell to `banana`: `| ORCH-n |` red, caught by the
+  # state check; ` | ORCH-n |` and a tab- or CR-indented row red, caught
+  # here; and `|ORCH-n |`, `|  ORCH-n |` and ` |ORCH-n |` all **green**,
+  # `docs ok`, with `banana` sitting in the state cell.
+  #
+  # A pipe with no space after it needs no unusual character, is the most
+  # ordinary typo available over a pipe table, renders in GFM as a row of
+  # this same table, reads as a board row to a human, and was invisible to
+  # every check in this file. The first version of this guard matched
+  # `^[[:space:]]+\| ORCH-` and was blind to it too: it closed one spelling
+  # while this comment asserted the shape was machine-held, which is worse
+  # than the gap it closed. ORCH-335's reason, which this project has paid
+  # for twice: a control that can go green on the defect it was built for
+  # does not merely fail to help, it ends the vigilance that was holding the
+  # rule. Hence a required shape and not a forbidden one.
+  #
+  # `ORCH-NEXT` is canonical too: it is the placeholder an agent writes and
+  # `herd-merger` numbers at integration, so the guard must not refuse it
+  # (D148, invariant 8).
+  #
+  # Known limit, named rather than guarded: an indent made of NBSP, ZWSP or
+  # a BOM is not `[[:space:]]`, so such a line still escapes every check
+  # here. All three are green today, measured, and no such line exists in
+  # the corpus. They are rare, and refusing them means deciding what
+  # characters a document may contain, which is a larger rule than this one.
+  # A lowercase `| orch-1 |` IS caught, because the candidate match is
+  # case-insensitive while the canonical one is not.
+  #
+  # Requiring the canonical spelling, rather than anchoring the three checks
+  # at an optional-whitespace prefix and accepting several, is the
+  # deliberate choice. Accepting several makes a row several spellings of one
+  # thing, and every check written over this table afterwards has to carry
+  # the tolerance for ever or quietly lose a row again. The one indented row
+  # that existed was a typo and not a style -- 1 against 317, measured
+  # 2026-11-01 -- and board.md is a live document, not a dated record, so
+  # de-indenting it was an ordinary edit.
+  #
+  # **This comment is the only record of that rejected alternative.** No
+  # `docs/decisions.md` entry was written, deliberately: the alternative is
+  # recorded here, where whoever trips over the rule is already standing,
+  # rather than 9000 lines into an append-only file. A later trim of this
+  # comment for brevity loses the record with it.
+  #
+  # A board row therefore cannot be shown as a literal in board.md: at
+  # column 1 the state check already read it before this guard existed, and
+  # at any other spelling this guard reads it. Escape the leading pipe
+  # (`\|`) to show one. The place this rule is documented is here.
+  #
+  # Counter-note to the 79-column rule above, which exempts
+  # `^[[:space:]]*\|` -- any table row at any indent, by ORCH-117. That
+  # exemption is about measuring width and is right; this guard is about
+  # board.md's row shape. The two sit 100 lines apart and say opposite
+  # things about an indented table row, deliberately so.
+  #
+  # Cost: two greps over one small file, flat in the corpus.
+  canon='^[0-9]+:\| ORCH-([0-9]+|NEXT) \|'
+  offenders=$(grep -niE '^[[:space:]]*\|[[:space:]]*ORCH-' "$board" \
+    | grep -vE "$canon" | cut -c1-56 | sed 's/^/    line /')
+  [ -z "$offenders" ] || note "$board has rows that are not in the canonical '| ORCH-<n> | ' shape, where the row checks below cannot see them (not their ten fields, not their state, not their id):
+$offenders"
   rows=$(grep -nE '^\| ORCH-' "$board" | awk -F'|' 'NF != 10 { print "    line " $0 }' | cut -c1-60)
   [ -z "$rows" ] || note "$board rows must have exactly eight cells:
 $rows"
@@ -200,7 +283,7 @@ done
 # compared as a string first, so every handoff written under the
 # pull-request method is skipped without being opened, and what is left is
 # read by one awk for the whole set -- one landing per batch. check-docs.sh
-# is run 38 times by check-orchestration.sh against the `docs` job's
+# is run 48 times by check-orchestration.sh against the `docs` job's
 # 5-minute cap (see the note at the top of this file).
 # The constant is a floor, and it moved once: the method landed on
 # 2026-10-28 and a merge handoff of that same date was already on `main`,
@@ -224,7 +307,7 @@ run_digits=8
 landings=""
 for f in docs/orchestration/history/*-merge-*.md; do
   [ -f "$f" ] || continue
-  b=${f##*/}      # not basename: one fork per file, paid 38 times
+  b=${f##*/}      # not basename: one fork per file, paid 48 times
   [ "${b%%-merge-*}" \< "$landing_from" ] && continue
   landings="$landings $f"
 done
@@ -305,7 +388,7 @@ done
 #
 # Cost: four greps over two small files, flat in the corpus. This is not one
 # of the whole-corpus rules the note at the top of this file warns about, and
-# the 38 runs in check-orchestration.sh pay it 38 times at that price.
+# the 48 runs in check-orchestration.sh pay it 48 times at that price.
 notes_dir=deploy/release-notes
 
 # The version the way `flake.nix` reads it (`workspace.package.version`),

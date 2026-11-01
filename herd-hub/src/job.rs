@@ -69,6 +69,38 @@ pub use herd_proto::JobMetrics;
 /// number alone — and the two new fields above are in fact of that kind, so
 /// what this move buys is **not** their carriage but the refusal arriving at
 /// the door with the layout's.
+///
+/// **A new *variant* is additive too, and until D292 this doc did not say
+/// so.** The additive rule above is stated in terms of **fields**, and a
+/// line of `events.jsonl` is a tagged enum: the thing somebody actually adds
+/// is a tenth [`JobEventKind`], a sixth [`JobState`], a new
+/// [`JobOutcome`](herd_proto::JobOutcome). D292 ruled that such an addition
+/// leaves this number alone, and the ground it ruled on is worth having
+/// here rather than re-derived: **a line's absence has always meant the
+/// thing did not happen.** A job with no `collection_short` line is a job
+/// whose collection was not short, so a reader that has never heard of the
+/// kind reads that history exactly as a reader written before the kind
+/// existed would have. Nothing it was promised changed.
+///
+/// **What that buys, and what it costs somebody else.** The alternative was
+/// to move this number for every new kind, which means a coordinated reset
+/// of the consumer's whole state root — every queued job and every
+/// uncollected verdict — for a line nobody was reading. What it costs
+/// instead is a requirement on a reader *outside* Herd: the first consumer
+/// parses this file with their own code (D8, E-53, E-54), so whether their
+/// parser ignores an `event` value it does not know or errors on it is a
+/// property of their parser and not of ours (D292). The consequence is that
+/// an addition is **named in the release notice** rather than discovered in
+/// the file.
+///
+/// **It is not a licence to respell a tag or drop a field.** Those two are
+/// the non-additive changes that look additive from inside Rust — every
+/// round trip in the suite stays green, because both sides moved together —
+/// and they are what the consumer's parser feels. Both of them, and a tenth
+/// variant that arrives without its line being written down, are a red gate
+/// in `herd-hub/src/store/frozen_events.rs`, which freezes every line of
+/// `events.jsonl` byte for byte and matches exhaustively over every variant
+/// and every field.
 pub const RECORD_VERSION: u32 = 2;
 
 /// The one sentence a reader gets for a record of another version.
@@ -2126,6 +2158,43 @@ impl JobEvent {
 /// with nothing on the record saying so is a record that lies by omission. So
 /// a line says which kind it is, in a `event` field, and a reader that wants
 /// the transitions reads the `transition` lines.
+///
+/// # Adding a kind here
+///
+/// You are standing on a **published** surface, and that was settled by D8
+/// and not by this file: *"the on-disk layout becomes a compatibility
+/// surface the moment the consumer reads it"*, and the first consumer reads
+/// it (E-53, E-54). `docs/handover.md` lists `events.jsonl` among what
+/// crosses the line between us.
+///
+/// **A new kind is additive and leaves [`RECORD_VERSION`] alone** — D292,
+/// on the ground that a line's absence has always meant the thing did not
+/// happen, so a reader that never heard of the kind is told nothing it was
+/// not told before. Read [`RECORD_VERSION`]'s own doc for the whole rule and
+/// for what it asks of the consumer's parser in exchange.
+///
+/// Three things an addition owes, none of them optional:
+///
+/// 1. **A frozen line in `herd-hub/src/store/frozen_events.rs`.** It will
+///    stop the build until you write one — the match over this enum is
+///    exhaustive and names every field with no `..` — and that is
+///    deliberate: the thing it replaced was a hand-written list of eight
+///    kinds that stayed green on the day the ninth landed.
+/// 2. **A sentence in the release notice**, because an addition is named to
+///    the consumer rather than left for them to find in the file (D292).
+/// 3. **Nothing else.** Do not move [`RECORD_VERSION`], and do not add
+///    `#[serde(other)]` to this enum: it would change only *our* readers,
+///    and on the one that exists it is a regression — an unknown arm turns
+///    `JobDirStore::note_collection_short`'s dedupe into a successful
+///    non-match, which is the unbounded duplicate-line case D292 built that
+///    one-shot to prevent.
+///
+/// **Respelling a tag or removing a field is none of the above.** Both look
+/// additive from inside Rust, because both sides move together and every
+/// round trip stays green; both break a parser that is not built on this
+/// type. They are record format changes: [`RECORD_VERSION`] moves, with
+/// [`crate::LAYOUT_VERSION`] beside it (D218), and that needs Alexa's
+/// approval and an operator instruction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum JobEventKind {

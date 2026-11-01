@@ -15460,3 +15460,92 @@ verdict and its named absences are byte for byte what they were.
 Deliberately not in this decision: anything about the requeue storm or
 about the rate at which the hub re-offers a job, and the healthy-link
 rewind — each has its own row.
+
+## 2026-11-01 — D293 A published record format owes a detector the
+compiler can enforce
+
+`events.jsonl` has been a published compatibility surface since D8, whose
+*Reversibility* says it in one sentence: *"The on-disk layout becomes a
+compatibility surface the moment the consumer reads it; the record format
+therefore carries a version from the start."* The condition is met — the
+first consumer parses the file with their own code (E-53, E-54, D292) —
+and two other places in the tree already carried the ruling:
+`herd-hub/src/job.rs`'s opening sentence, and `docs/handover.md:67`,
+which lists the file among what crosses the line in a table its own
+preamble calls *"the contract between the two"*. **So nothing here
+decides whether the file is published.** What was missing was a detector,
+and ORCH-345 was right about that and wrong that the surface was in
+question.
+
+**A frozen fixture alone is not a detector, and this project has the
+measurement.** `herd-hub/tests/announced_job_ceiling.rs:396`-`:417`
+enumerated **eight** event kinds and was green on 2026-10-31 with
+**nine** in the tree: `collection_short` landed and nothing went red,
+because that list was only ever checked against the lines the jobs of one
+scenario happen to produce. A fixture of today's lines says nothing about
+kind ten, since nothing about the old lines changed. The same shape has
+cost this project three controls in a day: an enumeration that does not
+bind is a control silent on the defect it was built for.
+
+**So a detector for a published format is three things in one file, and
+the third is the one that binds.** `herd-hub/src/store/frozen_events.rs`
+holds a byte-frozen line per kind, produced by the hub's own writer; a
+decode leg that hand-writes the same text and reads it back through
+`job_events`, so a line is proven readable and not merely proven stable;
+and **exhaustive matches** over `JobEventKind` and `JobState` that name
+every field of every variant with no `..` anywhere. A tenth variant, a
+field added to a variant and a field taken out of one are each a
+**compile error in the detector**. The compiler is the part that cannot
+be walked past, printed "ok" and forgotten — and it is the part a
+fixture, a round trip and a whitelist all lack.
+
+It lives **inside the crate**, as `#[cfg(test)] mod frozen_events;`
+beside the D103 ordering oracle, because `EventLine` and the writer that
+puts `RECORD_VERSION` in front of a line are private to `store`. Its own
+file for the oracle's reason: it is a gate, not one more test of the
+store.
+
+**Shown firing before its silence was trusted**, on four known-bad
+fixtures: a respelled `event` tag and a dropped field each turned two
+tests red, with the dropped field reading back out of the decode leg as
+`bytes: 0` — a true number inside a false record; a tenth variant and a
+field added to a variant each stopped the build. This is the project's
+own rule about a detector and it has earned it three times this week.
+
+**And D292's rule is now written where the person adding kind ten is
+standing.** D292 extended `RECORD_VERSION`'s additive rule from *fields*
+to *variants*, on the ground that a line's absence has always meant the
+thing did not happen; that extension lived only in a decision entry, so
+it would have been re-derived. It is now in `RECORD_VERSION`'s doc, in
+`JobEventKind`'s doc under *Adding a kind here*, in
+`docs/architecture.md`'s version table and in `docs/coverage.md`'s E-53
+cell. Each names the two changes that look additive from inside Rust and
+are not — a respelled tag, a removed field — because both keep every
+round trip in the suite green while breaking a parser that is not built
+on our type.
+
+**`#[serde(other)]` is refused, by name, in the doc comment.** It would
+change only *our* readers, and the consumer's parser is not built on our
+type (D292). On the one product reader that exists it is a
+**regression**: an unknown arm turns `note_collection_short`'s dedupe
+into a successful non-match, which re-enables the unbounded
+duplicate-line case D292 built that one-shot to prevent. Refusing it also
+leaves unanswered an unverified question about whether serde permits it
+on an internally tagged enum reached through two `flatten`s, which is a
+second reason not to ask.
+
+**A renderer is not refused and is not this entry.** ORCH-125 already
+ruled the shape at `herd-hub/src/main.rs:306`-`:318`: not `herdctl`,
+because a `FromHub` variant a requester can see moves
+`PROTOCOL_VERSION` and a requester is the wrong machine. If one is ever
+built it is `herd-hub events <job-id>`, judged on support value and not
+on compatibility — and the point of this entry is that the format's
+guard no longer waits on that question.
+
+Deliberately not in this decision: whether each addition must be named to
+the consumer in the release notice, which is a promise about *their*
+parser and is the director's; and `JobOutcome`, which `JobState::Finished`
+nests and which this pass freezes one of rather than all of, because it is
+`herd-proto`'s and is read by three parsers.
+
+No behaviour changed, no record byte changed, no version number moved.
