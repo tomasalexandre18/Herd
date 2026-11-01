@@ -15,12 +15,15 @@
 # $tmp: no network, no credential, nothing outside $tmp is written.
 #
 # Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
-# copy of the real repository -- 44 whole-corpus runs as this file stands.
+# copy of the real repository -- 48 whole-corpus runs as this file stands,
+# 63 s here on 2026-11-01 and ~120 s in CI at the x1.9 factor measured
+# 2026-10-27, against the `docs` job's 300 s cap (~40% of it; the full
+# dated figure is in check-docs.sh's header).
 # That multiplier is the constraint on anyone adding an all-docs rule to
-# check-docs.sh: a rule linear in the corpus is paid 44 times here, and the
-# `docs` CI job is capped at 5 minutes. Adding a case here costs one more
-# run of every rule. The fixtures are deliberately not trimmed: a control
-# measured on a toy corpus is not known to work on the real one.
+# check-docs.sh: a rule linear in the corpus is paid 48 times here, and
+# adding a case here costs one more run of every rule. The fixtures are
+# deliberately not trimmed: a control measured on a toy corpus is not
+# known to work on the real one.
 #
 # Usage: ./scripts/check-orchestration.sh
 set -uo pipefail
@@ -90,8 +93,8 @@ skipped() { skips=$((skips+1)); printf 'SKIP  %s: %s\n' "$1" "$2"; }
 # the release-notes rule (ORCH-162): it reads the workspace version out of
 # Cargo.toml, wants the notes file beside it, and asserts that release.yml
 # really puts that file on the page. Named file by file rather than as whole
-# directories, because this copy is made 45 times below -- one per case, of
-# which 44 then go on to run check-docs.sh -- and `deploy` and `.github`
+# directories, because this copy is made 49 times below -- one per case, of
+# which 48 then go on to run check-docs.sh -- and `deploy` and `.github`
 # hold a megabyte between them that no check here reads.
 fresh() {
   rm -rf "$tmp/repo"; mkdir -p "$tmp/repo"
@@ -124,6 +127,7 @@ expect_red_quiet() {
   else bad "$1" "    exit=$rc, output:
 $(printf '%s\n' "$out" | sed 's/^/    /' | head -8)"; fi
 }
+
 echo "== check-docs.sh goes green on the repository as it is"
 fresh; expect_green "unmodified copy passes"
 
@@ -150,29 +154,51 @@ fresh; printf '| ORCH-998 | item | origin | owner | pending | next | dep | ev |\
 expect_red "board row with an unknown state" 'unknown state'
 fresh; printf '| ORCH-001 | a second ORCH-001 | origin | owner | owed | next | dep | ev |\n' >> "$tmp/repo/docs/orchestration/board.md"
 expect_red "board id used twice" 'uses an id twice'
-# A board row indented by a single space was invisible to all three row
-# checks above (ORCH-NEXT): they anchor on `^| ORCH-`, so its ten fields
-# were not counted, its state was not known and its id was not compared.
-# One such row was on `main` until this branch de-indented it. check-docs.sh
-# now rejects the indented shape outright rather than tolerating it, so
-# these cases assert the new message -- and the pair of state cases is what
-# tells the two shapes apart: the same broken state cell goes red on
-# `unknown state` at column 1 (the case above) and red on the indentation,
-# silently as to its state, one space in. The column-1 cases above are the
-# other half of the same family and must keep passing unchanged.
+# A board row must be written in exactly one shape, `| ORCH-<n> | `, and
+# check-docs.sh requires that shape rather than forbidding a bad one. The
+# three checks above anchor on the literal `^| ORCH-`, so their blind set is
+# every line that renders as a row of that table and does not begin with
+# exactly those characters. An indented row is only one member of it: a
+# first version of the guard matched `^[[:space:]]+\| ORCH-` and left
+# `|ORCH-n |` and `|  ORCH-n |` -- a pipe with no space after it, or two,
+# needing no unusual character and rendering in GFM as a row of the same
+# table -- green with `banana` in the state cell, while claiming in prose
+# that the shape was machine-held (ORCH-335: a control that can go green on
+# the defect it was built for ends the vigilance that was holding the rule).
+#
+# The column-1 cases above are the other half of this family and must keep
+# passing unchanged. The three red-and-silent cases are what tell the
+# spellings apart: the same broken state cell goes red on `unknown state` at
+# column 1, and red on the shape, silent as to its state, one space in.
+#
+# One caveat on the duplicate-id case, so that nobody reads it as proving
+# more than it does: its silence is ALSO explained by `grep -o` capturing
+# the prefix into the compared key, so ` | ORCH-001` and `| ORCH-001` are
+# two different strings and `uniq -d` finds nothing. It therefore stays
+# green even if the id check is re-anchored to tolerate an indent, and
+# whoever re-anchors that check must not rely on this case to tell them they
+# got it wrong.
 B="$tmp/repo/docs/orchestration/board.md"
-fresh; printf ' | ORCH-997 | an indented row, well formed otherwise | origin | owner | owed | next | dep | ev |\n' >> "$B"
-expect_red "board row indented by one space" 'do not start at column 1'
-fresh; printf '\t| ORCH-996 | an indented row, tab rather than space | origin | owner | owed | next | dep | ev |\n' >> "$B"
-expect_red "board row indented by a tab" 'do not start at column 1'
-fresh; printf ' | ORCH-995 | an indented row whose state cell is broken | origin | owner | banana | next | dep | ev |\n' >> "$B"
-expect_red_quiet "an indented row with a broken state: the guard fires and the state check is blind" 'do not start at column 1' 'unknown state'
-fresh; printf ' | ORCH-994 | an indented row with too few cells | origin | owner | owed |\n' >> "$B"
-expect_red_quiet "an indented row with too few cells: the guard fires and the field count is blind" 'do not start at column 1' 'exactly eight cells'
-fresh; printf ' | ORCH-001 | an indented second ORCH-001 | origin | owner | owed | next | dep | ev |\n' >> "$B"
-expect_red_quiet "an indented duplicate id: the guard fires and the id check is blind" 'do not start at column 1' 'uses an id twice'
-fresh; printf '| ORCH-993 | a well-formed row at column 1 | origin | owner | owed | next | dep | ev |\n' >> "$B"
-expect_green "a well-formed row at column 1 is what the guard leaves alone"
+fresh; printf ' | ORCH-997 | one leading space, well formed otherwise | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_red "board row with one leading space" 'canonical'
+fresh; printf '\t| ORCH-996 | a tab rather than a space | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_red "board row indented by a tab" 'canonical'
+fresh; printf '|ORCH-992 | no space after the leading pipe | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_red "board row with no space after the leading pipe" 'canonical'
+fresh; printf '|  ORCH-991 | two spaces after the leading pipe | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_red "board row with two spaces after the leading pipe" 'canonical'
+fresh; printf '|ORCH-990 | no space after the pipe, state broken | origin | owner | banana | next | dep | ev |\n' >> "$B"
+expect_red_quiet "no space after the pipe, broken state: the guard fires and the state check is blind" 'canonical' 'unknown state'
+fresh; printf ' | ORCH-995 | one leading space, state broken | origin | owner | banana | next | dep | ev |\n' >> "$B"
+expect_red_quiet "one leading space, broken state: the guard fires and the state check is blind" 'canonical' 'unknown state'
+fresh; printf ' | ORCH-994 | one leading space, too few cells | origin | owner | owed |\n' >> "$B"
+expect_red_quiet "one leading space, too few cells: the guard fires and the field count is blind" 'canonical' 'exactly eight cells'
+fresh; printf ' | ORCH-001 | one leading space, a second ORCH-001 | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_red_quiet "one leading space, duplicate id: the guard fires and the id check is blind" 'canonical' 'uses an id twice'
+fresh; printf '| ORCH-993 | a canonical row | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_green "a canonical row is what the guard leaves alone"
+fresh; printf '| ORCH-NEXT | the placeholder herd-merger numbers | origin | owner | owed | next | dep | ev |\n' >> "$B"
+expect_green "ORCH-NEXT is canonical too: the guard must not refuse the placeholder"
 fresh; rm "$tmp/repo/docs/orchestration/board.md"
 expect_red "board missing" 'board.md is missing'
 fresh; printf '# late\n' > "$tmp/repo/docs/orchestration/history/undated-task.md"
@@ -2158,7 +2184,7 @@ echo "== a landing records its predecessor's post-push run (ORCH-333)"
 # accident by a record that is merely discussing runs.
 #
 # Cost: one awk pass over one file per case and no check-docs.sh run, so
-# this section adds nothing to the 44 whole-corpus runs this file is
+# this section adds nothing to the 48 whole-corpus runs this file is
 # otherwise paid for.
 
 # One width for the run id, written once. check-docs.sh owns it, because
