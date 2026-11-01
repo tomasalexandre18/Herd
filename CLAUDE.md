@@ -82,10 +82,10 @@ nix develop --command cargo fmt --all --check
 ```
 
 Gates before a commit: a change outside `CLAUDE.md`, `README.md`, `docs/`,
-`.claude/` and `.github/*.md` runs all four Rust gates plus `check-docs.sh`.
-A prose-only change runs `check-docs.sh` alone and says the Rust gates were
-**not run** locally, covered by the landing's `gate.sh`. A gate that did not
-run is reported as not run, never as passed.
+`.claude/`, `.github/*.md` and only the markdown under `deploy/` runs all four
+Rust gates plus `check-docs.sh`. A prose-only change runs `check-docs.sh` alone
+and says the Rust gates were **not run** locally, covered by the landing's
+`gate.sh`. A gate that did not run is reported as not run, never as passed.
 
 ## Git and main
 

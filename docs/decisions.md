@@ -15716,3 +15716,97 @@ number above D294 on `origin/main` and above every unlanded branch: all 30
 non-ancestor remote refs and all 13 non-ancestor local branches were read at
 this integration and none holds a `D` above 294, so no gap was closed and
 **D143**, **D154** and **D170** stay (D148, invariant 8).
+
+## 2026-11-01 — D296 Only `deploy/`'s markdown is gate-exempt, and in words
+
+`CLAUDE.md`'s *Commands* paragraph exempted by directory —
+`CLAUDE.md`, `README.md`, `docs/`, `.claude/`, `.github/*.md` — and
+`deploy/` was not on the list. By its letter a markdown-only change
+under `deploy/` owed all four Rust gates locally, although no Rust
+tool reads one. `deploy/release-notes/<version>.md` is prose that
+ships in the tree (ORCH-162), and v1.1.0's cut hit the case exactly:
+it ran `check-docs.sh` alone and reported the four as **not run, never
+as passed**, which was right under the letter as it stood.
+
+**The rule now exempts only the markdown under `deploy/` and nothing
+else there** (Alexa, 2026-11-01, ORCH-357).
+
+**What it governs is narrow.** Only whether an agent pays the compile
+locally before its own commit. `scripts/gate.sh` runs steps 0 to 8
+over the whole tree at the landing on the gated sha, `pre-push`
+refuses a push without that receipt, and `ci.yml` has no `paths`
+filter. Nothing reaches `main` ungated by this exemption.
+
+**The boundary is the decision, not the exemption.** Exempting
+`deploy/` wholesale would have been a loss of coverage dressed as the
+correction of a letter. `deploy/` holds 16 files: 7 markdown, and 9
+that are not — a `.nix`, a `.service`, a `.json`, two `docker-compose`
+YAMLs, a `.sh`, `env.example` and two files under `reverse-proxy/`.
+The clause's one operative sentence exempts markdown and makes no
+statement about any other extension, so all 9 keep the obligation the
+previous letter gave them and no file's class is decided here.
+
+**The warrant.** ORCH-357's row recommended the narrow exemption on
+the ground that `deploy/*.nix` and `deploy/env.example` *"are read by
+`nix flake check`"*. **They are not.** `flake.nix` narrows `src` with
+`lib.fileset.unions` to `Cargo.toml`, `Cargo.lock` and the four
+crates, declares no `checks` and no `nixosModules` output, and leaves
+`deploy/nixos-herd-runner.nix` to the consumer's own `/etc/nixos`
+(D161). What holds instead, and is enough: **no Rust gate reads any
+file under `deploy/`.** `check-docs.sh` reads all 7 of its markdown
+files; `check-orchestration.sh` reads the 5 under `release-notes/`,
+which `fresh()` copies into each of its corpora. **What no Rust gate
+reads is not something an exemption may assume on its behalf**:
+exempting a file because a gate covers it is a measured claim,
+exempting one because no gate would notice is the opposite, and that
+is why the boundary stops at markdown. The operative test is **`.md`**
+— a `deploy/notes.markdown` would be markdown to a reader and `.md` to
+no glob, so exempt here and read by no prose gate. None exists; the
+hazard is rowed.
+
+**It is written in words, not a glob, and that is part of the
+decision.** The first spelling was `` `deploy/**.md` ``, carried from
+the v1.1.0 handoff into the board's recommendation, into this
+validation, and into one commit. **It does not match
+`deploy/release-notes/1.1.0.md`** — the file whose release produced
+the row. `**` is recursive only as a whole path component, so
+`deploy/**.md` degrades to `deploy/*.md`; `git ls-files` with
+`:(glob)` and `bash` with `globstar` both return `deploy/README.md`
+and `deploy/release-notice.md` alone. **A glob in a method document
+has no engine.** Nothing mechanical reads this list, so a glob here is
+evaluated only by a reader's belief about a dialect — which is how a
+wrong one crossed four documents unexpanded. `deploy/**/*.md` is
+correct and was measured as fitting, and was still not chosen: two of
+the seven markdown files sit directly under `deploy/`, so a reader
+must know that `**/` matches no directory at all before they can place
+them. Words have no expansion to get wrong.
+
+**Why this is recorded, and why here.** The rule's holder is prose
+every agent reads, so the rule needs no second record; the **warrant**
+and the **notation** do. `check-docs.sh` caps `CLAUDE.md` at 150 lines
+and it is at 150, with the gates paragraph at five lines and one of
+them at exactly 79 columns, so the paragraphs above cannot live there.
+**D251** (ORCH-249) is why the cap was not raised rather than
+negotiated — a limit that exists to force this discipline would be
+spent to buy the lesson — and D251 also routes a rule that does not
+fit `CLAUDE.md` to `workflow.md` *Concurrency and host rules*. **This
+is not that case**: what has no home is not an operational rule but a
+warrant, and `workflow.md` holds method rather than rationale, so
+nothing an agent must do would change if this entry were pasted into
+it. Nothing mechanical holds the list **today** — searched across
+`scripts/`, `.claude/hooks/`, `.github/workflows/`, `flake.nix` and
+`Cargo.toml` with a detector first proven on a planted copy — though
+`check-docs.sh:168` already asserts literal `CLAUDE.md` strings with
+`grep -qF` and is the shape that could, which is rowed separately. So
+the boundary's only guards are prose, and the standing risk is a later
+editor regularising the words back into a glob whose dialect they have
+not tested. `CLAUDE.md` is rewritten; this file is appended to. That
+is why it is recorded here.
+
+D27, D148, D161, D251, D279, ORCH-129, ORCH-162, ORCH-357.
+
+**On the number.** Allocated **D296** at batch 40's integration, the next free
+number above D295 on `origin/main` and above every unlanded branch: all 30
+non-ancestor remote refs and all 15 non-ancestor local branches were read at
+this integration and none holds a `D` above 295, so no gap was closed and
+**D143**, **D154** and **D170** stay (D148, invariant 8).
