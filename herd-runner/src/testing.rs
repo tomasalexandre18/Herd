@@ -186,12 +186,51 @@ pub fn source_files() -> Vec<(PathBuf, String)> {
     found
 }
 
+/// The sentence a refusal for **a second attempt of a job this machine is
+/// already running** really carries, built the way `Session::take_job`
+/// builds it.
+///
+/// Here for [`a_refusal_for_the_memory_sum`]'s reason, and for one more:
+/// this is the one sentence about a place on a machine that is not
+/// arithmetic about the machine's size. A hub-side test asserting that the
+/// clauses cannot be mistaken for one another
+/// (`herd-hub/tests/announced_job_ceiling.rs`) has to read it as it is
+/// built, because a copy of its words would go on agreeing with itself
+/// after the sentence had changed.
+///
+/// **The figures are the first consumer's machine, 2026-10-31, and they come
+/// out:** 20 GiB lent, 6 GiB kept as its own floor, 7 GiB capping every job,
+/// so `confine::jobs_at_once` is `(20480 − 6144) / 7168` = **two** places —
+/// which is what `most: 2` beside it says. It is holding one of them:
+/// attempt 1 of the job whose attempt 2 the hub has just offered it.
+/// **Holding under what it announced is not a detail of the example**, which
+/// is why the arithmetic has to agree: `take_job` answers the ceiling first
+/// whenever `running >= most_at_once`, so a machine holding 1 of 1 is *at*
+/// its ceiling and this refusal is unreachable there. An earlier draft of
+/// this function lent 14 GiB, which yields one place, and so exhibited the
+/// opposite of the property the paragraph claims.
+pub fn a_refusal_for_a_second_attempt() -> String {
+    let host = herd_proto::HostSize::new(Some(20480), Some(12)).with_floor(Some(6144));
+    let ceiling = crate::confine::jobs_at_once(&host, 7168 << 20);
+    debug_assert_eq!(
+        ceiling.most(),
+        2,
+        "the figures have to yield the two places the sentence is about"
+    );
+    crate::NotTaken::StillRunningThisJob {
+        held: 1,
+        running: 1,
+        most: 2,
+    }
+    .sentence(&ceiling)
+}
+
 /// The sentence a refusal for this runner's **own running sum** really
 /// carries, built the way `Session::take_job` builds it.
 ///
 /// Here rather than in the test that reads it because
 /// `crate::NotTaken` is the runner's own business and stays so: a hub-side
-/// test asserting that the three sentences about room on a machine cannot be
+/// test asserting that the sentences about room on a machine cannot be
 /// mistaken for one another (`herd-hub/tests/announced_job_ceiling.rs`) has
 /// to read the sentence as it is built and not a copy of its words, and a
 /// copy is what it would have if this returned anything but the real one.

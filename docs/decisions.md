@@ -15549,3 +15549,121 @@ nests and which this pass freezes one of rather than all of, because it is
 `herd-proto`'s and is read by three parsers.
 
 No behaviour changed, no record byte changed, no version number moved.
+
+## 2026-11-01 — D294 A second attempt of one job is a rate, not
+a ceiling
+
+Two refusals a runner can make are about its own bookkeeping, and
+`herd-proto` said in writing that they *"are the same fact … and both
+carry the same consequence"*. The first half holds. The second is false,
+and the first consumer's `j0000000655` is the measurement: on 2026-10-31,
+v1.0.0, after a 71.28 s link silence at host load 172, the hub's watchdog
+wrote attempt 1 off while that machine was still running it, offered the
+job back to the same machine eight times between 20:28:37.160Z and
+20:28:37.671Z, and ended it `refused_as_full`, exit 125, with no verdict,
+for work no machine had failed at.
+
+The mechanism, and why it is a rate. The hub's one throttle for this shape
+is a count: `matcher.rs`'s `out_there >= at_once`, fed by what the machine
+itself said it was holding. A refusal at the announced ceiling reports
+`holding == most`, so the guard fires and nothing more is placed there
+until the next health report squares the counts — self-limiting, which is
+the behaviour D182 was written around. A refusal for a second attempt of
+one job reports `holding < most` **by construction**, because
+`herd_runner::Session::take_job` answers the ceiling first whenever
+`running >= most_at_once`: that branch is reachable only below the
+announced count. So the guard is guaranteed inert exactly where the
+refusal is guaranteed to repeat, and `give_the_job_another_go` ends on
+`dispatch_queued_jobs` with no delay anywhere on the path. Their figures
+were holding 1 of 2 places. `1 >= 2` is false.
+
+So the decision has two parts. **The wire says which refusal it was**: a
+second `#[serde(default)]` field, `still_running_attempt`, on
+`ToHub::AttemptAbandoned`, naming the attempt that is in the way. In a
+field and not in the `reason`, which is prose a hub may not parse; and in
+this field rather than inferred from the count being under the announced
+ceiling, because that ceiling reached the hub on a different frame, at a
+different moment, and sometimes from a different process of the same
+runner.
+
+**What `None` means, exactly, because the obvious reading is false.**
+`None` is *"this runner did not say which refusal it was"* — an absence of
+testimony. It is not *"not a refusal for a second attempt of this job"*:
+an un-upgraded v1.0.0 runner refuses exactly that way and sends no key,
+because the runner put both refusals in one match arm. D182's own field
+escaped this cleanly, since before it no abandonment carried any count at
+all. Both version numbers stay where they are all the same —
+`PROTOCOL_VERSION` 3, `RECORD_VERSION` 2 — because the absence does mean
+what the default says once the default is stated as silence, and because
+what a hub does with that silence is the behaviour it had before the
+field existed.
+
+**What it does cost is named, not softened: the upgrade order is runner
+first, and a hub deployed alone fixes nothing.** An upgraded hub beside
+un-upgraded runners receives no discriminant, excludes no pair, and
+offers the job back exactly as it does today — so until every runner that
+might refuse this way is rebuilt, the storm is still reachable on that
+fleet. The reverse of D181, whose order was hub first.
+
+**And the hub excludes the pair, not the machine.** On such a refusal the
+hub records `(job_id, runner)` and the matcher answers `ShortNow` for that
+pair until the machine's next health report stops naming the job. The job
+**waits** for the place it is already in, which is what the consumer
+needed; every other job is placed on that machine as before; nothing about
+any other machine changes. `ShortNow` and not `NotHere` because the place
+is really taken by a job that is really running and will really come free,
+which is the shape E-31's *short is never a failure* is about. The
+clearing needs no new frame and no clock — health reports already name
+every job a runner holds — and it is read off what the report **named**,
+before any entry is judged: the entry about the written-off attempt is
+refused as superseded, and it is also the only evidence the hub gets that
+the place is still taken.
+
+**What is bounded is the rate, and it is bounded per connection.** The
+exclusion lives on the connection, so a redial arrives with an empty set
+and the hub offers on the hello, before it reads a frame. Each redial
+costs one more refusal and one more charge, so eight redials during one
+long attempt still reach the bound and still end the job
+`refused_as_full`. What is closed is the 0.51 s storm, not every road to
+that outcome.
+
+**No third budget, and the existing one is kept.** The analysis left the
+choice to the brief and the brief ruled for no budget at all; the tree
+refuted it twice. Charging nothing would need a third kind of ending on
+the record, and — measured, not argued — it would turn
+`a_job_refused_past_the_bound_ends_and_names_it` red on a loaded host
+only: that test requires a job to reach the bound with
+`ceiling_refusals_allowed: 1`, and its own comment records 4 failures in
+20 under four spinners and 13 in 20 under eight in the regime where this
+branch is the refusal that fires, while on an idle host the ceiling
+refusal fires instead and would still be charged. A CI-only, load-only
+red is the one a local gate does not catch. An exemption with no bound
+remains the one outcome worse than a job that ends.
+
+Deliberately not in this decision: whether a self-collision earns an
+ending of its own on the record, which is a record-format addition and is
+on the board; the four places in `herd-hub/src/job.rs` and
+`herd-hub/src/server.rs` whose prose still asserts the merged claim,
+which cannot be fixed without that addition and is on the board beside
+it; and anything about the consumer's instance, which is theirs
+(invariant 9, D161).
+
+The evidence is a fixture that needs no clock. The write-off is reached by
+a frame — `ToHub::AttemptAbandoned` with no count enters the same
+`give_the_job_another_go(..., TheRunnerWentAway)` the watchdog calls, so
+the ending, the budget charged and every record field match and only the
+`ended` sentence differs — and the rate is bounded by
+`FromHub::HealthRecorded`, which the hub sends after judging the queue, so
+*"the hub did not offer this job again"* is a positive assertion over a
+bounded frame list. The fixture cannot compile on `9e8fdef`, since the
+field is a compile-time dependency of it; the equivalent fixture there,
+sending the frame a v1.0.0 runner really sends, failed with 8 refusals,
+offers 2 through 9, nine attempts on the record and `refused_as_full`. On
+the fix it passes in 0.23 s with exactly one refusal and the job's own
+verdict.
+
+**On the number.** Allocated **D294** at batch 38's integration, the next
+free number above D293 on `origin/main` and above every unlanded branch:
+all 30 non-ancestor remote refs were read at this integration and none
+holds a `D` above 293, so no gap was closed and **D143**, **D154** and
+**D170** stay (D148, invariant 8).

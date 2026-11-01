@@ -1662,6 +1662,31 @@ struct ConnectedRunner {
     /// `None` is "nothing to correct", which is the ordinary state and the
     /// one every runner joins in.
     it_said_it_is_holding: Option<u32>,
+    /// The jobs this machine has handed straight back because it is
+    /// **already running another attempt of them** (invariant 2, one machine
+    /// runs one job once).
+    ///
+    /// The correction the count above cannot make. A refusal for a job the
+    /// machine is already running is answered *below* the ceiling it
+    /// announced — `herd_runner::Session::take_job` answers the ceiling
+    /// first whenever `running >= most_at_once` — so the figure beside it
+    /// reads as room, the seat stays admissible, and the hub offers the same
+    /// job to the same machine again on the very next pass. Eight times in
+    /// 0.51 s on the first consumer's instance, until a budget meant for a
+    /// machine that is full ran out and a job no machine had failed at ended
+    /// `refused_as_full` with no verdict (2026-10-31, v1.0.0, `j0000000655`).
+    ///
+    /// So the pair is excluded rather than the machine: this job waits for
+    /// this machine, everything else is placed on it as before, and nothing
+    /// about any other machine changes. Held until the machine's next health
+    /// report stops naming the job, which is the same reconciliation the
+    /// count above uses and needs no clock and no new frame — the report
+    /// lists every job the runner is really running, so the one thing that
+    /// clears the exclusion is the place really coming free. Empty for every
+    /// runner that has never refused that way, which is the ordinary state,
+    /// and gone with the connection: a redial offers the job again and the
+    /// machine refuses again if it is still holding it.
+    it_said_it_is_running_these: BTreeSet<JobId>,
     /// How preferred this machine is when more than one could run a job
     /// (E-19). Declared by whoever runs it; zero when it says nothing.
     preference: i32,
@@ -2269,6 +2294,7 @@ impl State {
                     host: announced.host,
                     jobs_at_once: announced.jobs_at_once,
                     it_said_it_is_holding: None,
+                    it_said_it_is_running_these: BTreeSet::new(),
                     preference: announced.preference,
                     load_milli: announced.load_milli,
                     // Nothing said about a pack store on this connection
@@ -2365,6 +2391,7 @@ impl State {
                         host: runner.host,
                         jobs_at_once: runner.jobs_at_once,
                         it_said_it_is_holding: runner.it_said_it_is_holding,
+                        it_said_it_is_running_these: runner.it_said_it_is_running_these.clone(),
                         draining: runner.draining,
                         capacity: runner.capacity.clone(),
                         holdings,
@@ -2843,13 +2870,24 @@ impl State {
         )
     }
 
-    /// True when this report ended a correction a ceiling refusal had left
-    /// on the runner (D182), which is a machine that has room again and
-    /// therefore a queue worth judging.
+    /// True when this report ended a correction a refusal for the machine's
+    /// own count had left on the runner (D182), which is a machine that has
+    /// room again and therefore a queue worth judging.
+    ///
+    /// `named` is every job id the report mentioned **before** any of them
+    /// was judged, which is not what `jobs` holds: `mind_a_reported_job`
+    /// keeps only the attempts this runner was really given, and an attempt
+    /// the watchdog wrote off while the link was down is refused as
+    /// superseded and left out. That refused entry is the one thing that
+    /// says the machine is still running the job the hub has already taken
+    /// away from it — so the exclusion below is cleared on the whole of what
+    /// the machine named, never on the filtered set, or it would clear on
+    /// the very report that proves it is still needed.
     fn record_health(
         &self,
         outbox: &Outbox,
         jobs: Vec<RunningJob>,
+        named: &BTreeSet<JobId>,
         draining: bool,
         load_milli: Option<u64>,
         pack_store: PackStoreSaid,
@@ -2877,6 +2915,19 @@ impl State {
                 // ended — which is the throughput this change is trying not
                 // to cost.
                 let was_corrected = runner.it_said_it_is_holding.take().is_some();
+                // And the same reconciliation for the pairs, which is the
+                // one this report can really settle. A job the machine is
+                // still running is a job it names here, whatever this hub's
+                // records say the attempt number is; a job it has stopped
+                // running is a job it does not name, and that is the instant
+                // the place came free. So the exclusion is **kept** while it
+                // is named and dropped the moment it is not — never timed,
+                // never counted, and cleared by the machine's own word.
+                let held_before = runner.it_said_it_is_running_these.len();
+                runner
+                    .it_said_it_is_running_these
+                    .retain(|job_id| named.contains(job_id));
+                let a_place_came_free = runner.it_said_it_is_running_these.len() != held_before;
                 // A figure that could not be read this time does not erase
                 // the last one that could: an absent load is unknown, and the
                 // most recent figure the machine managed to give is still the
@@ -2890,7 +2941,7 @@ impl State {
                 // not a reading that failed, so the newest statement is the
                 // only true one. See [`ConnectedRunner::pack_store`].
                 runner.pack_store = pack_store;
-                was_corrected
+                was_corrected || a_place_came_free
             } else {
                 false
             }
@@ -2908,6 +2959,28 @@ impl State {
         self.with_peers(|peers| {
             if let Some(runner) = peers.runners.get_mut(name) {
                 runner.it_said_it_is_holding = Some(holding);
+            }
+        });
+    }
+
+    /// Record that a runner handed an assignment back because it is
+    /// **already running another attempt of that same job** (invariant 2).
+    ///
+    /// The count the refusal also carries is recorded beside this one and is
+    /// still true, and it is not enough on its own: it is a count the
+    /// machine refused *below*, so the hub's count-based admission reads it
+    /// as room. What stops the storm is this pair — the job waits for this
+    /// machine, nothing else about the machine changes — and what ends it is
+    /// the machine's next health report (see
+    /// [`ConnectedRunner::it_said_it_is_running_these`]).
+    ///
+    /// By name, and a no-op for a runner that is no longer registered, for
+    /// [`State::the_runner_says_it_is_holding`]'s reason: this is the relay
+    /// loop, and a refusal arriving as a link ends is the ordinary race.
+    fn the_runner_says_it_is_running(&self, name: &str, job_id: &JobId) {
+        self.with_peers(|peers| {
+            if let Some(runner) = peers.runners.get_mut(name) {
+                runner.it_said_it_is_running_these.insert(job_id.clone());
             }
         });
     }
@@ -5773,6 +5846,17 @@ async fn relay_from_runner(
                 // handed to — so each entry is judged before it is kept, and
                 // an entry about somebody else's attempt is refused by name
                 // rather than landing in the hub's picture of this runner.
+                //
+                // **Which is why what the report *named* is taken first.**
+                // The judgement below is about attempts and throws away the
+                // entries that are not this runner's to report on — among
+                // them the attempt the watchdog wrote off while the link was
+                // down, which the machine is still running. That entry is
+                // refused as superseded and is also the only evidence the
+                // hub gets that the place is still taken, so the set of job
+                // ids is read off the report whole, before any of it is
+                // judged (`State::record_health`).
+                let named: BTreeSet<JobId> = jobs.iter().map(|job| job.job_id.clone()).collect();
                 let mut its_own = Vec::new();
                 for job in jobs {
                     if mind_a_reported_job(state, name, outbox, &mut said, &job) {
@@ -5794,7 +5878,7 @@ async fn relay_from_runner(
                 // quiet fleet, the restatement cadence, which is a minute of
                 // a machine standing idle with work queued for it. The same
                 // shape as the switch below, and for the same reason.
-                if state.record_health(outbox, its_own, draining, load_milli, pack_store) {
+                if state.record_health(outbox, its_own, &named, draining, load_milli, pack_store) {
                     dispatch_queued_jobs(state)?;
                 }
                 // And the owner's switch, which rides on every report (E-33).
@@ -6267,6 +6351,7 @@ async fn relay_from_runner(
                 attempt,
                 reason,
                 at_its_ceiling,
+                still_running_attempt,
             } => {
                 if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
@@ -6289,6 +6374,31 @@ async fn relay_from_runner(
                     }
                     None => HowItEnded::TheRunnerWentAway,
                 };
+                // **And before the requeue too**, because the count above
+                // cannot stop this one. A machine that refused because it is
+                // already running another attempt of this job refused
+                // *below* the ceiling it announced — the ceiling branch
+                // answers first whenever `running >= most_at_once` — so the
+                // figure it just gave reads as room, the seat stays
+                // admissible, and the pass at the end of this arm places the
+                // same job on the same machine again. That is the storm the
+                // first consumer measured: attempts 2 to 9 of `j0000000655`
+                // between 20:28:37.160Z and 20:28:37.671Z, eight refusals in
+                // 0.51 s, and then `refused_as_full`, exit 125, no verdict
+                // (2026-10-31, v1.0.0).
+                //
+                // So the pair is excluded and the job **waits** for the place
+                // it is already in. Said out loud as well, because an
+                // operator watching a queue has to be able to see why one job
+                // is not being placed on a machine that is taking others.
+                if let Some(held) = still_running_attempt {
+                    state.the_runner_says_it_is_running(name, &job_id);
+                    println!(
+                        "herd-hub: {name} is still running attempt {held} of {job_id}, so it is \
+                         offered no further attempt of it until a health report of its own \
+                         stops naming it; every other job is placed there as before"
+                    );
+                }
                 if let Err(error) = give_the_job_another_go(state, &job_id, attempt, &reason, how) {
                     eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
                 }

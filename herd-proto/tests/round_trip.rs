@@ -893,9 +893,56 @@ fn the_link_frames_are_tagged_json_objects() {
             attempt: 1,
             reason: "the runner was asked to stop".to_owned(),
             at_its_ceiling: None,
+            still_running_attempt: None,
         })
         .expect("encodes"),
         r#"{"type":"attempt_abandoned","job_id":"j1","attempt":1,"reason":"the runner was asked to stop"}"#
+    );
+    // **The two refusals about a machine's own bookkeeping, told apart by
+    // the fields alone.** Both carry the count; only the second says which
+    // attempt of this very job is in the way, and a hub reads which refusal
+    // it got off these keys and never out of the sentence. Pinned as bytes
+    // because that is what crosses between two builds: a machine at its own
+    // announced ceiling sends no `still_running_attempt` key at all, which
+    // is what its absence has always meant.
+    assert_eq!(
+        to_frame(&ToHub::AttemptAbandoned {
+            job_id: JobId::new("j1"),
+            attempt: 2,
+            reason: "the runner is already running 2 job(s) and never started this job".to_owned(),
+            at_its_ceiling: Some(2),
+            still_running_attempt: None,
+        })
+        .expect("encodes"),
+        r#"{"type":"attempt_abandoned","job_id":"j1","attempt":2,"reason":"the runner is already running 2 job(s) and never started this job","at_its_ceiling":2}"#
+    );
+    assert_eq!(
+        to_frame(&ToHub::AttemptAbandoned {
+            job_id: JobId::new("j1"),
+            attempt: 2,
+            reason: "the runner is still running attempt 1 of this job".to_owned(),
+            at_its_ceiling: Some(1),
+            still_running_attempt: Some(1),
+        })
+        .expect("encodes"),
+        r#"{"type":"attempt_abandoned","job_id":"j1","attempt":2,"reason":"the runner is still running attempt 1 of this job","at_its_ceiling":1,"still_running_attempt":1}"#
+    );
+    // And the frame an **older runner** sends: no key, and a hub on this
+    // version reads `None`, which is "not a refusal for a second attempt of
+    // this job" and is the behaviour every abandonment had before the field
+    // existed. This is the whole of why neither version number moves.
+    assert_eq!(
+        from_frame::<ToHub>(
+            r#"{"type":"attempt_abandoned","job_id":"j1","attempt":2,"reason":"full","at_its_ceiling":1}"#
+        )
+        .expect("an older runner's frame reads"),
+        ToHub::AttemptAbandoned {
+            job_id: JobId::new("j1"),
+            attempt: 2,
+            reason: "full".to_owned(),
+            at_its_ceiling: Some(1),
+            still_running_attempt: None,
+        }
     );
     assert_eq!(
         to_frame(&FromHub::StandBy {
@@ -1105,6 +1152,14 @@ fn every_link_frame_round_trips() {
         attempt: 1,
         reason: String::new(),
         at_its_ceiling: None,
+        still_running_attempt: None,
+    });
+    round_trip_to_hub(ToHub::AttemptAbandoned {
+        job_id: JobId::new("j1"),
+        attempt: 2,
+        reason: "one machine runs one job once".to_owned(),
+        at_its_ceiling: Some(1),
+        still_running_attempt: Some(1),
     });
     round_trip_from_hub(FromHub::HealthRecorded {});
     round_trip_from_hub(FromHub::StillThere {

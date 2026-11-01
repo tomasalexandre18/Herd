@@ -814,6 +814,101 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
             "the sum's sentence must not become a substring of an existing one: {said}"
         );
     }
+    // ---------------------------------------------------------------------
+    // And the fourth clause: the machine already running another attempt of
+    // this very job.
+    // ---------------------------------------------------------------------
+    //
+    // The one of the four that is **not** arithmetic about a machine's size,
+    // and the one whose attribution the oracle in this file cannot perform:
+    // [`ceiling_refusals`] counts the clause above, and this sentence does
+    // not carry it — which is exactly why a green suite and a job dead with
+    // no verdict were both true on 2026-10-31. Its own oracle is in
+    // `herd-hub/tests/one_machine_runs_one_job_once.rs`, and what is
+    // asserted here is only that the four cannot be mistaken for one
+    // another.
+    // **Five clauses now, not four, and the fifth is the hub's.** The hub
+    // holds a job back on a `waiting` line while the place is taken by an
+    // attempt of that same job, and the runner refuses inside an
+    // `attempt_ended` line that charged one of the job's budgets. That is
+    // the same runner-versus-hub pair as the ceiling above, so it gets the
+    // same treatment: separate clauses, neither sentence carrying the
+    // other's. The first draft of this branch gave the hub's sentence the
+    // runner's clause verbatim, which is how this block came to exist.
+    let second_clause = herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT;
+    let hubs_second_clause = herd_hub::matcher::A_SECOND_ATTEMPT_OF_ITS_OWN;
+    let the_others = [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's ceiling", THE_HUBS_CEILING_SENTENCE),
+        ("the sum's", sum_clause),
+    ];
+    for (name, clause) in the_others {
+        for (mine, which) in [
+            (second_clause, "the runner's second-attempt"),
+            (hubs_second_clause, "the hub's second-attempt"),
+        ] {
+            assert!(
+                !mine.contains(clause) && !clause.contains(mine),
+                "neither {name} clause may be a substring of {which} clause, or the five \
+                 cannot be told apart: {clause:?} and {mine:?}"
+            );
+        }
+    }
+    assert!(
+        !second_clause.contains(hubs_second_clause) && !hubs_second_clause.contains(second_clause),
+        "and the two clauses about this one refusal are the pair that matters most: a \
+         reader who cannot tell them apart cannot tell a job waiting, which costs it \
+         nothing, from a go spent. {second_clause:?} and {hubs_second_clause:?}"
+    );
+    // And the sentences as they are really built. The runner's must carry its
+    // own clause and none of the other four: a refusal below the announced
+    // ceiling that read as a machine at its ceiling is the conflation this
+    // whole branch is about.
+    let second_said = herd_runner::testing::a_refusal_for_a_second_attempt();
+    assert!(
+        second_said.contains(second_clause),
+        "the sentence has to be attributable to the refusal it is: {second_said}"
+    );
+    // The hub's, built the way `admission` builds it — the same copy-of-the-
+    // shape, same-constant compromise `hub_said` above is, and for the same
+    // reason: what the matching turns on is the constant.
+    let hub_said_second = format!(
+        "capped-runner is {hubs_second_clause} j0000000001 — the place this attempt needs \
+         is the place that one is in"
+    );
+    for (name, clause) in [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's ceiling", THE_HUBS_CEILING_SENTENCE),
+        ("the sum's", sum_clause),
+        ("the hub's own second-attempt", hubs_second_clause),
+    ] {
+        assert!(
+            !second_said.contains(clause),
+            "and the runner's sentence must not carry {name} clause: {second_said}"
+        );
+    }
+    for (name, clause) in [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's ceiling", THE_HUBS_CEILING_SENTENCE),
+        ("the sum's", sum_clause),
+        ("the runner's own second-attempt", second_clause),
+    ] {
+        assert!(
+            !hub_said_second.contains(clause),
+            "and the hub's sentence must not carry {name} clause: {hub_said_second}"
+        );
+    }
+    for said in [&runner_said, &silent_said, &hub_said, &sum_said] {
+        for (mine, which) in [
+            (second_clause, "the runner's second-attempt"),
+            (hubs_second_clause, "the hub's second-attempt"),
+        ] {
+            assert!(
+                !said.contains(mine),
+                "and no older sentence may acquire {which} clause: {said}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
