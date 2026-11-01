@@ -405,10 +405,12 @@ Five things a reader must not mistake for done:
    is no migration path the last two destroy an existing state root as
    a working root. The sentence this replaces also said the ordinary
    release before v1.0.0 ships at layout 1 and record 1: no release cut
-   from `main` can now do that. **What followed for the release is
-   settled: the next tag is v1.0.0** (D212), so there is no ordinary
-   release before it for that sentence to bind — D243 ruled the
-   constraint moot rather than open, and ORCH-156 is closed as caduque.
+   from `main` can now do that. **What followed for the release was
+   settled and has happened: the tag after v0.4.1 was v1.0.0** (D212),
+   so there was no ordinary release before it for that sentence to bind
+   — D243 ruled the constraint moot rather than open, and ORCH-156 is
+   closed as caduque. **v1.1.0 is cut with all three unmoved**, 3, 2
+   and 2, so it is the first release since v0.4.1 that resets nothing.
 
 ## Musts per milestone
 
