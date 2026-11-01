@@ -389,32 +389,22 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     );
     println!("what a queued job is told behind a full machine:\n  {one}");
 
-    // And no `events.jsonl` line anywhere in this run is of a kind an older
-    // hub could not read. `JobEventKind` is `#[serde(tag = "event")]` with no
-    // `#[serde(other)]`, so this is not a style check: a kind outside this
-    // set would make the whole file undecodable to a hub rolled back.
-    let known: BTreeSet<&str> = [
-        "transition",
-        "attempt_started",
-        "attempt_ended",
-        "log_gap",
-        "joined",
-        "priority_raised",
-        "waiting",
-        "outputs_removed",
-    ]
-    .into_iter()
-    .collect();
-    for id in &submitted {
-        for event in events_of(&state_dir, id) {
-            let kind = event["event"].as_str().expect("every line names its kind");
-            assert!(
-                known.contains(kind),
-                "{id} recorded a {kind:?} line: a new JobEventKind variant makes events.jsonl \
-                 unreadable to an earlier hub, which is outside what D181 approved"
-            );
-        }
-    }
+    // What used to be here: a hand-written list of the **eight** event kinds
+    // an older hub could read, asserted over this scenario's own jobs.
+    //
+    // It is gone because it did not bind, and the tree proved that on
+    // 2026-10-31: `collection_short` landed as the **ninth** kind and this
+    // test stayed green, because the list was only ever checked against the
+    // lines the jobs *this* scenario submits happen to produce. An
+    // enumeration a new variant does not have to appear in is a control
+    // silent on the defect it was built for.
+    //
+    // The binding detector is `herd-hub/src/store/frozen_events.rs`: every
+    // kind's line frozen byte for byte, reached through an exhaustive
+    // `match` over `JobEventKind`, so a tenth variant is a compile error
+    // rather than a scenario nobody ran. That it has to live inside the
+    // crate — `EventLine` is private — is why it could not simply be moved
+    // here.
 
     running.abort();
     let _ = running.await;

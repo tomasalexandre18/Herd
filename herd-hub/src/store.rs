@@ -3732,6 +3732,13 @@ fn raise_in_place(record: &mut JobRecord, to: Priority, at: Timestamp) -> Raise 
 #[cfg(test)]
 mod ordering_oracle;
 
+/// `events.jsonl`'s nine kinds of line, frozen as literal text, with an
+/// exhaustive match that makes a tenth kind a compile error. Its own file
+/// for the oracle's reason, and inside the crate because [`EventLine`] and
+/// [`JobDirStore::event_line`] are private to this module.
+#[cfg(test)]
+mod frozen_events;
+
 #[cfg(test)]
 mod tests {
     use super::*;
