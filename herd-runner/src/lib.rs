@@ -469,6 +469,28 @@ impl std::fmt::Display for StandBy {
 
 impl std::error::Error for StandBy {}
 
+/// The clause that marks a sentence as **this runner refusing a second
+/// attempt of a job it is still running**: one machine runs one job once.
+///
+/// A clause of its own, and a fourth beside the three in [`confine`] —
+/// [`A_RUNNERS_OWN_CEILING`], [`A_RUNNERS_OWN_MEMORY_SUM`] and the hub's
+/// `herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED` — for the reason
+/// those three are three: attribution has to be decidable from the words
+/// alone, and the three about *room* cannot say this one. They are
+/// arithmetic about a machine's size; this one is about **which job**, and
+/// the two have opposite dynamics (`herd_proto::ToHub::AttemptAbandoned`'s
+/// `at_its_ceiling`). A reader of an `attempt_ended` line who cannot tell
+/// them apart cannot tell a machine that is full from a hub whose records
+/// ran ahead of the machine.
+///
+/// **Taken from here by the sentence itself**, so the two cannot drift: the
+/// clause is interpolated into [`NotTaken::sentence`] rather than written
+/// beside it, and a test matching on it matches what a runner really says.
+/// No one of the four clauses is a substring of another, which
+/// `herd-hub/tests/announced_job_ceiling.rs` asserts against the sentences
+/// as they are really built.
+pub const A_RUNNERS_OWN_SECOND_ATTEMPT: &str = "one machine runs one job once";
+
 /// Why this runner would not take a job the hub assigned it.
 ///
 /// Every one of these becomes a `ToHub::AttemptAbandoned` and nothing else:
@@ -606,7 +628,7 @@ impl NotTaken {
             ),
             NotTaken::StillRunningThisJob { held, running, .. } => format!(
                 "the runner is still running attempt {held} of this job and never started this \
-                 one: one machine runs one job once, so the place this attempt would need is \
+                 one: {A_RUNNERS_OWN_SECOND_ATTEMPT}, so the place this attempt would need is \
                  the place the job it is a second go at is already in. It is holding \
                  {running} job(s)"
             ),
@@ -2945,7 +2967,7 @@ impl Session {
     /// Nothing is held afterwards: the runner is not keeping a result, it is
     /// saying there is none. The hub decides what becomes of the job.
     pub(crate) fn abandon(&self, job_id: &JobId, attempt: u32, reason: &str) {
-        self.give_it_back(job_id, attempt, reason, None)
+        self.give_it_back(job_id, attempt, reason, None, None)
     }
 
     /// Give an attempt back because **this machine is already as full as it
@@ -2968,6 +2990,38 @@ impl Session {
             attempt,
             reason,
             Some(u32::try_from(running).unwrap_or(u32::MAX)),
+            None,
+        )
+    }
+
+    /// Give an attempt back because **this machine is already running
+    /// another attempt of this very job** (invariant 2, one machine runs one
+    /// job once).
+    ///
+    /// The same frame again, and one field more than
+    /// [`Session::abandon_at_its_ceiling`]: which attempt is in the way. The
+    /// machine's own count travels too and is still true — it is holding
+    /// `running` jobs, and the hub's records may well say otherwise — but it
+    /// is not what refused this assignment, and a hub that read only the
+    /// count would hold this refusal against a ceiling the machine has not
+    /// reached. That is the figure this runner refused *below*, which is why
+    /// the hub's count-based throttle cannot see this refusal at all and why
+    /// `herd_proto::ToHub::AttemptAbandoned`'s `still_running_attempt`
+    /// exists.
+    pub(crate) fn abandon_still_running_this_job(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        reason: &str,
+        running: usize,
+        held: u32,
+    ) {
+        self.give_it_back(
+            job_id,
+            attempt,
+            reason,
+            Some(u32::try_from(running).unwrap_or(u32::MAX)),
+            Some(held),
         )
     }
 
@@ -2977,6 +3031,7 @@ impl Session {
         attempt: u32,
         reason: &str,
         at_its_ceiling: Option<u32>,
+        still_running_attempt: Option<u32>,
     ) {
         self.with(|inner| {
             // **This attempt's entry, and only this attempt's.** Giving one
@@ -2993,6 +3048,7 @@ impl Session {
                     attempt,
                     reason: reason.to_owned(),
                     at_its_ceiling,
+                    still_running_attempt,
                 },
             );
         });

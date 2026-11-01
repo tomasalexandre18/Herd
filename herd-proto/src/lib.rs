@@ -1762,9 +1762,34 @@ pub enum ToHub {
         /// count of what it holds is why it refused** (D182, invariant 2).
         ///
         /// Two refusals say it: the ceiling the runner announced, and a job
-        /// it is already running another attempt of. Both are the same fact
-        /// — this machine has no place for this assignment, by its own
-        /// bookkeeping — and both carry the same consequence.
+        /// it is already running another attempt of. **They are the same
+        /// fact and they do not carry the same consequence**, and the
+        /// difference was measured rather than argued.
+        ///
+        /// The fact is one — this machine has no place for this assignment,
+        /// by its own bookkeeping — so both are counted here and neither
+        /// spends one of the goes E-21 keeps for a machine that went away.
+        /// What differs is the **rate**, and the hub's one throttle for this
+        /// shape is a count. A ceiling refusal reports `holding == most`,
+        /// and the hub's count-based admission holds the job back on that
+        /// figure, so nothing more is offered to that machine until its next
+        /// health report squares the two counts: self-limiting, which is the
+        /// behaviour D182 was written around. A refusal for a second attempt
+        /// of one job reports `holding < most` **by construction** —
+        /// `herd_runner::Session::take_job` answers the ceiling first
+        /// whenever `running >= most_at_once`, so that branch is reachable
+        /// only *below* the announced count — so the same guard is
+        /// guaranteed inert exactly where the refusal is guaranteed to
+        /// repeat. Measured on the first consumer's instance on 2026-10-31,
+        /// v1.0.0: holding 1 of 2, eight refusals in 0.51 s, and a job that
+        /// ended `refused_as_full`, exit 125, with no verdict, for work no
+        /// machine had failed at.
+        ///
+        /// So the two are told apart on the wire by `still_running_attempt`
+        /// below, and what the hub does about the second is exclude that one
+        /// `(job, runner)` pair until the machine stops naming the job in
+        /// its health reports. Not a second budget: this field's own bound
+        /// is already that, and the rate is what was missing.
         ///
         /// `None` on every other abandonment — a drain, a withdrawn switch, a
         /// command line that will not do, an attempt the hub wrote off — and
@@ -1793,6 +1818,51 @@ pub enum ToHub {
         /// field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at_its_ceiling: Option<u32>,
+        /// Which attempt of **this very job** the runner is still running,
+        /// when that is why it refused: one machine runs one job once
+        /// (invariant 2).
+        ///
+        /// The field that tells the two refusals above apart. Both say "no
+        /// place", both carry `at_its_ceiling`, and the hub cannot read
+        /// which of the two it got off the `reason`, which is prose for a
+        /// person. It has to be said in a field — and in *this* field rather
+        /// than inferred from `at_its_ceiling` being under the ceiling the
+        /// machine announced, because that ceiling reached the hub on a
+        /// different frame, at a different moment, and sometimes from a
+        /// different process of the same runner.
+        ///
+        /// What the hub does with it is refuse to offer **that job** to
+        /// **that machine** again while the machine's health reports still
+        /// name it. The place is genuinely taken and it will genuinely come
+        /// free, so the job waits rather than being handed back and forth at
+        /// the speed of the queue: the surplus the hub's records did not know
+        /// about is the machine's own word, and the reconciliation is the
+        /// health report that lists what it is really holding.
+        ///
+        /// **The attempt number rather than a flag**, for the reason the
+        /// count above is a count and not a flag: it is the one thing that
+        /// says *which* place is taken. A machine refusing attempt 2 because
+        /// it is still running attempt 1 is a hub whose records ran ahead of
+        /// the machine, which is ordinary after an outage; a machine
+        /// refusing attempt 2 because it is still running attempt 2 would be
+        /// a hub that offered one attempt twice, which is a different defect
+        /// and must not read as this one. Never zero: attempts are numbered
+        /// from one.
+        ///
+        /// `None` on every other abandonment, which is exactly what its
+        /// absence has always meant — no abandonment before this field
+        /// existed was a second attempt of a job the machine was already
+        /// running. Additive, and both version numbers stay where they are:
+        /// `#[serde(default)]` on an existing variant, with `None` meaning
+        /// what its absence says, is the one shape [`PROTOCOL_VERSION`]'s own
+        /// rule lets through, and it is the condition D181 and D182 shipped
+        /// under (asserted in `herd-hub/tests/announced_job_ceiling.rs`). An
+        /// older hub drops the key and reads the ceiling refusal it always
+        /// read, which is today's behaviour and today's defect; an older
+        /// runner sends no key and a hub on this version reads `None`, which
+        /// is "not a refusal for a second attempt of this job".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        still_running_attempt: Option<u32>,
     },
     /// Requester asks for a job to be cancelled (E-06).
     ///

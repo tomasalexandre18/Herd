@@ -814,6 +814,57 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
             "the sum's sentence must not become a substring of an existing one: {said}"
         );
     }
+    // ---------------------------------------------------------------------
+    // And the fourth clause: the machine already running another attempt of
+    // this very job.
+    // ---------------------------------------------------------------------
+    //
+    // The one of the four that is **not** arithmetic about a machine's size,
+    // and the one whose attribution the oracle in this file cannot perform:
+    // [`ceiling_refusals`] counts the clause above, and this sentence does
+    // not carry it — which is exactly why a green suite and a job dead with
+    // no verdict were both true on 2026-10-31. Its own oracle is in
+    // `herd-hub/tests/one_machine_runs_one_job_once.rs`, and what is
+    // asserted here is only that the four cannot be mistaken for one
+    // another.
+    let second_clause = herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT;
+    for (name, clause) in [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's", THE_HUBS_CEILING_SENTENCE),
+        ("the sum's", sum_clause),
+    ] {
+        assert!(
+            !second_clause.contains(clause) && !clause.contains(second_clause),
+            "neither {name} clause may be a substring of this one, or the four cannot be \
+             told apart: {clause:?} and {second_clause:?}"
+        );
+    }
+    // And the sentence as it is really built. It must carry its own clause
+    // and **not** the other three: a refusal below the announced ceiling that
+    // read as a machine at its ceiling is the conflation this whole branch is
+    // about, and a reader who cannot tell them apart cannot tell a machine
+    // that is full from a hub whose records ran ahead of the machine.
+    let second_said = herd_runner::testing::a_refusal_for_a_second_attempt();
+    assert!(
+        second_said.contains(second_clause),
+        "the sentence has to be attributable to the refusal it is: {second_said}"
+    );
+    for (name, clause) in [
+        ("the runner's count", THE_RUNNERS_CEILING_SENTENCE),
+        ("the hub's", THE_HUBS_CEILING_SENTENCE),
+        ("the sum's", sum_clause),
+    ] {
+        assert!(
+            !second_said.contains(clause),
+            "and it must not carry {name} clause: {second_said}"
+        );
+    }
+    for said in [&runner_said, &silent_said, &hub_said, &sum_said] {
+        assert!(
+            !said.contains(second_clause),
+            "and no other sentence may acquire this clause: {said}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -243,15 +243,24 @@ pub async fn execute(
         // that. The other two refusals are about this runner going away —
         // draining, or withdrawn by its owner — and are counted as they
         // always were.
-        Err(
-            not_taken @ (NotTaken::AtItsCeiling { .. }
-            | NotTaken::PastItsMemorySum { .. }
-            | NotTaken::StillRunningThisJob { .. }),
-        ) => {
+        //
+        // **And which of the two counts it was, in a field of its own.** The
+        // third refusal here is not a machine at its ceiling: it is a machine
+        // already running another attempt of this very job, which `take_job`
+        // can only answer *below* the ceiling it announced — the ceiling
+        // branch answers first whenever `running >= most_at_once`. So the
+        // count it reports is one the hub's own count-based throttle reads as
+        // room, and the hub placed the same job on the same machine again at
+        // the speed of its queue: eight times in 0.51 s on the first
+        // consumer's instance, until the refusals ran the budget out and a
+        // job no machine had failed at ended `refused_as_full` with no
+        // verdict (2026-10-31, v1.0.0, `j0000000655`). It is said in a field
+        // rather than left in the sentence for the reason the count is: the
+        // reason is prose for a person, and a hub may not parse it.
+        Err(not_taken @ (NotTaken::AtItsCeiling { .. } | NotTaken::PastItsMemorySum { .. })) => {
             let running = match not_taken {
                 NotTaken::AtItsCeiling { running, .. }
-                | NotTaken::PastItsMemorySum { running, .. }
-                | NotTaken::StillRunningThisJob { running, .. } => running,
+                | NotTaken::PastItsMemorySum { running, .. } => running,
                 _ => unreachable!("the pattern above admits nothing else"),
             };
             session.abandon_at_its_ceiling(
@@ -259,6 +268,20 @@ pub async fn execute(
                 attempt,
                 &not_taken.sentence(&ceiling),
                 running,
+            );
+            return;
+        }
+        Err(not_taken @ NotTaken::StillRunningThisJob { .. }) => {
+            let (held, running) = match not_taken {
+                NotTaken::StillRunningThisJob { held, running, .. } => (held, running),
+                _ => unreachable!("the pattern above admits nothing else"),
+            };
+            session.abandon_still_running_this_job(
+                &job_id,
+                attempt,
+                &not_taken.sentence(&ceiling),
+                running,
+                held,
             );
             return;
         }

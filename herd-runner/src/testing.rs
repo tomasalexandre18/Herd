@@ -200,6 +200,35 @@ pub fn source_files() -> Vec<(PathBuf, String)> {
 /// uses — a host lending 8 GiB, keeping 1 GiB, capping a job at 7 GiB — so
 /// the sentence under test is a sentence a real machine of that size really
 /// says.
+/// The sentence a refusal for **a second attempt of a job this machine is
+/// already running** really carries, built the way `Session::take_job`
+/// builds it.
+///
+/// Here for [`a_refusal_for_the_memory_sum`]'s reason, and for one more:
+/// this is the fourth sentence about a place on a machine that reaches an
+/// `attempt_ended` line, and it is the only one that is not arithmetic. A
+/// hub-side test asserting that the four cannot be mistaken for one another
+/// (`herd-hub/tests/announced_job_ceiling.rs`) has to read it as it is
+/// built, because a copy of its words would go on agreeing with itself
+/// after the sentence had changed.
+///
+/// The figures are the first consumer's own, 2026-10-31: a machine that
+/// announced two places, holding one — attempt 1 of the job whose attempt 2
+/// the hub has just offered it. **Holding under what it announced is not a
+/// detail of the example**: the ceiling branch answers first whenever
+/// `running >= most_at_once`, so this refusal cannot be reached any other
+/// way.
+pub fn a_refusal_for_a_second_attempt() -> String {
+    let host = herd_proto::HostSize::new(Some(14336), Some(12)).with_floor(Some(6144));
+    let ceiling = crate::confine::jobs_at_once(&host, 7168 << 20);
+    crate::NotTaken::StillRunningThisJob {
+        held: 1,
+        running: 1,
+        most: 2,
+    }
+    .sentence(&ceiling)
+}
+
 pub fn a_refusal_for_the_memory_sum() -> String {
     let host = herd_proto::HostSize::new(Some(8192), Some(8)).with_floor(Some(1024));
     let ceiling = crate::confine::jobs_at_once(&host, 7168 << 20);

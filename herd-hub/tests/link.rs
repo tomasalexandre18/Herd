@@ -2101,6 +2101,7 @@ async fn a_declared_command_is_handed_over_whole_on_every_attempt() {
             attempt,
             reason: "this runner is draining".to_owned(),
             at_its_ceiling: None,
+            still_running_attempt: None,
         })
         .await;
     let second = loop {
