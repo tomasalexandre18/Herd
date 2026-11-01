@@ -359,6 +359,32 @@ pub const READINGS_AT_ONCE: u32 = 2;
 /// cannot be lost by an edit to either wording.
 pub const A_CEILING_THE_RUNNER_ANNOUNCED: &str = "it said it holds at most";
 
+/// The clause that marks a sentence as **the hub holding a job back because
+/// the machine it would go to is already running another attempt of it** —
+/// again the hub's words, and again not the runner's.
+///
+/// The third member of the pair above, and here for its reason rather than
+/// as a convenience: `herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT` is what the
+/// **runner** says when it refuses that assignment, inside an
+/// `attempt_ended` line that charged one of the job's budgets, and this is
+/// what the **hub** says on a `waiting` line that charged it nothing.
+/// Neither carries the other's words. The first draft of this branch gave
+/// the hub's sentence the runner's clause verbatim, and a review read it for
+/// what it was: `herd-runner` is only a `[dev-dependencies]` of `herd-hub`,
+/// so nothing in a release build links the two, and a rename on one side
+/// would have left this module and its own unit test agreeing with each
+/// other and with nothing else.
+///
+/// **What is asserted and what is not.** That no two of the clauses are
+/// substrings of one another, and that each sentence carries its own and not
+/// its neighbours', is asserted in
+/// `herd-hub/tests/announced_job_ceiling.rs` over the sentences as they are
+/// really built — on the runner's side through
+/// `herd_runner::testing`, which is why that crate is a dev-dependency at
+/// all. What no gate can assert is the **cross-crate** link, because there
+/// is none: a test binary is the only place both crates exist at once.
+pub const A_SECOND_ATTEMPT_OF_ITS_OWN: &str = "already running another attempt of";
+
 /// What the claim step needs beyond the record and the fleet.
 ///
 /// A struct rather than three more arguments, and with a [`Default`], so that
@@ -880,11 +906,20 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
     // it ends, which is the one shape E-31's "short is never a failure" is
     // about. The exclusion is lifted by that machine's own next health
     // report, not by a clock here.
+    //
+    // **The sentence deliberately does not carry the runner's own clause for
+    // this refusal** (`herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT`), for the
+    // reason [`A_CEILING_THE_RUNNER_ANNOUNCED`] does not carry the runner's
+    // ceiling clause: a line the hub writes while a job **waits** costs that
+    // job nothing, and a line the runner wrote inside an `attempt_ended`
+    // spent one of its budgets. A reader who cannot tell them apart cannot
+    // tell those two states apart, and this clause had the words in it until
+    // it was read for exactly that.
     if seat.it_said_it_is_running_these.contains(&record.id) {
         return Admission::ShortNow(format!(
-            "{} is already running another attempt of {}, and one machine runs one job once: \
-             the place this attempt needs is the place that one is in, so it waits here until \
-             that machine's next health report stops naming it",
+            "{} is {A_SECOND_ATTEMPT_OF_ITS_OWN} {} — the place this attempt needs is the \
+             place that one is in, so it waits here until that machine's next health report \
+             stops naming it",
             seat.name, record.id
         ));
     }
@@ -4934,13 +4969,14 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("already running another attempt of j0"),
-            "the pair is what refuses this placement, and the sentence has to say so: {why}"
+            why.contains(&format!("{A_SECOND_ATTEMPT_OF_ITS_OWN} j0")),
+            "the pair is what refuses this placement, and the sentence has to say so, in \
+             the hub's own clause for it: {why}"
         );
         assert!(
-            why.contains("one machine runs one job once"),
-            "and name the invariant it is holding, which is the thing an operator looks up: \
-             {why}"
+            !why.contains(herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT),
+            "and it must not carry the **runner's** clause for the same refusal: this line \
+             is a job waiting, which costs it nothing, and that one is a go spent. {why}"
         );
         assert!(
             !why.contains("job(s) already out there and it said it holds at most"),

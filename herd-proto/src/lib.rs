@@ -1788,8 +1788,17 @@ pub enum ToHub {
         /// So the two are told apart on the wire by `still_running_attempt`
         /// below, and what the hub does about the second is exclude that one
         /// `(job, runner)` pair until the machine stops naming the job in
-        /// its health reports. Not a second budget: this field's own bound
-        /// is already that, and the rate is what was missing.
+        /// its health reports.
+        ///
+        /// **And no second budget, which also means the refusal is not
+        /// free.** A refusal for a second attempt of one job still carries
+        /// this field, so the hub still charges it to
+        /// `herd_hub::CEILING_REFUSALS_ALLOWED` — eight — and at the eighth
+        /// the job still ends `JobOutcome::RefusedAsFull` with no verdict.
+        /// What the exclusion bounds is the **rate** and not the total: one
+        /// such refusal per connection, because the exclusion lives on the
+        /// connection and a redial re-arms it. Eight redials during one long
+        /// attempt still reach the bound; 0.51 s of them no longer can.
         ///
         /// `None` on every other abandonment — a drain, a withdrawn switch, a
         /// command line that will not do, an attempt the hub wrote off — and
@@ -1849,18 +1858,34 @@ pub enum ToHub {
         /// and must not read as this one. Never zero: attempts are numbered
         /// from one.
         ///
-        /// `None` on every other abandonment, which is exactly what its
-        /// absence has always meant — no abandonment before this field
-        /// existed was a second attempt of a job the machine was already
-        /// running. Additive, and both version numbers stay where they are:
-        /// `#[serde(default)]` on an existing variant, with `None` meaning
-        /// what its absence says, is the one shape [`PROTOCOL_VERSION`]'s own
-        /// rule lets through, and it is the condition D181 and D182 shipped
-        /// under (asserted in `herd-hub/tests/announced_job_ceiling.rs`). An
-        /// older hub drops the key and reads the ceiling refusal it always
-        /// read, which is today's behaviour and today's defect; an older
-        /// runner sends no key and a hub on this version reads `None`, which
-        /// is "not a refusal for a second attempt of this job".
+        /// **`None` is "this runner did not say which refusal it was"**, and
+        /// that wording is load-bearing. It is tempting to read it as "not a
+        /// refusal for a second attempt of this job", and for every
+        /// abandonment *this* build sends that is true — but it is **false**
+        /// for an un-upgraded v1.0.0 runner, which refuses exactly that way
+        /// and sends no key, because `herd_runner` put both refusals in one
+        /// match arm. D182's `at_its_ceiling` escaped this cleanly: before
+        /// it, no abandonment carried any count at all, so its `None` was
+        /// true of every frame ever sent. This one is an absence of
+        /// testimony, not a denial.
+        ///
+        /// Additive all the same, and both version numbers stay where they
+        /// are. [`PROTOCOL_VERSION`]'s rule asks that the absence mean what
+        /// the default says, and "the runner said nothing about this" is
+        /// what `None` says and what an older runner's silence means; what a
+        /// hub then *does* with that silence is the behaviour it had before
+        /// the field existed, which is the misread degrading to today's
+        /// defect and nothing worse. The condition is D181's and D182's,
+        /// asserted in `herd-hub/tests/announced_job_ceiling.rs`.
+        ///
+        /// **So the upgrade order is runner first, and a hub deployed alone
+        /// fixes nothing.** An upgraded hub beside un-upgraded runners
+        /// receives no `still_running_attempt` from any of them, excludes no
+        /// pair, and offers the job back exactly as it does today — the
+        /// reverse of D181, whose order was hub first. The cost is named
+        /// rather than softened: until every runner that might refuse this
+        /// way is rebuilt, the storm this field exists to stop is still
+        /// reachable on that fleet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         still_running_attempt: Option<u32>,
     },

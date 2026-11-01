@@ -483,12 +483,28 @@ impl std::error::Error for StandBy {}
 /// them apart cannot tell a machine that is full from a hub whose records
 /// ran ahead of the machine.
 ///
-/// **Taken from here by the sentence itself**, so the two cannot drift: the
-/// clause is interpolated into [`NotTaken::sentence`] rather than written
-/// beside it, and a test matching on it matches what a runner really says.
-/// No one of the four clauses is a substring of another, which
-/// `herd-hub/tests/announced_job_ceiling.rs` asserts against the sentences
-/// as they are really built.
+/// **Taken from here by the sentence itself**, so these two cannot drift:
+/// the clause is interpolated into [`NotTaken::sentence`] rather than
+/// written beside it, and a test matching on it matches what a runner really
+/// says.
+///
+/// **And the hub has a sentence of its own about the same pair** — it holds
+/// the job back on a `waiting` line while the place is taken
+/// (`herd_hub::matcher::A_SECOND_ATTEMPT_OF_ITS_OWN`) — which deliberately
+/// does **not** carry this clause, for the reason
+/// [`A_RUNNERS_OWN_CEILING`]'s doc gives about its own pair: a line the hub
+/// writes costs the job nothing, and this one was written inside an
+/// `attempt_ended` that charged one of its budgets.
+///
+/// **What is asserted, exactly.** `herd-hub/tests/announced_job_ceiling.rs`
+/// asserts that no one of the clauses is a substring of another and that
+/// each sentence carries its own and not its neighbours', over the
+/// sentences as they are really built — the runner's through
+/// [`testing::a_refusal_for_a_second_attempt`]. What **no** gate asserts is
+/// the link between the two crates: `herd-runner` is only a
+/// `[dev-dependencies]` of `herd-hub`, so a test binary is the only place
+/// both constants exist at once, and nothing in a release build would notice
+/// one of them being renamed.
 pub const A_RUNNERS_OWN_SECOND_ATTEMPT: &str = "one machine runs one job once";
 
 /// Why this runner would not take a job the hub assigned it.

@@ -70,13 +70,16 @@ type Link =
 const RUNNER: &str = "a-machine-that-is-already-running-it";
 const ONE_LIFE: &str = "the-process-that-kept-the-written-off-attempt";
 
-/// The machine the first consumer ran: 20 GiB lent, 6 GiB kept as its own
-/// floor, 14 GiB usable, **two** places.
+/// The machine the first consumer ran: **20 GiB lent**, 6 GiB kept as its own
+/// floor, so 14 GiB usable, and **two** places at the 7 GiB it caps a job at.
 ///
 /// Declared rather than read off whatever host the suite runs on, and the two
 /// places are the figure the whole defect turns on: the refusal under test is
-/// answered at *one* of them.
-const LENT_MIB: u64 = 14 * 1024;
+/// answered at *one* of them. `LENT_MIB` is the figure the machine **lends**
+/// and not the figure left after its floor — an earlier draft of this file
+/// held 14 GiB here while the paragraph said 20, which is the same number
+/// meaning two different things in one declaration.
+const LENT_MIB: u64 = 20 * 1024;
 const FLOOR_MIB: u64 = 6 * 1024;
 const PLACES: u32 = 2;
 
@@ -252,10 +255,23 @@ fn refusals_for_a_second_attempt(
 /// running: the job **waits** for the place it is already in, and gets its own
 /// verdict when that place comes free.
 ///
-/// On `9e8fdef` this fails on both halves of the oracle: the hub offers the
-/// job to that machine again on the pass at the end of the refusal's own arm,
-/// so the first health report carries an offer the oracle forbids, and the job
-/// reaches `refused_as_full` long before any place comes free.
+/// **Where this was red, stated as it was really run.** This file *cannot
+/// compile* on `9e8fdef`: it names `still_running_attempt`,
+/// `herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT` and
+/// `herd_runner::testing::a_refusal_for_a_second_attempt`, and none of the
+/// three exists there — T4's field is a compile-time dependency of the
+/// fixture, so there is no artefact in this tree that is red without the hub
+/// change. What was run, in a throwaway worktree detached at `9e8fdef`, was
+/// the **equivalent** fixture sending the frame a v1.0.0 runner really sends
+/// — `at_its_ceiling: Some(1)` and no discriminant, the two refusals in one
+/// match arm — and it failed on both halves: the hub answered the very first
+/// health report with `AssignJob { attempt: 3 }` beside it, and when the peer
+/// kept refusing it reached `refused_as_full` with **8 refusals, offers 2
+/// through 9, 9 attempts on the record** and the hub's own sentence about two
+/// counts that never agreed. Those figures are in
+/// `docs/orchestration/history/2026-11-01-self-collision-no-reoffer.md`; that
+/// worktree is gone. With this field in place and the exclusion alone
+/// removed, this file fails on both halves too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_is_not_offered_to_the_machine_already_running_it() {
     let harness = Harness::with_hub().await;
