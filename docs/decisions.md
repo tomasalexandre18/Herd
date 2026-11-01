@@ -15667,3 +15667,52 @@ free number above D293 on `origin/main` and above every unlanded branch:
 all 30 non-ancestor remote refs were read at this integration and none
 holds a `D` above 293, so no gap was closed and **D143**, **D154** and
 **D170** stay (D148, invariant 8).
+
+## 2026-11-01 — D295 A pickaxe over a constant's name cannot see its value move
+
+**Context.** The brief for `cut-v1.1.0` instructed that `PROTOCOL_VERSION` not
+be bumped and gave as its warrant that the constant *"has not moved since the
+workspace's first commit — I checked its whole history with `git log -S`"*. The
+instruction was right and the warrant was false, and the two are independent.
+
+**The measurement, and why it reads as a zero.**
+`git log -S'pub const PROTOCOL_VERSION: u32'` returns exactly one commit,
+`12cca8e`, the one that introduced the line. `-S` reports a commit when the
+**count of occurrences** of the string changes. A pattern that stops before the
+value has the same count on both sides of `= 2` → `= 3`, so the pickaxe is
+silent across precisely the event it was aimed at. It answers *"was this
+declaration added or removed"* and was read as answering *"did this number ever
+change"*.
+
+**What is true.** Through `release.yml`'s own `sed`, `herd-proto/src/lib.rs`
+gives **2** at `v0.4.1` and **3** at `v1.0.0` and at `main`. Both moves name
+themselves in a subject line — `d114f03 move the protocol to 2`,
+`a99dfa9 Move PROTOCOL_VERSION to 3 and number the pack types` — and the
+constant's own doc comment at `:135` is written *about* the second one.
+
+**The rule.** A claim that a constant has not moved is made by **reading its
+value at the two ends** — `git show <ref>:<file>` through the same expression
+the consumer of the number uses — and never by a pickaxe over its name. Where a
+pickaxe is the right instrument, the pattern carries the value (`-S'… = 3;'`),
+and the result is read as a change in a count of occurrences rather than as a
+history of the number. This is the same shape as **D293**: a detector is
+trusted only once it has been shown to fire on the case it is meant to catch,
+and an unproven detector's silence is not a measurement.
+
+**What it does not cover.** Nothing about the version decision itself.
+`PROTOCOL_VERSION` is **3** at both ends of the 101 commits v1.1.0 ships, the
+two protocol fields this release adds are `#[serde(default)]` on existing
+variants — the first of the three shapes `:139`-`:145` names as additive — and
+invariant 4 is not breached. The number stays 3 on that ground, which is the
+ground the tree supports, and not on the pickaxe's.
+
+**Evidence.** `docs/orchestration/history/2026-11-01-release-v1.1.0.md`
+*Risks and findings* 1; `git log --oneline -S'pub const PROTOCOL_VERSION: u32 =
+2;' -- herd-proto/src/lib.rs`; `git show v0.4.1:herd-proto/src/lib.rs`;
+`herd-proto/src/lib.rs:135`, `:139`-`:145`, `:161`; D293, D286, D288; D204.
+
+**On the number.** Allocated **D295** at batch 39's integration, the next free
+number above D294 on `origin/main` and above every unlanded branch: all 30
+non-ancestor remote refs and all 13 non-ancestor local branches were read at
+this integration and none holds a `D` above 294, so no gap was closed and
+**D143**, **D154** and **D170** stay (D148, invariant 8).

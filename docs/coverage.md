@@ -344,10 +344,12 @@ not had that pass.
 
 Five things a reader must not mistake for done:
 
-1. **Merged is not running.** **The newest tag is v1.0.0**, cut from
-   `main` at `ae3ae40` on 2026-10-31 (**D212**, **D277**); v0.4.1 was
-   the newest until then, and this line read v0.3.0 until 2026-10-30
-   and was two releases stale. **Tagged is neither published nor
+1. **Merged is not running.** **The newest tag is v1.1.0**, cut from
+   `main` at batch 39's landing commit on 2026-11-01 (**D212**); v1.0.0
+   was the newest until then (`ae3ae40`, 2026-10-31, **D277**), v0.4.1
+   before that, and this line read v0.3.0 until 2026-10-30 and was two
+   releases stale. **v1.1.0 moves none of the three numbers** — 3, 2 and
+   2 — so it resets no state root. **Tagged is neither published nor
    deployed:** a release's own notes are Alexa's (**D210**). What the
    consumer's machines actually
    run is a fact that reaches us only as a dated report (D161), and the
@@ -405,10 +407,13 @@ Five things a reader must not mistake for done:
    is no migration path the last two destroy an existing state root as
    a working root. The sentence this replaces also said the ordinary
    release before v1.0.0 ships at layout 1 and record 1: no release cut
-   from `main` can now do that. **What followed for the release is
-   settled: the next tag is v1.0.0** (D212), so there is no ordinary
-   release before it for that sentence to bind — D243 ruled the
-   constraint moot rather than open, and ORCH-156 is closed as caduque.
+   from `main` can now do that. **What followed for the release was
+   settled and has happened: the tag after v0.4.1 was v1.0.0** (D212),
+   so there was no ordinary release before it for that sentence to bind
+   — D243 ruled the constraint moot rather than open, and ORCH-156 is
+   closed as caduque. **v1.1.0 is cut with all three unmoved**, 3, 2
+   and 2, so it is the first release on the far side of the one reset
+   this project has ever shipped.
 
 ## Musts per milestone
 
