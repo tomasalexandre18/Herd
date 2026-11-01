@@ -410,7 +410,8 @@ Five things a reader must not mistake for done:
    so there was no ordinary release before it for that sentence to bind
    — D243 ruled the constraint moot rather than open, and ORCH-156 is
    closed as caduque. **v1.1.0 is cut with all three unmoved**, 3, 2
-   and 2, so it is the first release since v0.4.1 that resets nothing.
+   and 2, so it is the first release on the far side of the one reset
+   this project has ever shipped.
 
 ## Musts per milestone
 
