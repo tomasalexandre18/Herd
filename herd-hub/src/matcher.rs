@@ -50,7 +50,7 @@
 //! module at all. That is what let D74 land without moving M7 or M8: the
 //! algebra, the slots and the admission are what they were.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use herd_proto::{of_which, Holdings, HostSize, JobId, LabelSet, Occupant, Parallelism};
@@ -141,6 +141,26 @@ pub struct Seat {
     /// jobs are offered, so two jobs offered together still contend for the
     /// last place whatever this says.
     pub it_said_it_is_holding: Option<u32>,
+    /// The jobs this machine has told this hub it is **already running
+    /// another attempt of**, by handing that attempt straight back
+    /// (invariant 2, one machine runs one job once).
+    ///
+    /// The one exclusion in this module keyed on a `(job, runner)` pair, and
+    /// the reason it cannot be the count above: that refusal is answered
+    /// *below* the announced ceiling by construction — `take_job` answers
+    /// the ceiling first whenever `running >= most_at_once` — so the figure
+    /// beside it reads as room and the count-based guard in [`admission`] is
+    /// guaranteed inert exactly where the refusal is guaranteed to repeat.
+    /// Measured: eight refusals in 0.51 s on the first consumer's instance,
+    /// 2026-10-31, and a job dead with no verdict for it.
+    ///
+    /// Answered `ShortNow` and never `NotHere`: the place is really taken by
+    /// a job that is really running, so this machine is exactly the kind
+    /// that runs this one and the wait is one something on that machine can
+    /// end (E-31, E-19). Cleared by the machine's own next health report —
+    /// see `herd_hub::server`'s `ConnectedRunner` — so nothing here times
+    /// anything, and a seat that has refused nothing carries an empty set.
+    pub it_said_it_is_running_these: BTreeSet<JobId>,
     /// On its way out (invariant 2). It takes no new job, and — the decision
     /// D80 records — it does not count as *available* either, so a job does
     /// not stick to a machine that is leaving.
@@ -338,6 +358,32 @@ pub const READINGS_AT_ONCE: u32 = 2;
 /// against both sentences as they are really built, so the distinction
 /// cannot be lost by an edit to either wording.
 pub const A_CEILING_THE_RUNNER_ANNOUNCED: &str = "it said it holds at most";
+
+/// The clause that marks a sentence as **the hub holding a job back because
+/// the machine it would go to is already running another attempt of it** —
+/// again the hub's words, and again not the runner's.
+///
+/// The third member of the pair above, and here for its reason rather than
+/// as a convenience: `herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT` is what the
+/// **runner** says when it refuses that assignment, inside an
+/// `attempt_ended` line that charged one of the job's budgets, and this is
+/// what the **hub** says on a `waiting` line that charged it nothing.
+/// Neither carries the other's words. The first draft of this branch gave
+/// the hub's sentence the runner's clause verbatim, and a review read it for
+/// what it was: `herd-runner` is only a `[dev-dependencies]` of `herd-hub`,
+/// so nothing in a release build links the two, and a rename on one side
+/// would have left this module and its own unit test agreeing with each
+/// other and with nothing else.
+///
+/// **What is asserted and what is not.** That no two of the clauses are
+/// substrings of one another, and that each sentence carries its own and not
+/// its neighbours', is asserted in
+/// `herd-hub/tests/announced_job_ceiling.rs` over the sentences as they are
+/// really built — on the runner's side through
+/// `herd_runner::testing`, which is why that crate is a dev-dependency at
+/// all. What no gate can assert is the **cross-crate** link, because there
+/// is none: a test binary is the only place both crates exist at once.
+pub const A_SECOND_ATTEMPT_OF_ITS_OWN: &str = "already running another attempt of";
 
 /// What the claim step needs beyond the record and the fleet.
 ///
@@ -840,7 +886,44 @@ enum Admission {
 /// function of it for a job that declared a per-thread figure, and N is chosen
 /// before any requirement is read (D82).
 fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission {
-    // **First, and before any figure about size**: the count the runner
+    // **First of all, and before any count**: this machine is already
+    // running another attempt of *this* job, and one machine runs one job
+    // once (invariant 2).
+    //
+    // The most specific fact there is about this pair, so it is read before
+    // anything general about the machine's size: the job was placed here
+    // once, so it fits here, and what is in the way is the earlier attempt's
+    // own place. A count cannot say it — the runner answers this refusal
+    // only *below* the ceiling it announced, so the figure it reports reads
+    // as room and the guard below is inert — and nothing else in this module
+    // is keyed on a pair, so without this the hub offers the job back on the
+    // very next pass, for as long as the budget on the far side lasts. Eight
+    // times in 0.51 s on the first consumer's instance, and then a job dead
+    // with no verdict (2026-10-31, v1.0.0, `j0000000655`).
+    //
+    // `ShortNow`, so the job **waits** for the place it is already in: that
+    // place belongs to an attempt of this very job and will come free when
+    // it ends, which is the one shape E-31's "short is never a failure" is
+    // about. The exclusion is lifted by that machine's own next health
+    // report, not by a clock here.
+    //
+    // **The sentence deliberately does not carry the runner's own clause for
+    // this refusal** (`herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT`), for the
+    // reason [`A_CEILING_THE_RUNNER_ANNOUNCED`] does not carry the runner's
+    // ceiling clause: a line the hub writes while a job **waits** costs that
+    // job nothing, and a line the runner wrote inside an `attempt_ended`
+    // spent one of its budgets. A reader who cannot tell them apart cannot
+    // tell those two states apart, and this clause had the words in it until
+    // it was read for exactly that.
+    if seat.it_said_it_is_running_these.contains(&record.id) {
+        return Admission::ShortNow(format!(
+            "{} is {A_SECOND_ATTEMPT_OF_ITS_OWN} {} — the place this attempt needs is the \
+             place that one is in, so it waits here until that machine's next health report \
+             stops naming it",
+            seat.name, record.id
+        ));
+    }
+    // **Then, and before any figure about size**: the count the runner
     // itself put on how many jobs it will hold at once (D181, invariant 2) —
     // in the two cases where it is still the bound, and no longer over what
     // this hub's own records say is out there (ORCH-323).
@@ -2062,6 +2145,7 @@ mod tests {
             preference,
             host,
             it_said_it_is_holding: None,
+            it_said_it_is_running_these: BTreeSet::new(),
             // Silent, on every seat these tests build but the ones that are
             // about the ceiling. That is deliberate and it is itself the
             // assertion D181's "absent is not a figure" needs: a runner that
@@ -4850,6 +4934,68 @@ mod tests {
             why.contains("2 of them by the machine's own count"),
             "and the one figure here that did not come off the records is said out loud, or an \
              operator reads a contradiction: {why}"
+        );
+    }
+
+    /// **And a job the machine is already running another attempt of is not
+    /// offered to that machine again**, which the count above cannot do.
+    ///
+    /// The refusal this is about is answered *below* the announced ceiling by
+    /// construction — `herd_runner::Session::take_job` answers the ceiling
+    /// first whenever `running >= most_at_once` — so the figure the machine
+    /// gives with it is a figure this bound reads as **room**. Both halves
+    /// are asserted here on one seat: holding 1 of 2 is admissible, and the
+    /// one job that machine says it is already running is not.
+    ///
+    /// Measured on the first consumer's instance, 2026-10-31, v1.0.0: a
+    /// 2-slot machine holding 1, `1 >= 2` false, the same job placed there
+    /// eight times in 0.51 s, and then `refused_as_full` — exit 125, no
+    /// verdict, for work no machine had failed at.
+    #[test]
+    fn a_job_a_machine_is_already_running_is_not_offered_to_it_again() {
+        let mut after_a_write_off = their_server_holding_at_most(2);
+        after_a_write_off.it_said_it_is_holding = Some(1);
+        after_a_write_off
+            .it_said_it_is_running_these
+            .insert(JobId::new("j0"));
+        let mut fleet = vec![after_a_write_off];
+        // The premise, asserted and not assumed: the count-based bound does
+        // not fire at 1 of 2, so without the pair the seat admits this job.
+        let why = waited(place(
+            &costs_nothing("j0"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains(&format!("{A_SECOND_ATTEMPT_OF_ITS_OWN} j0")),
+            "the pair is what refuses this placement, and the sentence has to say so, in \
+             the hub's own clause for it: {why}"
+        );
+        assert!(
+            !why.contains(herd_runner::A_RUNNERS_OWN_SECOND_ATTEMPT),
+            "and it must not carry the **runner's** clause for the same refusal: this line \
+             is a job waiting, which costs it nothing, and that one is a go spent. {why}"
+        );
+        assert!(
+            !why.contains("job(s) already out there and it said it holds at most"),
+            "the count is not what refused this: at 1 of 2 it reads as room, which is the \
+             whole of why this pair exists: {why}"
+        );
+        // And nothing else about the machine has changed: another job is
+        // placed on it, on the same pass, with one place still free.
+        let (runner, _) = placed(place(
+            &costs_nothing("j1"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(
+            runner, "build-host",
+            "one pair is excluded and the machine is not: a seat that has refused one job \
+             goes on taking every other"
         );
     }
 
