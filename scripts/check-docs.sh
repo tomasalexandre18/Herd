@@ -2,11 +2,11 @@
 # Enforces the docs discipline of CLAUDE.md invariant 8, so that it does not
 # have to be enforced by hand in review.
 #
-# Adding a rule here: check-orchestration.sh runs this whole script 38 times,
+# Adding a rule here: check-orchestration.sh runs this whole script 44 times,
 # each over a full copy of the real repository, because a control only ever
 # seen green is not known to work and each case needs its own fresh corpus.
 # The cost of any rule that is linear in the corpus is therefore multiplied
-# by 38 in the `docs` CI job, which has a 5-minute cap. One such rule already
+# by 44 in the `docs` CI job, which has a 5-minute cap. One such rule already
 # took that job past the cap (2026-10-27; see the 79-column check below).
 # Measure a new whole-corpus rule against the suite, not against one run.
 set -uo pipefail
@@ -171,6 +171,36 @@ if [ -f "$board" ]; then
   want="Waiting Owed Open Active Blocked Next"
   got=$(grep -oE '^## (Waiting|Owed|Open|Active|Blocked|Next)' "$board" | sed 's/^## //' | tr '\n' ' ' | sed 's/ $//')
   [ "$got" = "$want" ] || note "$board sections are '$got', want '$want' in that order"
+  # A row starts at column 1, and this guard is what makes the three checks
+  # below complete rather than nearly complete. All three anchor on
+  # `^| ORCH-`, so a row indented by even one space is read by none of them:
+  # its ten fields are not counted, its state is not known, its id is not
+  # compared. One such row sat on `main` (ORCH-341, substantively correct --
+  # ten fields, state `done`), and batch 36's merger proved the blind spot
+  # instead of inferring it: it broke that row's state cell to `banana` with
+  # the leading space intact and ran all three expressions, which stayed
+  # silent, then removed the space and watched all three fire.
+  #
+  # Rejecting the indented shape is the deliberate choice, over anchoring
+  # the three at `^[[:space:]]*\| ORCH-` and accepting both. Accepting both
+  # is fewer lines and worse in kind: a row becomes two spellings of one
+  # thing, and every check written over this table afterwards has to carry
+  # the tolerance for ever or quietly lose a row again. The indentation was
+  # a typo and not a style -- 1 against 317, measured 2026-11-01 -- and
+  # board.md is a live document, not a dated record, so de-indenting that
+  # row in the same commit is an ordinary edit.
+  #
+  # The domain is exactly the blind set of the three: an indented line whose
+  # first cell is an ORCH id. board.md holds no fenced block and no other
+  # indented table row, so nothing legitimate is in range today. A board row
+  # nested inside a list item would go red here; this table has no such
+  # shape, and the answer would be to unnest the row, not to widen this.
+  #
+  # Cost: one grep over one small file, flat in the corpus. This is not one
+  # of the whole-corpus rules the note at the top of this file warns about.
+  indented=$(grep -nE '^[[:space:]]+\| ORCH-' "$board" | cut -c1-56 | sed 's/^/    line /')
+  [ -z "$indented" ] || note "$board has rows that do not start at column 1, where the row checks cannot see them (not their ten fields, not their state, not their id); de-indent them:
+$indented"
   rows=$(grep -nE '^\| ORCH-' "$board" | awk -F'|' 'NF != 10 { print "    line " $0 }' | cut -c1-60)
   [ -z "$rows" ] || note "$board rows must have exactly eight cells:
 $rows"
@@ -200,7 +230,7 @@ done
 # compared as a string first, so every handoff written under the
 # pull-request method is skipped without being opened, and what is left is
 # read by one awk for the whole set -- one landing per batch. check-docs.sh
-# is run 38 times by check-orchestration.sh against the `docs` job's
+# is run 44 times by check-orchestration.sh against the `docs` job's
 # 5-minute cap (see the note at the top of this file).
 # The constant is a floor, and it moved once: the method landed on
 # 2026-10-28 and a merge handoff of that same date was already on `main`,
@@ -224,7 +254,7 @@ run_digits=8
 landings=""
 for f in docs/orchestration/history/*-merge-*.md; do
   [ -f "$f" ] || continue
-  b=${f##*/}      # not basename: one fork per file, paid 38 times
+  b=${f##*/}      # not basename: one fork per file, paid 44 times
   [ "${b%%-merge-*}" \< "$landing_from" ] && continue
   landings="$landings $f"
 done
@@ -305,7 +335,7 @@ done
 #
 # Cost: four greps over two small files, flat in the corpus. This is not one
 # of the whole-corpus rules the note at the top of this file warns about, and
-# the 38 runs in check-orchestration.sh pay it 38 times at that price.
+# the 44 runs in check-orchestration.sh pay it 44 times at that price.
 notes_dir=deploy/release-notes
 
 # The version the way `flake.nix` reads it (`workspace.package.version`),
