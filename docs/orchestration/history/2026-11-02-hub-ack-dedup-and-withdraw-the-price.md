@@ -11,8 +11,13 @@
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger` names
   the landing here, and fills the record of `templates/landing.md`
-- **Not pushed.** The GREEN gate this branch holds is for `fd33002`, not for
-  the tip that carries this file. See *Gates* and *Decisions needed*.
+- **Pushed**, and no pull request opened by anybody (one landing per batch).
+  The GREEN gate is for `fd33002`, which carries every line of code; the
+  commits on top of it are prose, which `CLAUDE.md` says run `check-docs.sh`
+  alone. See *Gates*.
+- **One thing is owed before this branch lands, and it blocks the landing:**
+  the new test has never been run against a tree without the fix, so its
+  silence is not yet evidence. *Resume point*, item 1.
 
 ## Done
 
@@ -101,8 +106,10 @@ hub over a real socket with a hand-driven peer, asserting four things:
   `bench-preflight.sh` refused for the whole window and the coordinator stood
   the branch down before it ran. So the new test is **green on the fixed tree
   and unmeasured on the unfixed one**: its silence is not yet evidence. The
-  edit was reverted and the worktree is clean at `fd33002`. The run is one
-  command, in *Resume point*.
+  edit was reverted and the worktree is clean. **This blocks the landing** —
+  `herd-merger` must not land this branch believing the test proved
+  something — and the exact command, the expected failure and what a *pass*
+  would mean are item 1 of *Resume point*.
 - **The `collection_is_whole` walk is not paid off.** The store re-runs it for
   every straggler chunk, one `stat` per manifest entry, 662 of them for the
   collection that broke the consumer's hub. It happens before the arm this
@@ -199,15 +206,33 @@ and not out of the gate's:
 printed `docs ok`.** Its output is in the agent's report; nothing is added to
 the tree afterwards.
 
-**What has *not* been gated: the tip.** The repo's convention is that the gate
-is the last thing run, after the handoff is committed — so a GREEN receipt
-should exist for the tip and not for `fd33002`. It does not. The host sat
-above `bench-preflight.sh`'s ceiling of 9.00 (load1 19.71 at the stand-down,
+**What has *not* been gated: the tip, and the Rust gates were NOT re-run on
+it.** The repo's convention is that the gate is the last thing run, after the
+handoff is committed — so a GREEN receipt would exist for the tip and not for
+`fd33002`. It does not, and no second gate window was spent on a markdown
+file: the host sat above `bench-preflight.sh`'s ceiling of 9.00 (load1 19.71,
 from the consumer's production, with nothing of ours in flight), and
-scheduling the run is the coordinator's, not this agent's. The delta between
-`fd33002` and the tip is this file alone: one markdown file under
-`docs/orchestration/history/`, no Rust, no `Cargo.toml`, no script. **That is
-a reason to believe the tip would gate green, not evidence that it did.**
+scheduling a run is the coordinator's. The delta from `fd33002` to the tip is
+`docs/` only — this file — with no Rust, no `Cargo.toml` and no script, which
+is exactly the case `CLAUDE.md` describes: *"a prose-only change runs
+`check-docs.sh` alone and says the Rust gates were **not run** locally,
+covered by the landing's `gate.sh`"*. So **the Rust gates were not run on the
+tip**, which is a statement and not a hedge: what covers it is the batch's own
+`gate.sh` at integration, which is `herd-merger`'s.
+
+**And the push was attempted under those rules rather than assumed.**
+`git push -u origin hub-ack-dedup-and-withdraw-the-price` with
+`core.hooksPath` pointing at `scripts/githooks` — **accepted**, the hook
+printing nothing. There is no disagreement between `CLAUDE.md` and the
+mechanical holder to report, and the reason is in the hook's second line of
+work: `[ "$remote_ref" = "$main_ref" ] || continue`
+(`scripts/githooks/pre-push:112` and its loop). It guards
+**`refs/heads/main` only**, and says so itself — *"Every other ref goes
+through untouched, silently and without consulting the gate: pushing a task
+branch is the normal case and stays free."* The receipt rule it enforces is
+about a landing's **second parent**, never about a task branch's tip, so a
+prose commit on top of a gated code commit was never something it could
+refuse. Nothing was bypassed and `--no-verify` was not used.
 
 ## Risks and findings
 
@@ -250,7 +275,39 @@ a reason to believe the tip would gate green, not evidence that it did.**
    today, and rewriting it was outside what this change needed.
 6. **The green test is not yet a detector.** See *Not done*: it has never been
    run against a tree without the guard, so its silence is not yet evidence
-   that it would have caught this defect.
+   that it would have caught this defect. **This blocks the landing**, and
+   *Resume point* item 1 is the run.
+7. **A suspected disagreement between `CLAUDE.md` and `pre-push` was tested
+   and does not exist.** The worry was that `CLAUDE.md` permits a prose-only
+   commit on top of a gated code commit while the hook demands a receipt for
+   whatever is pushed. It does not: the hook's loop begins
+   `[ "$remote_ref" = "$main_ref" ] || continue`, so it looks at
+   **`refs/heads/main` and nothing else**, and the receipt it asks for is
+   about a landing's *second parent*. Its own prose says so — *"pushing a task
+   branch is the normal case and stays free"*. The push was attempted rather
+   than assumed and was accepted with the hook silent. **No row is drafted for
+   it**, because there is no inconsistency to file; what there is, is a
+   reminder that the receipt rule bites exactly once, at the landing, and that
+   it is `herd-merger`'s.
+8. **ORCH-121 happened again here, and again cost nothing — which is evidence
+   for its "no mechanism" verdict rather than against it.** That row records
+   that a branch's docs gate is run before its handoff is written, the handoff
+   being itself a docs file, so the gate quoted green tested a different tree.
+   This branch inverted the same ordering: the gate ran on `fd33002`, then the
+   handoff was committed on top. Had the handoff been written first — the shape
+   ORCH-121 recommends — one gate run would have covered everything and this
+   paragraph would not exist. It cost nothing this time because the delta is
+   prose and `CLAUDE.md` covers prose, but it is the second branch in the
+   sample and whoever next writes a brief can prevent it in one sentence:
+   *write the handoff before you gate*.
+9. **Deleting the build tree makes the owed detector run cost a cold
+   compile.** The 14 GiB tree at `/mnt/ssd_980/herd/build/hub-ack-dedup` was
+   deleted when the branch was pushed, as `workflow.md` and the gotcha
+   `build-weight-off-root` require. It was warm for the detector run, so that
+   run is *one targeted job* but no longer a cheap one: it rebuilds the
+   workspace's test binaries before it can fail. Naming the trade rather than
+   quietly keeping 14 GiB on a shared host, or quietly letting the next
+   scheduler discover the cost.
 
 ## Drafted for `herd-merger`
 
@@ -261,40 +318,73 @@ with the columns `| ID | Item | Origin | Owner | State | Next action |
 Depends on | Evidence |`, its id to be allocated at integration. Paste it
 verbatim, replacing `ORCH-NEXT`:
 
-| ORCH-NEXT | **A straggler chunk still costs the hub one `stat` per manifest entry — 662 of them for the collection that broke it.** De-duplicating `JobFilesAck` per link removed the *frame* and the log line; the walk behind them is the store's, and was not opened. `write_output_chunk` early-returns `self.collection_state(id, &record)` for a chunk of a file it already holds whole (`herd-hub/src/store.rs:2554`-`:2556`), and `collection_state` calls `collection_is_whole`, which is `file_length` on every entry of the manifest (`:706`-`:712`, `:1293`-`:1299`). So every late chunk of a 662-file collection walks 662 paths, and the number of late chunks scales with the manifest and with how many collections share the link's one `FILES_IN_FLIGHT` window — 61 arrived for one job inside one second on the first consumer's hub on 2026-11-02. **This is CPU and page cache, not the memory that OOM-killed them**, so it is owed rather than urgent, and it is a different question from bounding the hub's unbounded outbox (`herd-hub/src/server.rs:3857`), which is planned separately. The shape to price: whether the hub can answer a chunk for a collection it has already called whole without re-deriving wholeness. A per-link memory of which collections are complete exists now — `relay_from_runner`'s `acked` — but it lives in the server and not in the store, and D79's one-definition rule is what makes moving it a decision rather than a cleanup | `hub-ack-dedup-and-withdraw-the-price`, 2026-11-02, while de-duplicating the frame | herd-planner | owed | Price it against D79's one definition: say whether the store may be *told* a collection is whole, or whether the server may skip the store for a chunk it already knows is late, before either is written | nothing | `herd-hub/src/store.rs:2554`-`:2556`, `:706`-`:712`, `:1293`-`:1299`; `herd-hub/src/server.rs`'s `Ok(ChunkLanded::Complete)` arm and its comment; `history/2026-11-02-hub-ack-dedup-and-withdraw-the-price.md` |
+| ORCH-NEXT | **De-duplicating `JobFilesAck` removed 232 frames for four jobs and is not the whole OOM.** The storm still makes refused chunks, `JobFilesHeld` answers and `collection_is_whole` walks, and **what remains is unmeasured** — a fix reported as *the* fix would be worse than this one is good, so this row exists to keep the remainder visible. Its measured part: **a straggler chunk still costs the hub one `stat` per manifest entry, 662 of them for the collection that broke it.** De-duplicating per link removed the *frame* and the log line; the walk behind them is the store's, and was not opened. `write_output_chunk` early-returns `self.collection_state(id, &record)` for a chunk of a file it already holds whole (`herd-hub/src/store.rs:2554`-`:2556`), and `collection_state` calls `collection_is_whole`, which is `file_length` on every entry of the manifest (`:706`-`:712`, `:1293`-`:1299`). So every late chunk of a 662-file collection walks 662 paths, and the number of late chunks scales with the manifest and with how many collections share the link's one `FILES_IN_FLIGHT` window — 61 arrived for one job inside one second on the first consumer's hub on 2026-11-02. **This is CPU and page cache, not the memory that OOM-killed them**, so it is owed rather than urgent, and it is a different question from bounding the hub's unbounded outbox (`herd-hub/src/server.rs:3857`), which is planned separately. The shape to price: whether the hub can answer a chunk for a collection it has already called whole without re-deriving wholeness. A per-link memory of which collections are complete exists now — `relay_from_runner`'s `acked` — but it lives in the server and not in the store, and D79's one-definition rule is what makes moving it a decision rather than a cleanup | `hub-ack-dedup-and-withdraw-the-price`, 2026-11-02, while de-duplicating the frame | herd-planner | owed | Price it against D79's one definition: say whether the store may be *told* a collection is whole, or whether the server may skip the store for a chunk it already knows is late, before either is written | nothing | `herd-hub/src/store.rs:2554`-`:2556`, `:706`-`:712`, `:1293`-`:1299`; `herd-hub/src/server.rs`'s `Ok(ChunkLanded::Complete)` arm and its comment; `history/2026-11-02-hub-ack-dedup-and-withdraw-the-price.md` |
 
 ## Decisions needed
 
-**One, and it is the coordinator's, not Alexa's.** This branch is committed and
-**not pushed**: the GREEN receipt is for `fd33002`, and the tip adds this
-handoff on top of it. Either
-
-- gate the tip on a quiet host and push on its GREEN — the convention, and the
-  recommendation, since a receipt for the sha that is pushed is the thing the
-  method asks for; or
-- push as it stands, on the coordinator's word, taking the delta — one
-  markdown file under `docs/orchestration/history/`, with `check-docs.sh`
-  green on it — as prose-only and covered by the batch's own `gate.sh` at
-  integration, which is `herd-merger`'s.
-
-Nothing is lost by the first: the worktree and the warm build tree are kept.
+None. The one open question — whether to spend a gate window on a markdown
+file or push under `CLAUDE.md`'s prose-only rule — was settled by attempting
+the push and letting `pre-push` answer: it accepted, and the rule and the
+hook turned out not to disagree at all (*Gates*, and finding 7).
 
 ## Resume point
 
-Two commands, in this order, both on a host `bench-preflight.sh` has cleared,
-and both the coordinator's to schedule:
+**Item 1 blocks the landing. `herd-merger` must not land this branch until it
+has that run's output, green or red.**
 
-1. **Prove the detector**, which is the one piece of evidence this branch
-   lacks. Neutralise the guard — in `herd-hub/src/server.rs`, make the
-   condition `if acked.insert((job_id.clone(), attempt)) || true {` — run
-   `nix develop --command cargo test --test spools_resumed -- --nocapture`
-   through Herd, and expect
-   `a_whole_collection_is_acknowledged_once_per_link_and_never_not_at_all` to
-   fail naming the straggler count. Then revert the edit and confirm the
-   worktree is clean at the tip.
-2. **Gate the tip** — `./scripts/gate.sh` through Herd, same submission as in
-   *Gates* — and push the branch on its GREEN. No merge, no tag, no pull
-   request: the landing is `herd-merger`'s.
+1. **Prove the detector** — the one piece of evidence this branch lacks, and
+   the reason its new test's silence is not yet evidence. Neutralise the
+   guard: in `herd-hub/src/server.rs`, inside the `Ok(ChunkLanded::Complete)`
+   arm, change
+
+   ```
+   if acked.insert((job_id.clone(), attempt)) {
+   ```
+
+   to
+
+   ```
+   if acked.insert((job_id.clone(), attempt)) || true {
+   ```
+
+   which restores the pre-fix behaviour exactly — the frame goes out on every
+   chunk — while keeping `acked` used so the file still compiles. Then run the
+   one test binary, not the gate, through Herd:
+
+   ```
+   /mnt/ssd_980/herd/queue/bin/herdctl --hub ws://127.0.0.1:8791 run \
+     --label build --memory-mib 4700 -- /bin/sh -c \
+     "cd <this worktree> && export CARGO_TARGET_DIR=<a build dir off /> && \
+      nix develop --command cargo test --test spools_resumed -- --nocapture"
+   ```
+
+   **Expected: RED.**
+   `a_whole_collection_is_acknowledged_once_per_link_and_never_not_at_all`
+   fails on its second assertion, naming the count — *"5 straggler chunk(s)
+   of a collection this hub already acknowledged drew N more
+   acknowledgement(s) on the same link"* — while the other two tests in the
+   file stay green, because neither of them sends a straggler. The first
+   assertion (the collection *must* be acknowledged) and the fourth (a new
+   link is acknowledged again) must also stay green with the guard
+   neutralised: they describe behaviour the fix preserves, not behaviour it
+   adds.
+
+   **If it passes with the guard neutralised, that is a finding about the test
+   and not about the fix, and it stops the landing**: it would mean the
+   fixture never produces a repeat acknowledgement on one link — most likely
+   the stragglers are not reaching the `Complete` arm at all — and the test
+   would have to be rewritten before it is worth anything.
+
+   Afterwards: revert the edit (`git checkout -- herd-hub/src/server.rs`) and
+   confirm the worktree is clean at the tip. **The build tree was deleted when
+   the branch was pushed, so this run pays a cold compile of the workspace's
+   tests** — it is one targeted job rather than a gate, but it is not free,
+   and it wants a window `bench-preflight.sh` has cleared like any other.
+
+2. Nothing else. The branch is pushed; the Rust gates are green on `fd33002`
+   and were not re-run on the prose commits above it, covered by the batch's
+   own `gate.sh` at integration. No merge, no tag, no pull request: the
+   landing is `herd-merger`'s.
 
 ## Processes
 
@@ -312,10 +402,16 @@ One Herd job ran: the gate above, on the queue's own hub
 (`ws://127.0.0.1:8791`), `--label build --memory-mib 4700`. No `pkill`, no
 kill by name, nothing on the consumer's instance.
 
-**The build tree is kept, not deleted**, because the branch is not pushed and
-the next run is a resumption of this one:
-`/mnt/ssd_980/herd/build/hub-ack-dedup`, **14 GiB** on `/mnt/ssd_980` and not
-on the root filesystem. It is deleted once the branch is pushed
-(`workflow.md`, *Concurrency and host rules*; gotcha
-`build-weight-off-root`). The worktree is kept for the same reason:
-`<scratchpad>/wt-ack-dedup`, clean at `fd33002`.
+**The build tree was deleted once the branch was pushed**, as `workflow.md`'s
+*Concurrency and host rules* and the gotcha `build-weight-off-root` require:
+`/mnt/ssd_980/herd/build/hub-ack-dedup`, **14 GiB**, on `/mnt/ssd_980` and
+never on the root filesystem. The cost of that is named in finding 9 — the
+owed detector run now pays a cold compile.
+
+**The worktree is kept**, clean at the tip. It is where *Resume point* item 1
+is run, and it goes when that item closes:
+
+```
+/mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/\
+  3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/wt-ack-dedup
+```
