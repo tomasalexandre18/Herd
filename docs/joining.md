@@ -736,12 +736,26 @@ practice it is the next second. The position outlives the command, the
 runner process and a reboot, and it is honoured with the hub down —
 which is when an owner is most likely to want her machine back.
 
-Neither position stops the runner. `off` leaves the process up and
-listening to nothing, which is what lets `on` put it back. To stop it
-altogether, `systemctl --user stop herd-runner`: it drains and exits
-inside five seconds (invariant 2), and a verdict the hub has not
-acknowledged is written under the data root and delivered on the next
-start (D34).
+The two positions differ in what they leave running, and that is the
+one thing the table does not say. `off` leaves the process up: it
+claims nothing and serves nothing, but it keeps reading the switch file
+every second, which is what lets `on` put the runner back with nobody
+starting anything. `drain` **exits the process** once the runner holds
+nothing — it is the position for *take this machine out of the herd*,
+not for *stop claiming for a while*. So under a unit with
+`Restart = "always"` a `drain` is a leave followed by a start, and that
+start reads the persisted `drain` as **`off`**, with the reason its
+owner gave kept: **D164**, in `herd-runner/src/switch.rs::at_startup`,
+whose test `a_persisted_drain_starts_a_runner_off_and_not_leaving`
+records the outage that rule closed — eight restarts in two minutes,
+and a runner never connected long enough to be switched back `on`. The
+runner says one sentence on its own stderr when it converts. An owner
+reading only the table cannot predict that, and it is the single most
+surprising thing either position does. To stop the runner altogether,
+rather than take a position at all, `systemctl --user stop
+herd-runner`: it drains and exits inside five seconds (invariant 2),
+and a verdict the hub has not acknowledged is written under the data
+root and delivered on the next start (D34).
 
 **The shortcut** — M17's own manual check is her flipping it from the
 Windows desktop within ten seconds. Two shortcuts, and they differ by
