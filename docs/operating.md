@@ -326,7 +326,13 @@ episode is a second line.
   has not acknowledged and delivers it on the next start.
 * **The runner figures are read at its startup too**, so changing one is
   a unit restart. `systemctl stop herd-runner` drains and exits inside
-  five seconds (invariant 2).
+  five seconds (invariant 2). For a window where the runner must instead
+  stay reachable throughout — a hub recreate, or a restart of something
+  the runner talks to — the position is `off` and never `drain`, because
+  `off` claims nothing, serves no content and leaves work in flight
+  alone while keeping the process up, so `herdctl switch <runner> on`
+  reaches it from anywhere afterwards, where `drain` exits the process
+  and is for withdrawing the machine.
 * **Record retention costs nothing to change today, because no shipped
   build enforces it.** When the engine lands it will ship **active by
   default** (D201) — which is worth saying plainly, because it means a
