@@ -15810,3 +15810,45 @@ number above D295 on `origin/main` and above every unlanded branch: all 30
 non-ancestor remote refs and all 15 non-ancestor local branches were read at
 this integration and none holds a `D` above 295, so no gap was closed and
 **D143**, **D154** and **D170** stay (D148, invariant 8).
+
+## 2026-11-02 — D297 A flag that every path sets names no cause
+
+`herdctl` printed `; it is also stopping (SIGTERM)` for any runner the
+hub reported as stopping. `herd_proto::RunnerSwitch.stopping` is a
+`bool`; the hub fills it from the runner's `draining` flag
+(`herd-hub/src/server.rs:2750`) and `Session::start_draining`
+(`herd-runner/src/lib.rs:3430`) sets that flag on **every** stop path,
+the signal and the `drain` position that has emptied and leaves by itself
+(`herd-runner/src/lib.rs:4203`) alike. The parenthetical was a literal.
+
+On 2026-11-02 at 01:11 CET the first consumer drained their server runner
+to recreate their hub, their idle check printed
+`server: … nothing running; it is also stopping (SIGTERM)`, their unit
+restarted the runner, and they opened an investigation into a signal
+nobody had sent.
+
+**The line now says `; it is also stopping` and names no cause.** The
+cause is **not** inferred from `RunnerSwitch.switch` beside it, although
+`Switch::leaves_when_empty()` would usually be right: a runner that is
+draining *and* was signalled is one machine with two causes, and a label
+taken from a correlate is this same defect with a longer reach. An
+inferred cause is not better than no cause.
+
+The field's own doc comment said `SIGTERM` too, which is where the
+rendering's reading was learnt; it now states that the flag carries none.
+**Doc comment only**: no field, no wire change, `PROTOCOL_VERSION` stays
+3. A unit test on `switch_lines` asserts the **absence** of `SIGTERM` and
+that the line reads alike under `drain` and under `on`, because the
+regression to prevent is a cause creeping back in.
+
+Whether the stop's *reason* should travel to the operator is a separate
+question, priced and not decided here (see the board row of the same
+date, ORCH-363): the runner holds the sentence and throws it away at the
+link, and carrying it is two additive fields across two hops, which
+invariant 4 makes a decision and not a cleanup.
+
+**On the number.** Allocated **D297** at batch 41's integration, the next free
+number above D296 on `origin/main` and above every unlanded branch: every
+non-ancestor remote ref was read at this integration and none holds a `D`
+above 296, so no gap was closed and **D143**, **D154** and **D170** stay
+(D148, invariant 8).
