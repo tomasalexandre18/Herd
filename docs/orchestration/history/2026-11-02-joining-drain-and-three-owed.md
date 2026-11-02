@@ -2,8 +2,11 @@
 
 - **Item:** ORCH-358, plus four undocketed debts the brief named
 - **Agent:** herd-step
-- **Branch / commit:** `joining-drain-and-three-owed` / `4f9aebf`, based
-  on origin/main `c824fc8`
+- **Branch / commit:** `joining-drain-and-three-owed` / `7dca107` plus
+  the follow-up commit this file is amended in, based on origin/main
+  `c824fc8`. `7dca107` was verified by the orchestrator, which re-ran
+  both gates in this worktree itself and kept the branch; the follow-up
+  is three further prose edits on the same branch, not a rewrite
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -55,8 +58,10 @@ in flight alone while keeping the process up, so
 `drain` exits the process and is for withdrawing the machine. One
 sentence and its wrap; no section.
 
-**3. ORCH-358 — `docs/orchestration/gotchas/docs-only-gates.md`.** Two
-edits, and one more disclosed below.
+**3. ORCH-358 — `docs/orchestration/gotchas/docs-only-gates.md`.** Three
+edits. **The closure covers both of that file's PR-era clauses, not one,
+so the `done` row is not read against a file that still has the
+defect.**
 
 - *Expected now* carried the pre-ORCH-357 five-entry exempt list. It now
   reads `` `CLAUDE.md`, `README.md`, `docs/`, `.claude/`, `.github/*.md`
@@ -72,36 +77,117 @@ edits, and one more disclosed below.
   landing record — and says in a clause that there is no pull request to
   look at, nobody opening one but `herd-merger`, once, for the batch's
   one landing (Alexa, 2026-10-28).
-- **The third touch, in the same sentence block and disclosed rather
-  than folded in:** *Expected now* also required the report to say *"that
-  CI covers them"*. Rewriting *Verify* to the landing would have left two
-  different coverers one bullet apart, so that clause now reads *"that
-  the landing's `gate.sh` covers them"*, matching `CLAUDE.md:87`-`:88`.
-  ORCH-358's row names two edits; this is a third, it is inside the
-  block the first edit rewrote, and it is recorded in that row too.
+- **The second touch, in the same sentence block and disclosed rather
+  than folded in — reported as beyond the brief, and accepted by the
+  orchestrator rather than reversed:** *Expected now* also required the
+  report to say *"that CI covers them"*. Rewriting *Verify* to the
+  landing would have left two different coverers one bullet apart, so
+  that clause now reads *"that the landing's `gate.sh` covers them"*,
+  matching `CLAUDE.md:87`-`:88`.
+- **The third touch, and the one that completes the class: the *Why*
+  clause at `:9`-`:10`.** It read *"CI runs all four on every PR anyway
+  (`ci.yml` has no path filter)"* and now reads *"on the batch's one
+  landing anyway"*, the parenthesis kept because it is still true. It
+  was first reported as deliberately left, on ORCH-358's instruction not
+  to restate the warrant in the *Why*; the orchestrator read that
+  instruction as forbidding a restatement of the **warrant** and not the
+  repair of a **stale clause**, and that reading is the better one —
+  closing a row about PR-era language in this file while PR-era language
+  survived nine lines up would have made the closure partial and left
+  the next reader the same drift in the same place. One clause changed,
+  no explanation added to the bullet. **No clause in that file now
+  attaches a gate run to a pull request**, which is what makes
+  ORCH-358's `done` safe to read against the file.
 
-**4. ORCH-291's *Evidence* cell, `docs/orchestration/board.md:179`.**
-Now cites the red run's log by path:
+ORCH-358's row names two edits; these are three, each inside or beside
+the block that row sent me to, and all three are recorded in that row.
+
+**4. ORCH-291's *Evidence* cell and *Next action*,
+`docs/orchestration/board.md:179`.** The cell cites two files, not one,
+because the gate log is not the richest trace the red run left. The
+gate log:
 
 ```
 .claude/worktrees/cut-v1.1.0/target/herd-gate/gate-20261101T203402Z-bfd238e3df87.log
 ```
 
-with the two lines that make it the sighting — `test
+for the two lines that make it the sighting — `test
 a_real_runner_condemns_nothing_when_the_hub_cannot_list_its_jobs ...
-FAILED` and the tail `gate: RED
+FAILED`, and the tail `gate: RED
 sha=bfd238e3df870d4a2db64a7e6add0483ecfdbf4a failed=6:test-suite
-skips=at-rest` — and says why it is the only trace: **`gate.sh` writes no
-receipt on RED**, deliberately (`scripts/gate.sh:73`-`:75`, *"a run that
-cannot stand behind its own verdict writes NO receipt, rather than a
-receipt with a caveat in it"*, proved red by mutation at
-`scripts/check-orchestration.sh:1400`). The cell also records that
-`.claude/worktrees/cut-v1.1.0` is **deliberately retained** on the
-orchestrator's word, for that log and the cut's receipt, and is not a
-worktree left behind by an oversight — without which the one sighting in
-the wild is findable only from something a later clean-up removes. Two
-dated sightings are named: the v1.1.0 cut's red of 2026-11-01, the first
-in the wild, and batch 40, which did **not** reproduce it.
+skips=at-rest`. And the suite's own output:
+
+```
+.claude/worktrees/cut-v1.1.0/target/herd-gate/test-output-bfd238e3df87.txt
+```
+
+**2359 lines**, which holds the failure itself: the panic at
+`herd-hub/tests/owed_scan_fails_against_the_real_runner.rs:431:5` —
+that file's `:766`-`:767` — and `test result: FAILED. 0 passed; 1
+failed` at `:887`. Both are cited because a reader sent only to the gate
+log has to go looking for the panic.
+
+`gate.sh` writes no receipt on RED, deliberately — `scripts/gate.sh:73`-
+`:75`, *"a run that cannot stand behind its own verdict writes NO
+receipt, rather than a receipt with a caveat in it"*, proved red by
+mutation at `scripts/check-orchestration.sh:1400` — so these two files
+are what a red sha leaves, which is why they are cited rather than left
+to be rediscovered. `.claude/worktrees/cut-v1.1.0` is recorded as
+**deliberately retained** on the orchestrator's word, for them and for
+the cut's receipt, and not a worktree left behind by an oversight: a
+clean-up of stale worktrees would take the only evidence of this
+defect's one sighting in the wild.
+
+**The panic names its own mechanism, so the row stops being a bare flake
+and becomes a hypothesis with a named check** — *"If the jobs directory
+is 0o711 rather than the 0o111 the fixture set, the host gave the access
+back before the hub scanned: see AListingThatFails::still_binds."*
+**Written with its qualifier, which is the part that matters:** for
+neither sighting is that mechanism measured. Nobody captured the mode at
+the scan for the v1.1.0 red or for batch 40's green, and the panic's own
+sentence is conditional, so the cell says the mechanism is **offered by
+the fixture, written in advance, and unconfirmed for both sightings** —
+never that it is the cause.
+
+What *is* measured, and the cell separates it from the two sightings: the
+mechanism in the abstract, on a third and earlier occasion.
+`herd-hub/tests/a_failed_listing/mod.rs:101`-`:104` records job
+`j0000000147`, 2026-10-30 — `mode=2111 read_dir=EACCES` at t=0.10 s,
+`mode=2711 read_dir=ok` at t=0.20 s, and *"`0o711` where the fixture set
+`0o111` — never the guard's own `0o755` — is the fingerprint"*. That job
+id is the one this row already carried.
+
+**Who hands the mode back is named in the tree and was not a lead to
+chase:** the runner carrying this very suite, every
+`herd_runner::confine::POLL_INTERVAL` — 200 ms — because `measure_tree`
+over `Workspace::base_dir` holds a job to its disk budget and
+`read_dir_restoring` calls `restore_access`,
+`set_permissions(mode | 0o700)`. That is invariant 2 and D166 working as
+required, a job not `chmod`-ing its way out of a figure the runner
+enforces (`a_failed_listing/mod.rs:17`-`:25` and `:84`-`:99`). Cited by
+name and not by line for the four symbols, per ORCH-301.
+
+The red run's state root corroborates that guard's **precondition** and
+nothing further: the hub's listening line,
+`test-output-bfd238e3df87.txt:775`, puts the run inside a Herd job's
+workspace under `$TMPDIR`:
+
+```
+/mnt/ssd_980/herd/queue/runner-data/jobs/j0000000232/tmp/nix-shell.NbZC5U/nix-shell.OzbGO6/.tmptkoFv9
+```
+
+which is exactly where that restoration applies. The cell offers it as a
+lead, not a finding.
+
+**The discriminator added to *Next action*, to run first, is the
+instrument the fixture already ships:** `AListingThatFails::still_binds()`
+(`a_failed_listing/mod.rs:105`), one call, which `owed_scan_fails.rs:340`
+and `:500` already make and this member does not — taken **at the scan's
+instant**, because that file's comment at `:418`-`:430` says reading the
+mode afterwards proves nothing, the hub's own sentence being the only
+honest witness of *when* the scan ran, and says in the same breath why
+this member cannot simply retake its measurement. The rest of *Next
+action* stands as it was. **No reproduction was attempted.**
 
 **5. `docs/coverage.md:233`, E-46's note**, which was empty while E-45
 above it carried its caveat. The boundary existed only in
@@ -115,8 +201,11 @@ lets the machine's owner decide, *"saying nothing would be the failure:
 it would let a deployment read as unprivileged when it is not"*.
 
 **6. ORCH-358's state is `done`** in the same row, dated 2026-11-02 to
-this branch, with its closure and the two residual findings below in its
-*Evidence* cell.
+this branch. **Its closure covers both of the gotcha's PR-era clauses**
+— *Verify* and *Why* — and the row says so, so the merger does not read
+a `done` row against a file that still carries the defect. The row also
+records the three edits against the two it names, and which of them the
+orchestrator accepted and which it instructed.
 
 ## Not done, and why
 
@@ -133,10 +222,9 @@ this branch, with its closure and the two residual findings below in its
   context so the two rows cross-reference, as the brief asked.
 - **`docs/status.md` is untouched**, as instructed; it is at exactly 90
   lines, its cap (`scripts/check-docs.sh:40`).
-- **The gotcha's *Why* at `:9`-`:10` is left stale.** It reads *"CI runs
-  all four on every PR anyway (`ci.yml` has no path filter)"*. ORCH-358's
-  row says in so many words not to restate the warrant there, and the
-  parenthesis is still true, so this is reported and not edited.
+- **The reproduction of ORCH-291's red is not attempted**, as
+  instructed. No suite ran; the mode was not captured, and the row says
+  for both sightings that it was not.
 - **The four Rust gates were NOT RUN**, see *Gates*.
 
 ## Gates
@@ -151,8 +239,9 @@ integration, which is `herd-merger`'s and not this agent's. No `cargo`
 was invoked, no job was submitted and no compile was started on this
 host.
 
-Verbatim, from the run made on the five edits before this file was
-committed:
+Verbatim, from the run made on the edits before this file was committed.
+The orchestrator also re-ran both gates in this worktree itself at
+`7dca107`, the first commit pair, and got the same two verdicts:
 
 ```
 $ ./scripts/check-orchestration.sh
@@ -174,20 +263,24 @@ this change edits `docs/orchestration/`.
 copy and no skip count to account for.
 
 ## Risks and findings
-
-- **One figure in the brief is refuted by the tree, and the row says the
-  counted figure instead.** The brief described
-  `.claude/worktrees/cut-v1.1.0` as retained for the red log *"and for
-  v1.1.0's two receipts"*. Counted on 2026-11-02, that directory holds
-  **one** receipt —
+- **Two counts in the briefs were refuted by the tree, and the row
+  carries the counted figures. Both are settled.** (1) The first brief
+  described `.claude/worktrees/cut-v1.1.0` as retained for the red log
+  *"and for v1.1.0's two receipts"*. Counted on 2026-11-02, that
+  directory holds **one** receipt —
   `19ef7ebca8eb84ce8eccf3707b607cc8f63ad5f4.receipt`, verdict GREEN,
   branch `merge-batch-39` — beside **two** run logs and their skip and
-  ignore lists. `find` over the whole repository returns eleven
+  ignore lists; `find` over the whole repository returns eleven
   receipts, one per worktree that gated, and only that one under
-  `cut-v1.1.0`. The ORCH-291 cell therefore says one receipt and names
-  it, and marks the count as made against the tree on 2026-11-02. The
-  retention decision is unaffected: the red log is there, it is the only
-  trace, and it is the reason to keep the worktree.
+  `cut-v1.1.0`. The orchestrator has dropped its figure and confirmed
+  the counted one, noting that *"two receipts"* contradicted its own
+  statement that `gate.sh` writes none on RED — it had counted the two
+  logs. (2) The follow-up said the red run left **11** files; counted in
+  the same directory on 2026-11-02 it left **ten**, all suffixed
+  `bfd238e3df87`: the gate log, the suite output, and the eight skip and
+  ignore lists. The cell says ten. Neither figure changes anything that
+  follows from it: the red run left no receipt, the two cited files are
+  what a reader needs, and the worktree is worth keeping for them.
 - **The journal line in the row material is a trimmed excerpt, and the
   row says so.** `herd-runner/src/lib.rs:4305` prints
   `herd-runner: draining ({reason}); {n} job(s) to end, no new job
@@ -209,8 +302,28 @@ copy and no skip count to account for.
   file still both carry the list in prose, and ORCH-359 is the sized
   question of whether `check-docs.sh` should hold it mechanically. The
   third live holder, the ORCH-357 row, is unchanged and consistent.
+- **ORCH-291's mechanism is measured on a third occasion and
+  unconfirmed on both sightings, and the row must keep saying so.** The
+  two are easy to collapse into *"the host handed the mode back"*, which
+  would be a true mechanism in a word it has not earned. The 2026-10-30
+  measurement in job `j0000000147` establishes that the restoration
+  happens and how fast; it establishes nothing about the v1.1.0 red or
+  about batch 40's green, for which the mode at the scan was never
+  captured. Whoever edits that cell next should keep the two apart.
+- **The lead about *"whatever hands access back"* was already answered
+  in the tree, which is why the cell names it instead of pointing at a
+  temp directory.** The follow-up offered the run's nix-shell state-root
+  path as the place to look. The restorer is `read_dir_restoring` →
+  `restore_access`, driven by `measure_tree` over `Workspace::base_dir`
+  every `POLL_INTERVAL`, and it is documented at
+  `a_failed_listing/mod.rs:17`-`:25` and `:84`-`:99`. The path is kept
+  in the cell as corroboration of that guard's precondition — the run
+  really was inside a Herd job's workspace under `$TMPDIR` — and
+  labelled a lead, not a finding. ORCH-301 asks for those four symbols
+  by name, and the cell complies.
 - **Not reproduced, and not attempted:** ORCH-291's red. This is a prose
-  task; no suite ran. The row's *Next action* is unchanged.
+  task; no suite ran. *Next action* keeps everything it had and gains
+  the one-call discriminator in front of it.
 
 ## Drafted for `herd-merger`
 
@@ -248,10 +361,13 @@ not Alexa's: it is *how*, not *what*.
 
 ## Resume point
 
-`git push -u origin joining-drain-and-three-owed`, then hand the branch
-to the batch. For whoever continues the class: read
-`docs/joining.md:739`-`:758` and
-`herd-runner/src/switch.rs:91`-`:138` side by side, and size row A.
+The branch is pushed and ready for the batch; nothing further is owed
+on it. For whoever continues the drain class: read
+`docs/joining.md:739`-`:758` and `herd-runner/src/switch.rs:91`-`:138`
+side by side, and size row A. For whoever continues ORCH-291: add
+`still_binds()` at `owed_scan_fails_against_the_real_runner.rs:431` and
+run that one test, which costs one compile and decides between a hub
+defect and a fixture whose premise the host took back.
 
 ## Processes
 

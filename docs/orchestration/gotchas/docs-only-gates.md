@@ -7,7 +7,7 @@
   `target/` in a fresh worktree, about ten minutes of compile to learn
   nothing.
 - **Why:** the Rust gates cannot fail on a prose change, and CI runs all
-  four on every PR anyway (`ci.yml` has no path filter).
+  four on the batch's one landing anyway (`ci.yml` has no path filter).
 - **Expected now:** a change confined to `CLAUDE.md`, `README.md`,
   `docs/`, `.claude/`, `.github/*.md` and only the markdown under
   `deploy/` runs `./scripts/check-docs.sh` locally. The report says the
