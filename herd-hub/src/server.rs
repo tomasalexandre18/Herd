@@ -5813,6 +5813,24 @@ async fn relay_from_runner(
     // runner's name part of its key without being in it, and what frees it
     // with no eviction policy when the runner goes (D151).
     let mut said = AlreadySaid::new();
+    // Which collections this link has already been told are whole, by (job,
+    // attempt) — the same shape and the same register as
+    // [`OwedAtJoin::CannotTell`]'s `answered` below, and for the same reason: a
+    // collection is offered as a *stream* of chunks, and the one sentence about
+    // it belongs to the first chunk that earns it.
+    //
+    // **Per connection, not global**, exactly like the link's window and its
+    // credit. A new link has to be able to say it again: a restarted runner
+    // re-offers a spool this hub already holds whole, and the acknowledgement
+    // answering that offer is the only thing in the tree that removes a spool
+    // (D19) — `spools_resumed`'s
+    // `a_collection_the_hub_already_holds_is_never_asked_for_again` is that
+    // sentence asserted against the real hub. Kept across links, this set would
+    // make that offer unanswerable and strand on a runner's disk the 37.6 GiB
+    // ORCH-092 exists for, which is strictly worse than the flood below.
+    //
+    // Freed with the link, with no eviction policy, like `said` above it.
+    let mut acked: HashSet<(JobId, u32)> = HashSet::new();
     loop {
         let message = tokio::select! {
             // The hub has accepted a newer connection from this runner; this
@@ -6094,11 +6112,45 @@ async fn relay_from_runner(
                                  will not go away: {error}"
                             );
                         }
-                        let _ = outbox.send(FromHub::JobFilesAck {
-                            job_id: job_id.clone(),
-                            attempt,
-                        });
-                        println!("herd-hub: {job_id} has every file of its collection");
+                        // **Once per collection per link, and the first one is
+                        // not optional.** `Complete` is not an edge here: the
+                        // store answers it for *every* chunk of a file it
+                        // already holds whole (`write_output_chunk`'s *already
+                        // here and whole* arm early-returns
+                        // `collection_state`), so from the moment a collection
+                        // is complete, each straggler still crossing the wire
+                        // arrives here. With no memory of having said it, the
+                        // hub said it again every time: the first consumer's
+                        // runner was sent this frame **61 times for one job
+                        // inside one second**, and 86, 50 and 35 times for three
+                        // others — 232 frames for four collections it held
+                        // nothing for — on a hub that then died of its own
+                        // unbounded outbox twice in a night, at a 2 GiB cap and
+                        // again at 4 GiB (2026-11-02, the first consumer's).
+                        //
+                        // **The boundary a de-duplication must not cross.** An
+                        // ack that is *not* a repeat has to go out: the
+                        // runner's `files_acknowledged` is the one path that
+                        // frees a collection, so an ack swallowed here would
+                        // strand that collection on the runner's disk for ever
+                        // — worse than the flood. The insertion is what decides
+                        // it, a first ack on this link going out and a repeat
+                        // not, and both halves are asserted in
+                        // `spools_resumed`.
+                        //
+                        // What this does **not** buy back is the walk. By the
+                        // time this arm is reached the store has already re-run
+                        // `collection_is_whole`, one `stat` per manifest entry
+                        // — 662 of them for the collection that broke this hub.
+                        // That cost is the store's and not this frame's to pay
+                        // off.
+                        if acked.insert((job_id.clone(), attempt)) {
+                            let _ = outbox.send(FromHub::JobFilesAck {
+                                job_id: job_id.clone(),
+                                attempt,
+                            });
+                            println!("herd-hub: {job_id} has every file of its collection");
+                        }
                         // And the verdict this hub was holding for exactly
                         // this moment (D167). Here rather than on a clock,
                         // because the only thing that can complete a
@@ -6261,30 +6313,67 @@ async fn relay_from_runner(
                 // ordinary verdict, which is almost every verdict, reads no
                 // record for a collection it has not got.
                 //
-                // **What this costs on a healthy link, with the measurement
-                // and not without it.** A collection whose runner never lost
-                // its link is already being pumped when this frame is
-                // handled, so this is a second start for it: the frame
-                // reports the nothing this hub holds, `FilesOut::resume_from`
-                // winds that runner's cursor back to the start of the
-                // collection, and a second `pump_files` task joins the
-                // first. The two cannot duplicate a chunk between them —
-                // `FilesOut::next` hands each one out once, under the
-                // session's own lock — so what the rewind can cost is the
-                // chunks already in flight when it lands, re-sent and
-                // refused by offset, with the refusal carrying this hub's
-                // real holdings and winding the cursor forward again.
+                // **What this costs, and the bound this comment used to
+                // claim it had.** A collection whose runner never lost its
+                // link is already being pumped when this frame is handled, so
+                // this is a second start for it: the frame reports the nothing
+                // this hub holds, `FilesOut::resume_from` winds that runner's
+                // cursor back — over the **whole collection**, every entry of
+                // the manifest, not the one file the frame is about — and a
+                // second `pump_files` task joins the first. The two cannot
+                // duplicate a chunk between them, `FilesOut::next` handing
+                // each one out once under the session's own lock, so what the
+                // rewind costs is the chunks already past the cursor when it
+                // lands, re-sent and refused by offset, with each refusal
+                // carrying this hub's real holdings and winding the cursor
+                // forward again.
                 //
-                // Measured on `outputs_whole`, a real runner streaming 33
-                // files of a megabyte over loopback, twice: **zero** refused
-                // chunks. On a link whose round trip is microseconds the
-                // rewind lands before anything has been sent, so there is
-                // nothing to re-send. The window it could cost on a link
-                // with real latency is `FILES_IN_FLIGHT` 8 times
-                // `OUTPUT_CHUNK_BYTES` 1 MiB — 8 MiB, once per collection,
-                // self-correcting — and that figure is reasoned from those
-                // two constants, not measured. Either way it is a transfer
-                // cost and not a correctness one.
+                // **Withdrawn, 2026-11-02: what this paragraph priced at "at
+                // most 8 MiB, once per collection, self-correcting" is not
+                // bounded by that semaphore at all.** The arithmetic was
+                // right and the premise was wrong, in the reassuring
+                // direction, which is how it passed review. `FILES_IN_FLIGHT`
+                // (8) times `OUTPUT_CHUNK_BYTES` (1 MiB) bounds one thing:
+                // the chunk frames **queued on one connection, across every
+                // collection on that link** — its own doc says *per
+                // connection* and the runner builds one semaphore per dial —
+                // so it is a cap on bytes resident in the runner, and with n
+                // collections in flight each one's share of it is 8/n. The
+                // permit comes back from `write_frames` when the chunk is
+                // handed to the **kernel**, not when this hub receives it,
+                // reads it or writes it, so **nothing in that semaphore
+                // bounds how far the runner's cursor may be ahead of this
+                // hub's holdings** — and that lead, not the resident bytes,
+                // is what a rewind re-sends.
+                //
+                // The field refutation, same day, the first consumer's hub: a
+                // collection on the server runner **over loopback**, round
+                // trip ~0, so the old sentence's "on a link with real latency"
+                // caveat did not apply at all — and this hub held **1 MiB** of
+                // a file while a chunk for that same file arrived at offset
+                // **73400320**, 70 MiB ahead of it, with 61 late 1 MiB chunks
+                // for one job inside one second against a claimed ceiling of
+                // eight.
+                //
+                // So the honest shape of the price is: a storm of refused
+                // chunks whose size scales with **the manifest** — every entry
+                // is rewound and every frame past the cursor comes back — and
+                // with **how many collections share the link's one window**,
+                // and which this hub pays for again in a `collection_is_whole`
+                // walk per arriving chunk. No number is offered for it here,
+                // because the last number offered here was read as a
+                // guarantee.
+                //
+                // The reassuring measurement this paragraph used to cite,
+                // `outputs_whole`, was 33 files over loopback: a manifest
+                // **20× smaller** than the 662 that broke this hub, exercising
+                // neither the per-frame cost that grows with the manifest nor
+                // the sharing of one window between concurrent collections.
+                // Its zero was real and said nothing about 662 files.
+                //
+                // It remains a transfer cost and not a correctness one: every
+                // one of those chunks is refused by offset and no byte is
+                // written twice. It is not a bounded one.
                 if outputs.streamed && !outputs.files.is_empty() {
                     match state.store.collection_owed(&job_id) {
                         Ok(Some(collection)) if collection.runner == name => {

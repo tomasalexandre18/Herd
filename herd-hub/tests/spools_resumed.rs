@@ -11,23 +11,32 @@
 //!
 //! The runner's startup sweep brings those spools back under the
 //! offer-and-acknowledge path rather than deleting them, and the whole design
-//! rests on two facts about the hub that are asserted here against the real
+//! rests on three facts about the hub that are asserted here against the real
 //! one, over a real socket, rather than read off its source:
 //!
 //! 1. a collection the hub is **still owed** is asked for, unprompted, the
 //!    moment the runner joins — that is the path a swept spool re-enters, and
 //!    it needs no new frame, which matters because `PROTOCOL_VERSION` is
 //!    frozen at 2 (D73);
-//! 2. a collection the hub **already holds in full** is never mentioned
-//!    again, and a chunk of it offered anyway is refused rather than written
-//!    twice. So a runner cannot learn "you may drop this" by being told; it
-//!    learns it from the hub's silence, and the barrier that makes silence
-//!    readable is the answer to the first health report — the owed list is
-//!    sent before the hub reads a frame, and frames on one link are ordered.
+//! 2. a collection the hub **already holds in full** is never *asked for*
+//!    again — it is not owed, so the unprompted list at join says nothing
+//!    about it — while a chunk of it offered anyway is neither written twice
+//!    nor refused: the store answers with the state of the whole collection
+//!    and the hub acknowledges it, which is the sentence a swept spool's offer
+//!    is freed by (D19). The barrier that makes the *silence at join* readable
+//!    is the answer to the first health report — the owed list is sent before
+//!    the hub reads a frame, and frames on one link are ordered.
+//! 3. that acknowledgement is said **once per collection per link**,
+//!    never once per chunk: a collection that is already whole reaches the
+//!    hub's `Complete` arm on every straggler still crossing the wire, and
+//!    saying it each time sent the first consumer's runner 61 frames for one
+//!    job inside one second and OOM-killed their hub twice (2026-11-02). Per
+//!    link, so a restarted runner's offer is still answered — the
+//!    de-duplication must not cost the one sentence that frees a spool.
 //!
-//! Both are asserted with a runner that **rejoins**, because that is the
-//! state the sweep exists for: the second connection is a restarted runner as
-//! far as the hub can tell.
+//! Each is asserted with a runner that **rejoins**, because that is the state
+//! the sweep exists for: the second connection is a restarted runner as far as
+//! the hub can tell.
 
 use std::time::Duration;
 
@@ -362,4 +371,148 @@ async fn a_collection_the_hub_already_holds_is_never_asked_for_again() {
         Some(1),
         "{record}"
     );
+}
+
+/// How many straggler chunks the test sends after the collection is already
+/// whole.
+///
+/// **More than one, deliberately.** A single repeat could be read as a frame
+/// that raced the completion; several cannot, and the field's own figure was 61
+/// for one job inside one second. Each of these takes the store's *already here
+/// and whole* arm, which answers `Complete` without writing a byte — so each
+/// one is a chance for the hub to say the same sentence again.
+const STRAGGLERS: usize = 5;
+
+/// **One acknowledgement per collection per link — and the first one is never
+/// swallowed** (the 2026-11-02 flood).
+///
+/// `ChunkLanded::Complete` is not an edge. The store answers it for every chunk
+/// of a file it already holds whole, so once a collection is complete each
+/// chunk still crossing the wire comes back to the arm that acknowledges it.
+/// With no memory of having said it, the hub said it again every time: the
+/// first consumer's runner was sent the frame 61 times for one job inside one
+/// second, 232 times across four collections it held nothing for, and that hub
+/// was OOM-killed twice in a night.
+///
+/// Both halves are asserted here, because a de-duplication that swallowed the
+/// *first* ack would be the worse defect: `files_acknowledged` on the runner is
+/// the only path in the tree that frees a collection (D19), so an ack that
+/// never goes out strands the bytes on the runner's disk for ever.
+///
+/// And the register is **per connection**, like the link's window and its
+/// credit:
+/// `a_collection_the_hub_already_holds_is_never_asked_for_again` above is the
+/// same sentence on a *second* link, and it must keep arriving there — that is
+/// the sentence the startup sweep's offer is answered with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_collection_is_acknowledged_once_per_link_and_never_not_at_all() {
+    let harness = Harness::with_hub().await;
+    let token = harness.approve("a-runner-whose-chunks-straggle");
+    let mut runner = Peer::runner(
+        &harness.hub_url,
+        "a-runner-whose-chunks-straggle",
+        &token,
+        "the-life-that-ran-it",
+    )
+    .await;
+    let (job_id, attempt, bytes) = a_job_promising_a_collection(&harness, &mut runner).await;
+
+    // The chunk that completes the collection. This acknowledgement is the one
+    // that may never be lost.
+    runner
+        .say(ToHub::JobFileChunk {
+            job_id: job_id.clone(),
+            attempt,
+            path: PATH.to_owned(),
+            offset: 0,
+            data: bytes.clone(),
+        })
+        .await;
+    loop {
+        match tokio::time::timeout(PATIENCE, runner.next()).await {
+            Ok(Some(FromHub::JobFilesAck { job_id: of, .. })) => {
+                assert_eq!(of, job_id, "the collection that completed");
+                break;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!(
+                "a collection that just became whole must be acknowledged, or its runner \
+                 can never free it: {other:?}"
+            ),
+        }
+    }
+
+    // And now the stragglers: the same bytes again, for a file the hub already
+    // holds whole.
+    for _ in 0..STRAGGLERS {
+        runner
+            .say(ToHub::JobFileChunk {
+                job_id: job_id.clone(),
+                attempt,
+                path: PATH.to_owned(),
+                offset: 0,
+                data: bytes.clone(),
+            })
+            .await;
+    }
+    // **Read against the health report rather than against a clock.** One
+    // link, one order: the hub handles these chunks before the report that
+    // follows them, so anything they produced is in this list, ahead of the
+    // `HealthRecorded` that ends it. A sleep would measure the host's speed.
+    let after = runner.through_a_health_report().await;
+    let said_again: Vec<&FromHub> = after
+        .iter()
+        .filter(|frame| matches!(frame, FromHub::JobFilesAck { job_id: of, .. } if *of == job_id))
+        .collect();
+    assert!(
+        said_again.is_empty(),
+        "{STRAGGLERS} straggler chunk(s) of a collection this hub already acknowledged drew \
+         {} more acknowledgement(s) on the same link. This is the frame the first \
+         consumer's runner received 61 times in one second, on a hub that was then \
+         OOM-killed twice: {after:?}",
+        said_again.len()
+    );
+    assert!(
+        after
+            .iter()
+            .any(|frame| matches!(frame, FromHub::HealthRecorded {})),
+        "the link has to stay alive through the stragglers, or the silence above is the \
+         silence of a dropped connection: {after:?}"
+    );
+
+    // **The other side of the boundary: a new link says it again.** The set is
+    // per connection, so the offer a restarted runner makes is still answered
+    // — which is the only way a swept spool is ever freed.
+    drop(runner);
+    support::wait_until("the hub notices the runner is gone", || {
+        !harness.runner_joined()
+    })
+    .await;
+    let mut restarted = Peer::runner(
+        &harness.hub_url,
+        "a-runner-whose-chunks-straggle",
+        &token,
+        "the-life-that-swept-it-up",
+    )
+    .await;
+    let _ = restarted.through_a_health_report().await;
+    restarted
+        .say(ToHub::JobFileChunk {
+            job_id: job_id.clone(),
+            attempt,
+            path: PATH.to_owned(),
+            offset: 0,
+            data: bytes,
+        })
+        .await;
+    match tokio::time::timeout(PATIENCE, restarted.next()).await {
+        Ok(Some(FromHub::JobFilesAck { job_id: of, .. })) => {
+            assert_eq!(of, job_id, "the collection offered again")
+        }
+        other => panic!(
+            "the acknowledgement is de-duplicated per connection, not for ever: a link that \
+             has never been told its collection is whole must be told, or a swept spool \
+             can never go (D19): {other:?}"
+        ),
+    }
 }

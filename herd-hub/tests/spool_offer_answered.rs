@@ -113,18 +113,21 @@ const RUNNER: &str = "a-runner-that-comes-back";
 /// sentence this whole file is about.
 const ACKNOWLEDGED: &str = "has every file of its collection";
 
-/// **More than one chunk's worth, and the difference is the measurement.**
+/// **More than one chunk's worth, and the difference is what the fixture
+/// exercises.**
 ///
-/// A collection the hub already holds is acknowledged on **every** chunk of a
-/// re-offer: the *already here and whole* arm answers with the state of the
-/// whole collection without writing anything, and that state is `Complete`
-/// from the first chunk on. So a collection that fits in one chunk would make
-/// "the pump sent everything" and "the pump sent one chunk and stopped"
-/// indistinguishable — both are one chunk and one acknowledgement. Two files
-/// of [`EACH`] are [`chunks_in_the_collection`] chunks, and the count the hub
-/// prints says which of three things happened: none of them (the pump never
-/// read at all), one (it read, sent, and found its entry gone), or all of them
-/// (it finished, and the acknowledgement raced the barrier and won).
+/// A collection the hub already holds reaches the `Complete` arm on **every**
+/// chunk of a re-offer: the *already here and whole* arm answers with the state
+/// of the whole collection without writing anything, and that state is
+/// `Complete` from the first chunk on. The hub no longer *says* so on every
+/// one of them — it remembers, per link, which collections it has called whole
+/// (2026-11-02, the frame that OOM-killed the first consumer's hub) — so the
+/// printed count no longer separates "the pump sent everything" from "the pump
+/// sent one chunk and stopped". Two files of [`EACH`] are
+/// [`chunks_in_the_collection`] chunks all the same, and the fixture keeps
+/// them: the race this file is about is lost or won inside a pump's full
+/// `OUTPUT_CHUNK_BYTES` disk read, which a collection of one short chunk never
+/// performs.
 const PATHS: [&str; 2] = ["evidence/results.json", "evidence/beside-it.bin"];
 
 /// How long each file of the collection is: **one chunk and a little more**.
@@ -444,15 +447,21 @@ async fn every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside() 
             );
         }
     }
-    // **Once each**, and the asymmetry with the re-offer below is the
-    // measurement this test turns on. A collection *arriving* completes on its
-    // last chunk: the chunks before it leave the collection `More`, so there
-    // is one acknowledgement however many files it has. A collection
-    // *re-offered* is already whole, so **every** chunk of it takes the
-    // `already here and whole` arm and is answered `Complete` — one
-    // acknowledgement each. So after the restart, the number of these lines is
-    // the number of chunks that reached the hub, which is what says how far
-    // the pumps got.
+    // **Once each.** A collection *arriving* completes on its last chunk: the
+    // chunks before it leave the collection `More`, so there is one
+    // acknowledgement however many files it has.
+    //
+    // This used to be half of an asymmetry: a collection *re-offered* is
+    // already whole, so every chunk of it took the `already here and whole`
+    // arm, was answered `Complete`, and was acknowledged again — which made
+    // the count after the restart a reading of how far the pumps had got. That
+    // reading is gone, deliberately: the hub now remembers, per link, which
+    // collections it has said are whole, because saying it per chunk sent the
+    // first consumer's runner 61 frames for one job inside one second and
+    // OOM-killed their hub twice (2026-11-02). The count below is therefore
+    // one per collection per link, and it says *whether* each pump was
+    // answered rather than how far it got. What this test asserts does not
+    // depend on it.
     let acknowledged_before = herd.said("hub").matches(ACKNOWLEDGED).count();
     assert_eq!(
         acknowledged_before,
@@ -535,9 +544,9 @@ async fn every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside() 
     // about the race on that host, and the counts are what make it readable.
     println!(
         "spool-offer-repro: {SWEPT} collection(s) swept, {} set aside, {} still spooled, \
-         {acknowledged_for_the_offer} acknowledgement(s) of the re-offers (up to {} \
-         chunks each), {could_not_send} `cannot send` line(s), {barrier_lines} barrier \
-         line(s)",
+         {acknowledged_for_the_offer} acknowledgement(s) of the re-offers (one per \
+         collection per link, whatever the up to {} chunks each offer is), \
+         {could_not_send} `cannot send` line(s), {barrier_lines} barrier line(s)",
         set_aside.len(),
         still_held.len(),
         chunks_in_the_collection(),
@@ -553,8 +562,10 @@ async fn every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside() 
          already condemned them. Set aside: {:#?}\nStill spooled: {:#?}\n\
          \n\
          What the pumps did, which decides how narrow the fix is. A re-offered collection \
-         is already whole, so the hub answers EVERY chunk of it `Complete`: that count is \
-         the number of chunks that reached the hub, against up to {} per collection. \
+         is already whole, so every chunk of it reaches the hub's `Complete` arm — but \
+         the hub says the sentence once per collection per link, so that count is the \
+         number of collections whose offer was answered at all and not how many of their \
+         up to {} chunks arrived. \
          {could_not_send} `cannot send` line(s) in the runner's own output, and \
          {barrier_lines} collection(s) condemned by the barrier in its own words. A \
          condemned collection with no `cannot send` beside it is a pump that stopped at \
