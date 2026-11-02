@@ -1205,8 +1205,21 @@ pub fn switch_lines(runner: &RunnerSwitch) -> Vec<String> {
         1 => ", 1 job running there finishes".to_owned(),
         many => format!(", {many} jobs running there finish"),
     });
+    // **No cause named.** `stopping` is one bool and every stop path sets it:
+    // a `SIGTERM`, and equally a `drain` position whose runner now holds
+    // nothing and leaves on its own. The parenthetical `(SIGTERM)` that stood
+    // here was a literal, not a reading of the frame, and on 2026-11-02 at
+    // 01:11 CET it told the first consumer that something had signalled a
+    // runner they had drained themselves; they opened an investigation into a
+    // signal nobody had sent. The cause is not inferred from `runner.switch`
+    // either, however often `leaves_when_empty()` would be right: a runner
+    // that is draining *and* was signalled is one machine with two causes, and
+    // a label taken from a correlate is the same defect with a longer reach.
+    // `herdctl` cannot tell these stops apart, so it says only what it knows.
+    // Carrying the runner's own reason here would be a protocol change, not a
+    // rendering one: see `herd_proto::RunnerSwitch::stopping`.
     if runner.stopping {
-        line.push_str("; it is also stopping (SIGTERM)");
+        line.push_str("; it is also stopping");
     }
     if let Some(version) = &runner.facts.version {
         line.push_str(&format!("; herd {version}"));
@@ -2229,5 +2242,95 @@ mod tests {
                 "nor about a declaration it knows nothing about: {line}"
             );
         }
+    }
+
+    /// A stopping runner's line says it is stopping and **names no cause**.
+    ///
+    /// `RunnerSwitch::stopping` is one bool that every stop path sets, so
+    /// there is no cause in it to print. The line carried `(SIGTERM)` as a
+    /// literal until 2026-11-02, when the first consumer drained their server
+    /// runner to recreate their hub, read `it is also stopping (SIGTERM)` and
+    /// opened an investigation into a signal nobody had sent.
+    ///
+    /// Three things are pinned, and the second is the one that matters: that
+    /// the string `SIGTERM` is **absent**. The regression this prevents is a
+    /// cause creeping back in, and an assertion that only checked the new
+    /// wording was present would pass on a line that said both. The third is
+    /// that the stop reads alike whether the switch is `drain` or `on` —
+    /// because inferring the cause from the position beside it, where
+    /// `Switch::leaves_when_empty()` would usually be right, is the same
+    /// defect with a longer reach: a runner that is draining *and* was
+    /// signalled is one machine with two causes.
+    #[test]
+    fn a_stopping_runner_names_no_cause_for_its_stop() {
+        let stopping_under = |switch: Switch| {
+            let mut lines = switch_lines(&RunnerSwitch {
+                name: "server".to_owned(),
+                switch,
+                jobs: 0,
+                stopping: true,
+                facts: herd_proto::RunnerFacts::default(),
+            });
+            assert_eq!(
+                lines.len(),
+                1,
+                "one runner with nothing suspended is one line: {lines:?}"
+            );
+            lines.remove(0)
+        };
+
+        // The two stops `herdctl` cannot tell apart: a `drain` that has
+        // emptied and leaves by itself, and a runner signalled while `on`.
+        let drained = stopping_under(Switch::Drain {
+            reason: "a reboot is due".to_owned(),
+        });
+        let signalled = stopping_under(Switch::On);
+
+        for line in [&drained, &signalled] {
+            assert!(
+                line.ends_with("; it is also stopping"),
+                "a stopping runner says so, with nothing after it: {line}"
+            );
+            assert!(
+                !line.contains("SIGTERM"),
+                "and names no cause: the field carries none, so this line must claim none: {line}"
+            );
+            assert!(
+                !line.to_lowercase().contains("signal"),
+                "nor any other word for a cause: {line}"
+            );
+        }
+
+        // Said the same way past the position, which is the whole of it: the
+        // position is the owner's, the stop's cause is not in the frame, and
+        // nothing switch-dependent may be appended to a stopping runner's
+        // line.
+        let past_the_position = |line: &str| {
+            let at = line
+                .find(", nothing running")
+                .unwrap_or_else(|| panic!("the jobs clause is in every line: {line}"));
+            line[at..].to_owned()
+        };
+        assert_eq!(
+            past_the_position(&drained),
+            past_the_position(&signalled),
+            "these are two causes for one flag and `herdctl` must not pick between them: \
+             {drained:?} against {signalled:?}"
+        );
+
+        // And the clause is absent entirely when the runner is not stopping,
+        // so the assertions above are about this branch and not about a line
+        // that never had it.
+        let running = switch_lines(&RunnerSwitch {
+            name: "server".to_owned(),
+            switch: Switch::On,
+            jobs: 1,
+            stopping: false,
+            facts: herd_proto::RunnerFacts::default(),
+        });
+        assert_eq!(
+            running,
+            vec!["server: on, 1 job running there finishes".to_owned()]
+        );
     }
 }

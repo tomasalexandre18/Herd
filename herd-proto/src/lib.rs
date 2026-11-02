@@ -572,7 +572,24 @@ pub struct RunnerSwitch {
     /// How many jobs it is running. A machine switched off with a job still on
     /// it is the ordinary case and not a contradiction: its work finishes.
     pub jobs: u32,
-    /// Whether it is also stopping for good (`SIGTERM`, invariant 2).
+    /// Whether it is also stopping for good (invariant 2).
+    ///
+    /// **It carries no cause.** The hub fills it from the runner's own
+    /// `draining` flag, and that flag is set by *every* stop path: a `SIGTERM`
+    /// or a Ctrl-C from the owner, and just as much a `drain` position whose
+    /// runner now holds nothing and leaves by itself. The two are
+    /// indistinguishable in this bool, so a reader must not name a cause from
+    /// it — nor from [`RunnerSwitch::switch`] beside it, since a runner that is
+    /// draining *and* was signalled is one machine with two causes. `herdctl`
+    /// printed `(SIGTERM)` off this field until 2026-11-02 and sent the first
+    /// consumer hunting a signal nobody had sent; this comment said `SIGTERM`
+    /// too, which is where that reading was learnt.
+    ///
+    /// The runner does hold a sentence for the stop — it prints
+    /// `draining (<reason>)` on its own stderr — and throws it away at the
+    /// link. Carrying it would be a new field on two hops, the health frame
+    /// and this one, which is a protocol decision (invariant 4), not a
+    /// cleanup.
     pub stopping: bool,
     /// Its build and its suspended capabilities (D166). Defaulted, so a frame
     /// from a hub that has never heard of either still decodes — as "this hub
