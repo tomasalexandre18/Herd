@@ -82,35 +82,82 @@ and no test. The same search over `--include=*.md` returned nothing.
 ## Gates
 
 **All four Rust gates plus both docs checks, run whole and bare through
-the queue** on the code commit, never per step: `./scripts/gate.sh` runs
-step 1 `check-docs.sh`, step 2 `check-orchestration.sh`, step 3
+the queue, never per step.** `./scripts/gate.sh` runs step 1
+`check-docs.sh`, step 2 `check-orchestration.sh`, step 3
 `nix flake check`, step 4 `cargo fmt --all --check`, step 5
 `cargo clippy --workspace --all-targets -- -D warnings`, step 6 the
-suite, step 7 the skips by list and both kinds, step 8 the verdict. Its
-verdict and receipt are in this agent's report, verbatim, with their
-figures.
+suite, step 7 the skips by list and both kinds, step 8 the verdict and a
+receipt named for the sha.
 
-It was submitted to our own queue hub with
+Every run was submitted to our own queue hub with
 `/mnt/ssd_980/herd/queue/bin/herdctl --hub ws://127.0.0.1:8791 run
 --label build --memory-mib 4700`, after `./scripts/bench-preflight.sh`
-whose verdict was read **as text** and said `ok, safe to start`. Bare
-`herdctl` was never used: on this host its compiled-in default is the
-consumer's production hub.
+whose verdict was read **as text** and was required to say
+`ok, safe to start`. Bare `herdctl` was never used: on this host its
+compiled-in default is the consumer's production hub.
+`CARGO_TARGET_DIR` was off the root filesystem.
+
+**The first run was RED, and it is reported red.** On the code commit
+`fe35bce`, before this file existed:
+
+```text
+gate: RED sha=fe35bcef24e15fdff530f573fc79705a36250740
+failed=4:cargo-fmt,6:test-suite
+skips=under-load(flood-fifty=39.38>8,flood-two-fifty=39.38>8)
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+```text
+  started 2026-11-02T00:22:52Z, finished 2026-11-02T00:36:35Z
+  load1 7.23 at the start, 52.16 after the suite
+  steps that failed: 4:cargo-fmt 6:test-suite
+```
+
+Two causes, and only one of them was this branch's.
+
+1. **`4:cargo-fmt` was this branch's own**, and is fixed: `rustfmt`
+   wanted two `assert_eq!` calls in the new test wrapped. The fix was
+   made by `nix develop --command cargo fmt --all` through the queue
+   (job `j0000000236`), its diff was read before it was taken — 9
+   insertions, 2 deletions, **in `herdctl/src/lib.rs` alone** — and it
+   was amended into the one code commit.
+2. **`6:test-suite` was the host**, and is a finding, not a fix: the two
+   failures are in `herd-runner/tests/confinement.rs`, nothing this diff
+   can reach, and they are written up under *Risks and findings* with
+   their figures and drafted as a board row below. **The new test itself
+   passed on that very run** —
+   `test tests::a_stopping_runner_names_no_cause_for_its_stop ... ok`.
+
+**A second run was REFUSED, and that is recorded rather than tidied
+away:** `gate: REFUSED … reason=the working tree is not clean`, because
+this handoff was being written in the worktree. The gate is right and the
+order is the one the template prescribes — this file is committed first,
+and the gate then runs on the tree that is pushed.
 
 **The last run, named and not quoted** — it is made after this file is
 committed, so its output cannot be in the tree it gates:
 
 ```text
-./scripts/check-docs.sh
+./scripts/gate.sh
 ```
 
-from the worktree root; its output goes to the terminal and is reproduced
-verbatim in this agent's report.
+bare and whole, through the queue, on the tip of this branch — the commit
+that adds this file. Its receipt is written to
+`target/herd-gate/<sha>.receipt` in this worktree
+(`$HERD_GATE_RECEIPTS`, per worktree and gitignored), and its verdict,
+its receipt and its figures are reproduced **verbatim in this agent's
+report**. `./scripts/check-docs.sh` is run after it, from the worktree
+root, and its output is in that report too.
 
-**Skips:** named in this agent's report as a list and never as a count,
-out of the gate's own step 7. Nothing in this diff adds a
-`HERD-SKIPPED` line or an `#[ignore]`. No `HERD-SKIPPED` line is copied
-as a pass.
+**Skips, as a list and never as a count.** The first run's step 7 matched
+both expectations exactly: the 13 at-rest `HERD-SKIPPED` names of
+`scripts/expected-skips/local.txt`, plus the two load-gated flood benches
+`flood-fifty` and `flood-two-fifty`, each excused on **its own** reading
+of 39.38 against its own ceiling of 8; and **38** `#[ignore]` lines
+matching `scripts/expected-skips/ignored.txt`, every one carrying a
+reason. **Nothing in this diff adds a `HERD-SKIPPED` line or an
+`#[ignore]`**, and no `HERD-SKIPPED` line is anywhere copied as a pass
+(D27).
 
 ## Risks and findings
 
@@ -136,6 +183,42 @@ as a pass.
 - **`switch_lines` is called from exactly one place**,
   `herdctl/src/main.rs:1231`, so the rendering has one reader and no
   other caller was affected.
+- **Two fixtures in `herd-runner/tests/confinement.rs` went red on load,
+  not on this diff, and they cannot skip.** The first gate run of this
+  branch (`fe35bce`) was RED on `4:cargo-fmt,6:test-suite`.
+  `cargo fmt` was this branch's own fault and is fixed. The suite's two
+  failures — `a_restarted_runner_reclaims_what_a_killed_one_left` and
+  `a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them` — both
+  panicked at `herd-runner/tests/confinement.rs:3071` with *"the fixture
+  never started a process carrying <pid-needle>"*. That is
+  `wait_for_a_process_with`'s **20-second wall-clock patience**
+  (`:3068`), waiting for a job's own process to appear in `/proc`. The
+  gate read `load1 7.23` at step 0 and **52.16 after the suite**, and the
+  two flood benches read **39.38** against their own ceiling of 8 and
+  declined.
+- **Nothing in this diff can reach either fixture**: it changes
+  `herdctl`'s rendering, one `herd-proto` doc comment and one `herdctl`
+  unit test, and neither fixture loads `herdctl`.
+- **The hazard is the shape, not the two names.** The flood benches read
+  the load themselves and print `HERD-SKIPPED` with the figure, which the
+  gate excuses per skip (D27, `gate.sh` rule 2). A wall-clock
+  `assert!(Instant::now() < deadline)` cannot do that: it panics, it is
+  on neither expected-skip list, and so it turns a loaded host into a red
+  gate that names a diff which did not cause it. **This is the same class
+  as ORCH-351's load-only red**, from the other direction: there a
+  no-charge rule would have made an assertion unreachable under load;
+  here a patience makes one unreachable under load today.
+- **No prior occurrence of these two names is recorded under `docs/`** —
+  searched; which is not the same as saying it has never happened, only
+  that nothing written down says it has.
+- **Where the load came from, read off the host and not guessed**: the
+  machine's own `01:00` borgbackup of `/mnt/ssd_980` and
+  `/mnt/raidhdd/seafile`, and the first consumer's production — their
+  `herd-runner 1.1.0`, a `qemu-system-x86_64` for their job
+  `j0000000777` and an `xtask test --only packages-here,wlan,snix -j 3`
+  beside it. **None of it is this project's to touch** (D161), nothing
+  was signalled, and the only thing to do with it is wait, which is what
+  was done.
 
 ## Drafted for `herd-merger`
 
@@ -179,9 +262,14 @@ carrying it is two additive fields across two hops, which invariant 4
 makes a decision and not a cleanup.
 ```
 
-### `docs/orchestration/board.md` — one new row, in *Open*
+### `docs/orchestration/board.md` — two new rows, both in *Open*
 
 | ORCH-NEXT | **Should the stop's reason travel to the operator? Priced, not decided; nothing was changed.** The runner holds a sentence for every stop and throws it away at the link: `herd-runner/src/lib.rs:4305` prints `herd-runner: draining (<reason>); N job(s) to end, no new job accepted` on its own stderr, and `start_draining` takes the reason only to cancel jobs with it. **Three reasons exist in production, and all three are the operator's own words**: `"the runner's owner asked it to stop (SIGTERM)"` (45 chars), the same with `(SIGINT)` (44), and `format!("the owner's switch is {} and this runner holds nothing, so it leaves", switch.sentence())` — 92 chars with `draining (a reboot is due)` (`herd-runner/src/lib.rs:4203`, `:4401`-`:4402`). **Hop 0, unnamed in the brief and real:** the runner does not keep the reason. `Inner.draining` is a `bool` (`herd-runner/src/lib.rs:1204`), so either a second field `drain_reason: Option<String>` is added beside it — 3 edits in one file, no reader changes, and the two can diverge — or `draining` becomes `Option<String>`, which cannot diverge and touches 6 sites in that file plus `Session::draining()`'s return type (`:1379`, `:2151`, `:2170`, `:2313`, `:3430`-`:3432`, `:3908`). **Hop 1, the health frame, is the expensive one: 18 Rust construction sites across 13 files, plus one exhaustive pattern.** `ToHub::Health` (`herd-proto/src/lib.rs:1694`) gains `#[serde(default)] drain_reason: Option<String>`; a struct-variant construction cannot elide a field, so all 18 must gain it — 1 in production (`herd-runner/src/lib.rs:3906`), 11 in `herd-hub/tests/` and 6 in `herd-proto/tests/round_trip.rs`. Four more sites destructure with `..` and are free; `herd-hub/src/server.rs:5828` deliberately binds every field by name and is not. Then the hub's own `Runner.draining: bool` (`:1764`), `record_health`'s signature and its 5 read sites (`:1335`, `:2395`, `:2541`, `:2750`, `:2904`). **Hop 2 is cheap: 3 construction sites today** — `RunnerSwitch` gains `#[serde(default)] stopping_reason: Option<String>` at `herd-hub/src/server.rs:2746` and `herd-proto/tests/round_trip.rs:1033`, `:1043`, plus the two in this branch's new unit test. **A cheaper variant of hop 2 exists and has a caveat**: `RunnerSwitch.facts` is already `#[serde(default)]` and `RunnerFacts` derives `Default` with all-`Option` fields, so a reason put there costs 1 production site (`:1823`) and reaches `herdctl runner list` as well (E-51, D166) — but `RunnerFacts` means "this hub did not say", which would then sit on the same field as "not stopping". **No `PROTOCOL_VERSION` move either way, on D124/D128's own ground and with two precedents** — `FromHub::AssignJob.need` and `ToHub::AttemptAbandoned.still_running_attempt` (ORCH-350, D294) both landed additive and defaulted, each spelled `#[serde(default, skip_serializing_if = "Option::is_none")]` so an absent field is also an absent key on the wire (`herd-proto/src/lib.rs:2544`, `:1889`). **Two further costs, named because they are not field counts.** (1) **The display is its own decision, not an append**: the longest reason is 92 chars and the current line is 72, so `; it is also stopping (<92 chars>)` is a 167-column line, measured, which is exactly what D49 and D166 already refused for a suspension's reason — the shape that fits is a second indented line beside `suspension_lines`. (2) **A third surface asks the same question**: `RunnerStatus.draining` (`herd-hub/src/server.rs:1427`) and the waiting-job sentences at `:2359`, `:2395`, `:2541` would all want the reason once it exists, so the field count above is the floor | the 2026-11-02 `herdctl` defect, found by the orchestrator in the tree the same night the first consumer hit it; priced by `herd-step` on `herdctl-stopping-names-no-cause` | herd-planner | open | Decide whether the reason travels. **The recommendation is yes, as one unit of three hops, and not as a cheap first half** — see *Evidence* for why either half alone buys nothing | none; the rendering fix is already landed and is complete without this | `herd-runner/src/lib.rs:4203`, `:4305`, `:4401`-`:4402`, `:1204`, `:3430`-`:3432`, `:3906`; `herd-proto/src/lib.rs:1694`, `:569`-`:575`; `herd-hub/src/server.rs:1764`, `:2746`, `:2750`, `:2904`, `:5828`; `herd-proto/tests/round_trip.rs:1033`, `:1043`; D124, D128, D294, D49, D166, invariant 4. **The pricing's own asymmetry is the argument**: hop 2 alone is 3 sites and buys nothing, because the hub has no reason to forward until hop 1 exists; hop 1 alone is 18 sites and buys the hub a fact it does not show. So the useful unit is both hops and hop 0 together — about 25 construction sites, one display decision and a test per hop — for a sentence the runner already writes and already prints to the one person who was already standing in front of it. **What the landed fix buys without any of it**: the operator is no longer told something false, which was the whole of the 01:11 cost; what stays unbought is being told something true |
+
+**The second row.** Not this task's subject; it is what this task's own
+gate run measured, and it is a gate hazard rather than a product defect.
+
+| ORCH-NEXT | **Two fixtures in `herd-runner/tests/confinement.rs` go red under host load instead of skipping, and the gate cannot excuse them.** `wait_for_a_process_with` (`herd-runner/tests/confinement.rs:3068`-`:3072`) gives a job's own process **20 seconds of wall clock** to appear in `/proc` and then `assert!`s. Measured on 2026-11-02 on `herdctl-stopping-names-no-cause`'s first gate run, sha `fe35bce`: `a_restarted_runner_reclaims_what_a_killed_one_left` and `a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them` both panicked there with *"the fixture never started a process carrying <needle>"*, on a host the gate read at `load1 7.23` at step 0 and **52.16 after the suite**, while the two flood benches read **39.38** against their own ceiling of 8 and declined. The load was the machine's `01:00` borgbackup plus the first consumer's production (their `herd-runner 1.1.0`, a `qemu-system-x86_64` for `j0000000777`, and an `xtask test … -j 3`) — real load on a shared host, not a burst this project made. **The shape is the hazard, not the two names:** a bench that reads the load prints `HERD-SKIPPED` with its figure and `gate.sh`'s rule 2 excuses it per skip out of the bench's own line (D27); a wall-clock `assert!` panics instead, sits on neither expected-skip list, and so turns a loaded host into a red gate that names whichever diff happened to be under it. **It cost one whole gate run here** — 673 s of suite plus 13 min of queue — and the diff it accused touches only `herdctl`'s rendering, one `herd-proto` doc comment and one `herdctl` unit test, none of which either fixture loads. **Same class as ORCH-351's load-only red, from the other direction**: there a no-charge rule would have made an assertion unreachable under load; here a patience already does | `herd-step`, 2026-11-02, out of `herdctl-stopping-names-no-cause`'s own first gate run; the second run's verdict is in that branch's handoff | herd-planner | open | Decide what a load-sensitive wall-clock patience owes. Three shapes exist in the tree and this one is the weakest: a bench that reads the load and declines with its figure (`fake_hub_flood.rs`), a fixture that waits on the hub's own view rather than a clock (`until_the_fleet_says`, D100), and this `assert!`. **The cheapest honest fix is the second shape, not a bigger number** — a patience raised to 60 s still goes red at some load and says nothing about why — but it is a fixture rewrite in `herd-runner/tests/`, owes all four Rust gates, and is not this branch's | nothing. **Not a blocker for the `herdctl` fix**, whose own gate is reported in that branch's handoff | `herd-runner/tests/confinement.rs:3055`-`:3075`, `:2945`; `scripts/gate.sh` rule 2 and step 7; `scripts/expected-skips/local.txt` (13 at-rest names) and `local-under-load.txt`; D27, D100, D179, ORCH-351. **No prior occurrence of either name is recorded under `docs/`** — searched, which says only that nothing written down carries one |
 
 ## Decisions needed
 
